@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.10.0"
+KOKOMUX_VERSION="0.11.0"
 DISTRO=kokoro
 
 ASSUME_YES=0; VERBOSE=0
@@ -573,10 +573,12 @@ or through the background server:
   engine.py job /tmp/kokoro.XXXXXX/job      run one job
   engine.py serve [--port N] [--idle SECS]  keep the model loaded, serve jobs
   engine.py voices                          list voice names
-  engine.py download                        fetch model files (resumable)
+  engine.py download [--quality high]       fetch model files (resumable)
+  engine.py forget-high                     delete the full-precision model
 
 A job folder holds `job` (key=value lines: voice, speed, lang, and optionally
-url, out, stream) and `in.txt` (the text, unless url is set). Output goes into
+quality, url, out, stream, words, start, of, gap_ms) and `in.txt` (the text,
+unless url is set). A voice can be a blend: af_heart:70+bf_emma:30. Output goes into
 the same folder: `out.<ext>` for a saved file, and with stream=1 one WAV per
 chunk in `stream/0001.wav`, `stream/0002.wav`, ... followed by `stream/end`.
 """
@@ -603,13 +605,21 @@ MODEL = os.path.join(MODELS, "kokoro-v1.0-timestamped.int8.onnx")
 MODEL_SRC = ("https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX-timestamped/resolve/"
              "dd4401a9add81ac692d20e240d22ec9dda82cc29/onnx/model_quantized.onnx")
 OLD_MODEL = os.path.join(MODELS, "kokoro-v1.0.int8.onnx")   # before 0.8: no timings
+# The same model at full precision: a cleaner voice (the 8-bit one can sound a
+# little buzzy), at 326 MB and more work per sentence. Downloaded on request.
+MODEL_HQ = os.path.join(MODELS, "kokoro-v1.0-timestamped.fp32.onnx")
+MODEL_HQ_SRC = ("https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX-timestamped/resolve/"
+                "dd4401a9add81ac692d20e240d22ec9dda82cc29/onnx/model.onnx")
+QUALITIES = ("standard", "high")
+# A voice, or several blended: "af_heart", "af_heart+af_bella", "af_heart:70+af_bella:30"
+VOICE_SPEC = re.compile(r"^[a-z]{2}_[a-z]+(?::\d{1,3})?(?:\+[a-z]{2}_[a-z]+(?::\d{1,3})?){0,3}$")
 VOICES = os.path.join(MODELS, "voices-v1.0.bin")
 VOICES_SRC = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
 SERVER_DIR = "/tmp/kokoro-server"
 JOB_DIR_RE = re.compile(r"^/tmp/kokoro\.[A-Za-z0-9]+$")
 FORMATS = ("wav", "mp3", "ogg", "flac")
 USER_AGENT = "Mozilla/5.0 (Linux; Android) kokomux"
-MAX_CHUNK = 200  # characters per synthesis chunk
+MAX_CHUNK = 360  # characters per part: whole sentences, under Kokoro's 510 sounds
 AHEAD = 3        # while listening, parts made ahead of the one being heard
 SERVING = False
 
@@ -625,6 +635,7 @@ def log(msg):
 # ------------------------------------------------------------------ model
 
 _tts = None
+_tts_model = None
 _tts_lock = threading.Lock()
 # One synthesis at a time, across every job the server is running: espeak isn't
 # thread-safe, and the phone has only so much CPU. Held per part, not per job, so
@@ -632,24 +643,63 @@ _tts_lock = threading.Lock()
 SYNTH_LOCK = threading.Lock()
 
 
-def tts():
-    global _tts
+def model_for(quality):
+    """The model file for a quality: the full-precision one only once it's downloaded."""
+    if quality == "high" and os.path.exists(MODEL_HQ):
+        return MODEL_HQ
+    return MODEL if os.path.exists(MODEL) else OLD_MODEL
+
+
+def tts(quality="standard"):
+    """Kokoro, loaded with the model for this quality. One model at a time: switching
+    lets the other go first, so a phone never holds both."""
+    global _tts, _tts_model
     with _tts_lock:
-        if _tts is None:
+        model = model_for(quality)
+        if _tts is None or _tts_model != model:
             from kokoro_onnx import Kokoro
-            model = MODEL if os.path.exists(MODEL) else OLD_MODEL
+            _tts = None
+            import gc
+            gc.collect()
             _tts = Kokoro(model, VOICES)
+            _tts_model = model
             # kokoro-onnx looks for an output called "duration"; this export calls it
             # "durations". It's the second output either way, which is what it reads.
             _tts.has_timings = len(_tts.sess.get_outputs()) > 1
-    return _tts
+        return _tts
 
 
-def phonemize_many(words, lang):
+def voice_style(engine, spec):
+    """What to hand Kokoro for a voice: its name, or for a blend ("af_heart:70+af_bella:30")
+    the voices' styles mixed in those proportions. Weights left out are shared equally."""
+    if not VOICE_SPEC.match(spec or ""):
+        raise JobError(f"'{spec}' isn't a voice. See: kokoro --list-voices")
+    known = set(engine.get_voices())
+    parts = []
+    for item in spec.split("+"):
+        name, _, weight = item.partition(":")
+        if name not in known:
+            raise JobError(f"Unknown voice '{name}'. See: kokoro --list-voices")
+        parts.append((name, int(weight) if weight else None))
+    if len(parts) == 1:
+        return parts[0][0]
+    given = sum(w for _, w in parts if w is not None)
+    unset = [n for n, w in parts if w is None]
+    share = max(0, 100 - given) / len(unset) if unset else 0
+    weights = [(n, w if w is not None else share) for n, w in parts]
+    total = sum(w for _, w in weights)
+    if total <= 0:
+        raise JobError(f"The voices in '{spec}' need some weight, e.g. af_heart:70+af_bella:30")
+    import numpy as np
+    style = sum((w / total) * np.asarray(engine.get_voice_style(n), dtype=np.float32) for n, w in weights)
+    return style.astype(np.float32)
+
+
+def phonemize_many(words, lang, engine=None):
     """Each word's phonemes on its own, the way Kokoro phonemises (call under SYNTH_LOCK)."""
     import phonemizer
     from kokoro_onnx.tokenizer import Tokenizer
-    vocab = tts().tokenizer.vocab
+    vocab = (engine or tts()).tokenizer.vocab
     out = phonemizer.phonemize([Tokenizer.normalize_text(w) for w in words], lang,
                                preserve_punctuation=True, with_stress=True)
     return ["".join(ch for ch in p if ch in vocab) for p in out]
@@ -657,22 +707,174 @@ def phonemize_many(words, lang):
 
 # ------------------------------------------------------------------ text
 
-def split_text(text):
-    """Split into chunks: a short first one (so playback starts quickly), then
-    sentences grouped up to MAX_CHUNK characters."""
-    pieces = [p.strip() for p in re.split(r"(?<=[.!?…;:])\s+|\s*\n\s*", text)]
-    pieces = [p for p in pieces if re.search(r"\w", p)]
-    chunks, cur = [], ""
-    for p in pieces:
-        if not cur:
-            cur = p
-        elif (not chunks and len(cur) < 40) or (chunks and len(cur) + len(p) < MAX_CHUNK):
-            cur += " " + p
+# Pauses between parts, in seconds. Inside a part Kokoro pauses 0.25 s at a
+# full stop; between parts the same, longer after a paragraph and a chapter,
+# in golden-ratio steps (0.25 × φ² and × φ³).
+PAUSE = {"sentence": 0.25, "paragraph": 0.65, "chapter": 1.06}
+
+# --- tidying text before it's spoken -----------------------------------------
+# Kokoro reads what it's given, so things meant for the eye are made speakable
+# first: ligatures, footnote marks, links, markdown, dashes, Roman numerals in
+# headings, ALL-CAPS headings, and (in English) abbreviations and units. The
+# reader shows the tidied text, so what's lit is what's said.
+
+_INVISIBLE = dict.fromkeys(map(ord, "­​‌‍⁠﻿"))
+_LIGATURES = {"ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl",
+              "ﬅ": "st", "ﬆ": "st", "Ĳ": "IJ", "ĳ": "ij"}
+_ROMAN = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+_HEADING_WORDS = (r"Chapter|Part|Book|Volume|Vol\.|Act|Scene|Section|Canto|Letter|Appendix|"
+                  r"Chapitre|Partie|Livre|Capítulo|Capitulo|Parte|Libro|Capitolo|Kapitel|Teil|Buch")
+# "Chapter IV" or "CHAPTER IV", where the numeral ends the phrase ("the part I liked" stays)
+_HEADING_RE = re.compile(r"\b((?:" + "|".join(f"{w}|{w.upper()}" for w in _HEADING_WORDS.split("|")) +
+                         r"))[ \t]+([IVXLCDM]+)(?=[ \t]*(?:\n|$|[.:,;)–—-])|[ \t]+[A-Z\"“'‘])", re.M)
+_TITLES = {"Mr": "Mister", "Mrs": "Missus", "Ms": "Miz", "Dr": "Doctor", "Prof": "Professor",
+           "St": "Saint", "Gen": "General", "Capt": "Captain", "Lt": "Lieutenant",
+           "Sgt": "Sergeant", "Col": "Colonel", "Rev": "Reverend", "Hon": "Honourable"}
+_PHRASES = [(r"\be\.[ \t]?g\.", "for example"), (r"\bi\.[ \t]?e\.", "that is"),
+            (r"\betc\.", "etcetera."), (r"\bvs\.?(?=[ \t])", "versus"), (r"\bapprox\.", "approximately"),
+            (r"\bNo\.(?=[ \t]*\d)", "number"), (r"\bFig\.(?=[ \t]*\d)", "figure"),
+            (r"\bpp\.(?=[ \t]*\d)", "pages"), (r"\bp\.(?=[ \t]*\d)", "page")]
+# unit: (singular, plural), spoken after a number; (American, British) spellings
+_UNITS = [("km/h", ("kilometer per hour", "kilometers per hour"), ("kilometre per hour", "kilometres per hour")),
+          ("mph", ("mile per hour", "miles per hour"), None),
+          ("km", ("kilometer", "kilometers"), ("kilometre", "kilometres")),
+          ("cm", ("centimeter", "centimeters"), ("centimetre", "centimetres")),
+          ("mm", ("millimeter", "millimeters"), ("millimetre", "millimetres")),
+          ("kg", ("kilogram", "kilograms"), None),
+          ("mg", ("milligram", "milligrams"), None),
+          ("ml", ("milliliter", "milliliters"), ("millilitre", "millilitres")),
+          ("lbs?", ("pound", "pounds"), None),
+          ("ft", ("foot", "feet"), None),
+          ("GB", ("gigabyte", "gigabytes"), None), ("MB", ("megabyte", "megabytes"), None),
+          ("KB", ("kilobyte", "kilobytes"), None), ("kB", ("kilobyte", "kilobytes"), None)]
+
+
+_TITLE_RE = re.compile(r"\b(" + "|".join(_TITLES) + r")\.(?=[ \t]+[A-Z])")
+_UNIT_WORDS = {u: (us, gb) for u, us, gb in _UNITS}
+_UNIT_RE = re.compile(r"(?<![\w.])(\d+(?:[.,]\d+)?)[ \t]?(" + "|".join(u for u, _, _ in _UNITS) + r")\b")
+
+
+def roman(s):
+    """A Roman numeral's value, or None if it isn't one ("MMXXIV" -> 2024)."""
+    s = s.upper()
+    if not s or not re.fullmatch(r"M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})", s):
+        return None
+    total = 0
+    for i, ch in enumerate(s):
+        v = _ROMAN[ch]
+        total += -v if i + 1 < len(s) and _ROMAN[s[i + 1]] > v else v
+    return total
+
+
+def _caps_heading(line):
+    """ "CHAPTER ONE: THE ROAD" -> "Chapter One: The Road" (only whole lines in capitals)."""
+    letters = [c for c in line if c.isalpha()]
+    words = re.findall(r"[^\W\d_]{2,}", line)
+    if len(letters) < 4 or len(words) < 2 or not all(c.isupper() for c in letters):
+        return line
+    return re.sub(r"[^\W\d_]+", lambda m: m.group(0)[0] + m.group(0)[1:].lower(), line)
+
+
+def _english(text, lang):
+    text = _TITLE_RE.sub(lambda m: _TITLES[m.group(1)], text)   # titles before a name: "Dr. Smith"
+    for pat, rep in _PHRASES:
+        text = re.sub(pat, rep, text)
+    text = re.sub(r"(?<=\d)[ \t]?([ap])\.[ \t]?m\.", lambda m: f" {m.group(1).upper()}M" +   # 5 p.m. -> 5 PM
+                  ("." if re.match(r"[ \t]+[\"“]?[A-Z]|[ \t]*(?:\n|$)", m.string[m.end():]) else ""),
+                  text, flags=re.I)
+    text = re.sub(r"(?<=\d)[ \t]?°[ \t]?C\b", " degrees Celsius", text)
+    text = re.sub(r"(?<=\d)[ \t]?°[ \t]?F\b", " degrees Fahrenheit", text)
+    text = re.sub(r"(?<=\d)[ \t]?°", " degrees", text)
+    british = lang == "en-gb"
+
+    def unit(m):
+        us, gb = _UNIT_WORDS[m.group(2) if m.group(2) not in ("lb", "lbs") else "lbs?"]
+        one, many = gb if british and gb else us
+        return f"{m.group(1)} {one if m.group(1) == '1' else many}"
+    text = _UNIT_RE.sub(unit, text)
+    text = re.sub(r"(?<=[ \t])&(?=[ \t])", "and", text)
+    return text
+
+
+def normalise(text, lang="en-us"):
+    """Make text speakable (see above). Line breaks, which mark paragraphs, are kept.
+    Each rule runs once over the whole text, so a long book stays quick."""
+    text = text.translate(_INVISIBLE)
+    for k, v in _LIGATURES.items():
+        text = text.replace(k, v)
+    text = re.sub(r"[¹²³⁰-⁹]+", "", text)                 # footnote marks¹²
+    text = re.sub(r"\[(?:\d+(?:\s*[,–-]\s*\d+)*|[a-z]|note \d+|citation needed|clarification needed)\]", "", text)
+    text = re.sub(r"\b(?:https?://|www\.)(?:www\.)?([\w-]+(?:\.[\w-]+)+)[^\s)\]]*?(?=[.,;:!?)\]]?(?:\s|$))",
+                  r"\1", text)                                                         # links: their site
+    text = re.sub(r"(?m)^[ \t]*(?:#{1,6}|>+|[-*+•·▪◦‣])[ \t]+", "", text)            # markdown marks, bullets
+    text = re.sub(r"(?<![\w*])(\*\*|__|\*|_)(?=\S)([^\n]+?)(?<=\S)\1(?![\w*])", r"\2", text)
+    text = re.sub(r"(?<=\d)[ \t]?[–—][ \t]?(?=\d)", " to ", text)                     # 1990–1995
+    text = re.sub(r"[ \t]*(?:—|–|--)[ \t]*", ", ", text)                             # dashes: a pause
+    text = re.sub(r"([!?])\1+", r"\1", text)
+    text = re.sub(r"(?m)^[ \t]+|[ \t]+$", "", text)
+    text = re.sub(r"(?m)^([IVXLCDM]+)([.:]?)$",                                       # a heading: "IV."
+                  lambda m: f"{roman(m.group(1))}{m.group(2) or '.'}" if roman(m.group(1)) else m.group(0), text)
+    text = _HEADING_RE.sub(lambda m: f"{m.group(1)} {roman(m.group(2))}" if roman(m.group(2)) else m.group(0),
+                           text)                                                       # "Chapter IV"
+    text = re.sub(r"(?m)^[^\na-z]*[A-Z][^\na-z]*$", lambda m: _caps_heading(m.group(0)), text)
+    if lang.startswith("en"):
+        text = _english(text, lang)
+    return re.sub(r"[ \t]{2,}", " ", text)
+
+
+# --- splitting into parts ----------------------------------------------------
+_ABBREV = re.compile(r"(?:\b(?:[A-Z]|Mr|Mrs|Ms|Dr|St|Prof|Sr|Sra|Jr|Mt|Gen|Capt|Lt|Sgt|Col|Rev|Hon|"
+                     r"Inc|Ltd|Co|vs|etc|approx|No|Fig|M|Mme|Mlle|Hr|Fr|Dra|Sig|Sto)\.)$")
+_SENTENCE_END = re.compile(r"(?<=[.!?…])[\"”’»)\]]*\s+")
+
+
+def sentences(paragraph):
+    """A paragraph's sentences, not broken after an initial or abbreviation ("J. R. R.", "Mme.")
+    or before a word in lower case ("approx. five")."""
+    out = []
+    for piece in (p for p in re.split(r"((?<=[.!?…])[\"”’»)\]]*)\s+", paragraph)):
+        if piece is None:
+            continue
+        if out and not out[-1].endswith(" ") and re.fullmatch(r"[\"”’»)\]]*", piece):
+            out[-1] += piece + " "                  # closing quotes stay with their sentence
+            continue
+        if out and (_ABBREV.search(out[-1].rstrip()) or (piece[:1].islower())):
+            out[-1] = out[-1].rstrip() + " " + piece
         else:
-            chunks.append(cur)
-            cur = p
-    if cur:
-        chunks.append(cur)
+            out.append(piece)
+    return [s.strip() for s in out if re.search(r"\w", s)]
+
+
+def _clauses(sentence, limit):
+    """A sentence longer than the limit, cut at commas, semicolons and colons."""
+    parts, cur = [], ""
+    for bit in re.split(r"(?<=[,;:])\s+", sentence):
+        if cur and len(cur) + len(bit) + 1 > limit:
+            parts.append(cur)
+            cur = bit
+        else:
+            cur = f"{cur} {bit}" if cur else bit
+    return parts + [cur] if cur else parts
+
+
+def split_text(text):
+    """Split into parts: (text, pause after it). The first part is short, so playback
+    starts quickly; then whole sentences up to MAX_CHUNK characters. A part never
+    runs across a paragraph (a line break), and each paragraph ends with a longer
+    pause. The last part's pause is a paragraph's; the caller makes it a chapter's."""
+    chunks = []
+    for para in text.split("\n"):
+        cur = ""
+        for sent in sentences(para.strip()):
+            for bit in (_clauses(sent, MAX_CHUNK) if len(sent) > 2 * MAX_CHUNK else [sent]):
+                limit = 40 if not chunks else MAX_CHUNK
+                if cur and len(cur) + 1 + len(bit) > limit:
+                    chunks.append((cur, PAUSE["sentence"]))
+                    cur = bit
+                else:
+                    cur = f"{cur} {bit}" if cur else bit
+        if cur:
+            chunks.append((cur, PAUSE["paragraph"]))
     return chunks
 
 
@@ -926,17 +1128,37 @@ def read_job(path):
     return jobdir, job
 
 
+def edges(samples, rate):
+    """Soften a part's first and last few milliseconds, so a trimmed edge can't click."""
+    import numpy as np
+    n = min(len(samples) // 4, int(rate * 0.004)), min(len(samples) // 4, int(rate * 0.012))
+    samples = np.array(samples, dtype=np.float32, copy=True)
+    if n[0]:
+        samples[:n[0]] *= np.linspace(0, 1, n[0], dtype=np.float32)
+    if n[1]:
+        samples[-n[1]:] *= np.linspace(1, 0, n[1], dtype=np.float32)
+    return samples
+
+
+def silence(seconds, rate):
+    import numpy as np
+    return np.zeros(max(0, int(seconds * rate)), dtype=np.float32)
+
+
 def run_job(path):
     import numpy as np
     import soundfile as sf
 
     t0 = time.time()
     jobdir, job = read_job(path)
-    engine = tts()
+    quality = job.get("quality", "standard")
+    if quality not in QUALITIES:
+        raise JobError(f"Quality must be one of: {', '.join(QUALITIES)}")
+    engine = tts(quality)
+    if quality == "high" and model_for("high") != MODEL_HQ:
+        log("The high-quality model isn't downloaded (kokoro --quality high); using the standard one.")
 
-    voice = job.get("voice", "af_heart")
-    if voice not in engine.get_voices():
-        raise JobError(f"Unknown voice '{voice}'. See: kokoro --list-voices")
+    voice = voice_style(engine, job.get("voice", "af_heart"))
     try:
         speed = float(job.get("speed", "1.0"))
     except ValueError:
@@ -970,9 +1192,10 @@ def run_job(path):
         # where each chapter starts is written down for the player's chapter list.
         chunks, starts = [], []
         for heading, text in chapters:
-            parts = split_text(text)
+            parts = split_text(normalise(text, lang))
             if parts:
                 starts.append(f"{len(chunks) + 1}\t{heading.replace(chr(9), ' ').replace(chr(10), ' ')[:80]}")
+                parts[-1] = (parts[-1][0], PAUSE["chapter"])         # a longer breath between chapters
                 chunks += parts
         if not chunks:
             raise JobError("No text to read")
@@ -982,13 +1205,24 @@ def run_job(path):
             first = int(job.get("start", "1"))
         except ValueError:
             first = 1
+        try:
+            was = int(job.get("of", "0"))       # the bookmark's count of parts, if it had one
+        except ValueError:
+            was = 0
+        if was > 1 and was != len(chunks):
+            # Made with another version's parts: the same place, as a fraction of the text.
+            first = 1 + round((first - 1) * len(chunks) / was)
         if not 1 <= first <= len(chunks):
             first = 1   # a bookmark past the end: start again
         if stream:
             _write_atomic(os.path.join(stream, "first"), f"{first}\n")
 
+        try:
+            lead = max(0, min(500, int(job.get("gap_ms", "0")))) / 1000   # the player's own start-up gap
+        except ValueError:
+            lead = 0.0
         for i in range(first, len(chunks) + 1):
-            chunk = chunks[i - 1]
+            chunk, pause = chunks[i - 1]
             if stream:
                 _wait_for_listener(jobdir, stream, i, first)
             # The kokoro command deletes its job folder when it exits or is
@@ -1000,10 +1234,11 @@ def run_job(path):
                 if timed:
                     import words
                     samples, rate, timings = engine.create_timed(chunk, voice=voice, speed=speed, lang=lang)
-                    marks = words.words_from_timings(chunk, timings, lambda ws: phonemize_many(ws, lang))
+                    marks = words.words_from_timings(chunk, timings, lambda ws: phonemize_many(ws, lang, engine))
                 else:
                     samples, rate = engine.create(chunk, voice=voice, speed=speed, lang=lang)
-            total += len(samples) / rate
+            samples = edges(samples, rate)
+            total += len(samples) / rate + pause
             if stream:
                 # The text and its word timings first, so the player has them the
                 # moment the audio lands.
@@ -1011,15 +1246,16 @@ def run_job(path):
                 if timed:
                     _write_atomic(os.path.join(stream, f"{i:04d}.words"), words.player_rows(chunk, marks))
                 tmp = os.path.join(stream, f"{i:04d}.tmp.wav")
-                sf.write(tmp, samples, rate)
+                # The pause goes on the end, less the gap the player leaves anyway.
+                sf.write(tmp, np.concatenate([samples, silence(pause - lead, rate)]), rate)
                 os.replace(tmp, os.path.join(stream, f"{i:04d}.wav"))
             if out:
                 # Written as it's made, so a whole book never has to fit in memory.
                 if writer is None:
                     writer = sf.SoundFile(out, "w", samplerate=rate, channels=1)
-                else:
-                    writer.write(np.zeros(int(rate * 0.2), dtype=np.float32))
                 writer.write(samples)
+                if i < len(chunks):
+                    writer.write(silence(pause, rate))
     finally:
         if writer is not None:
             writer.close()
@@ -1056,14 +1292,14 @@ def _write_atomic(path, text):
 
 # ------------------------------------------------------------------ server
 
-def serve(port, idle):
+def serve(port, idle, quality="standard"):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import parse_qs, urlparse
 
     global SERVING
     SERVING = True
     log("Loading model...")
-    tts()
+    tts(quality)
     token = secrets.token_hex(16)
     state = {"last": time.time(), "busy": 0}
 
@@ -1151,9 +1387,12 @@ def serve(port, idle):
 
 # ------------------------------------------------------------------ download
 
-def download():
+def download(quality="standard"):
     os.makedirs(MODELS, exist_ok=True)
-    for dest, src, label in ((MODEL, MODEL_SRC, "model"), (VOICES, VOICES_SRC, "voices")):
+    files = [(MODEL, MODEL_SRC, "model"), (VOICES, VOICES_SRC, "voices")]
+    if quality == "high":
+        files.append((MODEL_HQ, MODEL_HQ_SRC, "high-quality"))
+    for dest, src, label in files:
         name = os.path.basename(dest)
         if os.path.exists(dest) and os.path.getsize(dest) > 0:
             print(f"@@progress {label} 100 0 0")
@@ -1186,7 +1425,7 @@ def download():
                 print(f"{name}: download interrupted ({e}), retry {attempt}/5", flush=True)
                 time.sleep(2 * attempt)
         else:
-            sys.exit(f"Couldn't download {name}. Run the installer again to resume.")
+            sys.exit(f"Couldn't download {name}. Try again: it picks up where it stopped.")
     if os.path.exists(OLD_MODEL):
         os.remove(OLD_MODEL)   # the timestamped model replaces it (saves 88 MB)
 
@@ -1250,6 +1489,7 @@ def main():
     s = sub.add_parser("serve")
     s.add_argument("--port", type=int, default=8880)
     s.add_argument("--idle", type=int, default=1800, help="stop after this many idle seconds (0 = never)")
+    s.add_argument("--quality", choices=QUALITIES, default="standard", help="the model to load first")
     v = sub.add_parser("voices")
     v.add_argument("--plain", action="store_true", help="one name per line")
     v.add_argument("--width", type=int, default=60)
@@ -1257,7 +1497,10 @@ def main():
     v.add_argument("--color", action="store_true", help="colour even when piped")
     v.add_argument("--accent", default="", help="SGR parameters for the accent colour")
     v.add_argument("--muted", default="", help="SGR parameters for secondary text")
-    sub.add_parser("download")
+    d = sub.add_parser("download")
+    d.add_argument("--quality", choices=QUALITIES, default="standard",
+                   help="high also fetches the full-precision model (326 MB)")
+    sub.add_parser("forget-high", help="delete the full-precision model")
     a = p.parse_args()
 
     if a.cmd == "job":
@@ -1266,7 +1509,7 @@ def main():
         except JobError as e:
             sys.exit(f"Error: {e}")
     elif a.cmd == "serve":
-        serve(a.port, a.idle)
+        serve(a.port, a.idle, a.quality)
     elif a.cmd == "voices":
         names = sorted(tts().get_voices())
         if a.plain:
@@ -1274,7 +1517,11 @@ def main():
         else:
             print_voices(names, a.width, a.default, a.accent, a.muted)
     elif a.cmd == "download":
-        download()
+        download(a.quality)
+    elif a.cmd == "forget-high":
+        for f in (MODEL_HQ, MODEL_HQ + ".part"):
+            if os.path.exists(f):
+                os.remove(f)
 
 
 if __name__ == "__main__":
@@ -1848,7 +2095,7 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
     printf '\033[%d;%dH%sStart something new%s' "$y" "$x0" "$B" "$R" >&2; y=$(( y + 1 ))
     for spec in "c|Read the clipboard$clip_note|clip" "f|Open a file  ${D}text, EPUB or PDF${R}|file" \
                 "u|Read a web page|url" "t|Type something to hear|text" \
-                "v|Voice  ${D}$KOKORO_VOICE · ${KOKORO_SPEED}×${R}|voice" "s|Settings  ${D}speed, colours, highlighting…${R}|settings"; do
+                "v|Voice  ${D}$(voice_label "$(voice_mix)") · ${KOKORO_SPEED}×${R}|voice" "s|Settings  ${D}speed, colours, highlighting…${R}|settings"; do
       IFS='|' read -r key r cmd <<< "$spec"
       printf '\033[%d;%dH %s%s%s  %s' "$y" "$x0" "$ACC2" "$key" "$R" "$r" >&2
       rowact[$y]=$cmd; y=$(( y + 1 ))
@@ -1913,6 +2160,12 @@ voice_desc() {   # voice_desc VOICE: "British English, female"
   printf '%s, %s' "${TUI_LANG_NAME[${TUI_VOICE_LANG[${v:0:1}]:-}]:-Other}" "$g"
 }
 
+blend_amount() {  # how much of the blended voice is in the mix, in percent (30 if unsaid)
+  local a=30; [[ "$KOKORO_BLEND" == *:* ]] && a=${KOKORO_BLEND#*:}
+  [[ "$a" =~ ^[0-9]+$ ]] && [ "$a" -ge 10 ] && [ "$a" -le 90 ] || a=30
+  echo "$a"
+}
+
 voice_sample() { # voice_sample VOICE: hear a voice say a line in its own language
   local v=$1 lang=${TUI_VOICE_LANG[${1:0:1}]:-en-us}
   KOKORO_TUI=0 KOKORO_WORDS=0 KOKORO_NOTIFY=0 \
@@ -1932,8 +2185,11 @@ tui_save() {     # tui_save NAME VALUE: keep a setting (and use it straight away
 TUI_SETTINGS=(
   "#Voice and speech"
   "voice|Voice|The voice that reads to you. Enter opens the list of 54 voices; Space plays a sample."
+  "blend|Blend with|Mix a second voice into yours, for a voice of your own. Enter picks it, Space hears the mix, and ← turns blending off."
+  "blendamt|Blend amount|How much of the second voice is in the mix, from 10% to 90%. ← and → change it in steps of 10; Space hears it."
   "speed|Speed|How fast it reads, from 0.5× to 2×. Use ← and → to change it in steps of 0.1."
   "lang|Language|How words are pronounced. Choosing a voice sets this to match; change it to read another language."
+  "quality|Voice quality|Standard is the 92 MB model: quick, and light on the battery. High is the same voice at full precision (a 326 MB download): cleaner, but each sentence takes longer to make."
   "out|Save files as|The file name used when you save without -o. The ending picks the format: .wav .mp3 .ogg or .flac."
   "#Reading"
   "KOKORO_TUI|Full-screen reader|Open the full-screen reader when you listen on a terminal. Off: show the text below the command instead."
@@ -1957,6 +2213,21 @@ setting_value() {  # what the row shows on the right for setting $1
   case "$id" in
     voice) printf '%s%s%s' "$ACC2" "$KOKORO_VOICE" "$R"
            [ "$SET_NARROW" = 1 ] || printf '  %s%s%s' "$D" "$(voice_desc "$KOKORO_VOICE")" "$R" ;;
+    blend) if [ -z "$KOKORO_BLEND" ]; then printf '%snone%s' "$D" "$R"
+           else printf '%s%s%s' "$ACC2" "${KOKORO_BLEND%%:*}" "$R"
+                [ "$SET_NARROW" = 1 ] || printf '  %s%s%s' "$D" "$(voice_desc "${KOKORO_BLEND%%:*}")" "$R"; fi ;;
+    blendamt)
+      if [ -z "$KOKORO_BLEND" ]; then printf '%s—%s' "$D" "$R"; return 0; fi
+      local w=15 a; [ "$SET_NARROW" = 1 ] && w=9
+      a=$(blend_amount); f=$(( (a - 10) * w / 80 ))
+      printf -v bar '%*s' "$f" ''; bar="$ACC${bar// /━}●$R"
+      printf -v e '%*s' $(( w - f )) ''; bar+="$D${e// /─}$R"
+      printf '%s  %s%%' "$bar" "$a" ;;
+    quality)
+      if [ "$KOKORO_QUALITY" = high ]; then printf '‹ %sHigh%s ›' "$ACC2" "$R"; t="326 MB"
+        hq_ready || t="not downloaded yet"
+      else printf '‹ %sStandard%s ›' "$ACC2" "$R"; t="92 MB"; fi
+      [ "$SET_NARROW" = 1 ] || printf '  %s%s%s' "$D" "$t" "$R" ;;
     speed)
       local w=15; [ "$SET_NARROW" = 1 ] && w=9
       t=$(speed_tenths); f=$(( (t - 5) * w / 15 )); [ "$f" -lt 0 ] && f=0
@@ -1990,6 +2261,30 @@ setting_change() { # setting_change ID STEP: ←/→ (-1/+1); 0 means Enter, a c
   local id=$1 step=$2 t i
   case "$id" in
     voice) [ "$step" = 0 ] && tui_voices ;;
+    blend)
+      if [ "$step" = -1 ]; then
+        [ -n "$KOKORO_BLEND" ] && { tui_save KOKORO_BLEND ""; SETTINGS_NOTE="Blending is off."; }
+      else tui_voices blend; fi ;;
+    blendamt)
+      if [ -z "$KOKORO_BLEND" ]; then SETTINGS_NOTE="Choose a voice to blend with first (Blend with, above)."; return 0; fi
+      [ "$step" = 0 ] && step=1
+      t=$(( $(blend_amount) + step * 10 ))
+      [ "$t" -ge 10 ] && [ "$t" -le 90 ] && tui_save KOKORO_BLEND "${KOKORO_BLEND%%:*}:$t" ;;
+    quality)
+      if [ "$KOKORO_QUALITY" = high ]; then
+        tui_save KOKORO_QUALITY standard
+        hq_ready && SETTINGS_NOTE="Standard. The high-quality model stays on the phone: kokoro --quality standard can delete it."
+      elif hq_ready; then tui_save KOKORO_QUALITY high
+      else
+        tui_prompt "Download the high-quality model now (326 MB)? (y/N)"
+        [[ "$ANSWER" =~ ^[Yy] ]] || return 0
+        tui_cooked; printf '\033[0m\033[?1049l' >&2              # the download, in the open
+        "$0" --quality high </dev/tty >/dev/tty 2>&1 || true
+        read -r -p "Press Enter to go back to the settings. " _ </dev/tty || true
+        printf '\033[?1049h' >&2; tui_raw
+        if hq_ready; then tui_save KOKORO_QUALITY high
+        else SETTINGS_NOTE="The download didn't finish. Choose High again to carry on where it stopped."; fi
+      fi ;;
     speed)
       if [ "$step" = 0 ]; then tui_prompt "Speed, 0.5 to 2.0:" "$KOKORO_SPEED"
         [[ "$ANSWER" =~ ^(0\.[5-9][0-9]?|1(\.[0-9]{1,2})?|2(\.0+)?)$ ]] && tui_save KOKORO_SPEED "$ANSWER"
@@ -2109,7 +2404,7 @@ tui_settings() { # the settings menu; works on its own or from the home screen
       $'\033[D'|$'\033OD'|h|-) setting_change "${items[sel]}" -1 ;;
       $'\033[C'|$'\033OC'|l|+|=) setting_change "${items[sel]}" 1 ;;
       $'\n'|$'\r') setting_change "${items[sel]}" 0 ;;
-      " ") if [ "${items[sel]}" = voice ]; then voice_sample "$KOKORO_VOICE"; else setting_change "${items[sel]}" 0; fi ;;
+      " ") case "${items[sel]}" in voice|blend|blendamt) voice_sample "$(voice_mix)" ;; *) setting_change "${items[sel]}" 0 ;; esac ;;
       $'\033[<0;'*M)
         [[ "$KEY" =~ \;([0-9]+)M$ ]] || continue
         r=${rowsel[${BASH_REMATCH[1]}]:-}
@@ -2121,24 +2416,42 @@ tui_settings() { # the settings menu; works on its own or from the home screen
   if [ "$own" = 1 ]; then tui_close; fi
 }
 
-tui_voices() {   # the voice picker: type to filter, Space to hear, Enter to choose
-  local filter="" sel=0 top=0 list=() v i y view lang prev g key
+tui_pick() {     # tui_pick VOICE MODE: choose it as your voice, or (MODE blend) as the one blended in
+  if [ "$2" = blend ]; then
+    if [ "$1" = "$KOKORO_VOICE" ]; then PICK_NOTE="That's your own voice. Pick another to blend with it."; return 1; fi
+    tui_save KOKORO_BLEND "$1:$(blend_amount)"
+  else
+    tui_save KOKORO_VOICE "$1"
+    tui_save KOKORO_LANG "${TUI_VOICE_LANG[${1:0:1}]:-$KOKORO_LANG}"   # its own language
+  fi
+}
+
+tui_voices() {   # tui_voices [blend]: the voice picker: type to filter, Space to hear, Enter to choose
+  local mode=${1:-} filter="" sel=0 top=0 list=() v i y view lang prev g key cur=$KOKORO_VOICE title="Choose a voice"
   local -A rowsel=()
-  for i in "${!TUI_VOICES[@]}"; do [ "${TUI_VOICES[i]}" = "$KOKORO_VOICE" ] && sel=$i; done
+  PICK_NOTE=""
+  if [ "$mode" = blend ]; then cur=${KOKORO_BLEND%%:*}; title="Blend with a voice"; fi
+  for i in "${!TUI_VOICES[@]}"; do [ "${TUI_VOICES[i]}" = "$cur" ] && sel=$i; done
   while :; do
     tui_size; view=$(( TH - 7 ))
     list=(); for v in "${TUI_VOICES[@]}"; do [[ -z "$filter" || "$v" == *"$filter"* ]] && list+=("$v"); done
     [ "$sel" -ge "${#list[@]}" ] && sel=$(( ${#list[@]} > 0 ? ${#list[@]} - 1 : 0 ))
     [ "$sel" -lt "$top" ] && top=$sel
     [ "$sel" -ge $(( top + view )) ] && top=$(( sel - view + 1 ))
-    printf '%s%s\033[2J\033[1;1H  %skokomux%s  %sChoose a voice%s' "$SYNC_ON" "$R" "$ACC" "$R" "$B" "$R" >&2
+    printf '%s%s\033[2J\033[1;1H  %skokomux%s  %s%s%s' "$SYNC_ON" "$R" "$ACC" "$R" "$B" "$title" "$R" >&2
     printf '\033[1;%dH%s%s%s' $(( TW - 20 )) "$D" "${#list[@]} of ${#TUI_VOICES[@]} voices" "$R" >&2
     printf '\033[2;1H%s%s%s' "$LINE" "$(rule "$TW")" "$R" >&2
     printf '\033[3;%dH%sFilter:%s %s%s▏' "$LM" "$D" "$R" "$filter" "$ACC" >&2; printf '%s' "$R" >&2
+    g=""
+    if [ -n "$PICK_NOTE" ]; then g=$PICK_NOTE
+    elif [ "$mode" = blend ]; then g="mixed into $KOKORO_VOICE at $(blend_amount)%"; fi
+    if [ -n "$g" ] && [ $(( LM + 14 + ${#filter} + ${#g} )) -lt "$TW" ]; then
+      printf '\033[3;%dH%s%s%s' $(( LM + CW - ${#g} )) "$D" "$g" "$R" >&2
+    fi
     rowsel=(); prev=""
     for (( i = top, y = 5; i < ${#list[@]} && y <= TH - 3; i++, y++ )); do
       v=${list[i]}; lang=${TUI_VOICE_LANG[${v:0:1}]:-}; g=female; [ "${v:1:1}" = m ] && g=male
-      local mark=" "; [ "$v" = "$KOKORO_VOICE" ] && mark="$GRN✓$R"
+      local mark=" "; [ "$v" = "$cur" ] && mark="$GRN✓$R"
       if [ "$i" = "$sel" ]; then
         printf '\033[%d;%dH%s%*s\033[%d;%dH%s▎%s%s %s%s %s%-16s%s %s%s · %s%s' \
           "$y" "$LM" "$SEL" "$CW" "" "$y" "$LM" "$ACC" "$R" "$SEL" "${mark//$R/$R$SEL}" "$SEL" "$ACC2" "$v" "$R$SEL" "$D" "${TUI_LANG_NAME[$lang]:-}" "$g" "$R" >&2
@@ -2149,30 +2462,30 @@ tui_voices() {   # the voice picker: type to filter, Space to hear, Enter to cho
     done
     [ "${#list[@]}" = 0 ] && printf '\033[5;%dH%sNo voice matches "%s".%s' "$LM" "$D" "$filter" "$R" >&2
     printf '\033[%d;1H%s%s%s' $(( TH - 1 )) "$LINE" "$(rule "$TW")" "$R" >&2
-    if [ "$TW" -ge 72 ]; then g="type to filter · ↑↓ choose · Space hear it · Enter use it · Esc back"
+    if [ "$mode" = blend ]; then
+      if [ "$TW" -ge 72 ]; then g="type to filter · ↑↓ choose · Space hear the mix · Enter blend it · Esc back"
+      else g="type · ↑↓ · Space hear · Enter blend · Esc"; fi
+    elif [ "$TW" -ge 72 ]; then g="type to filter · ↑↓ choose · Space hear it · Enter use it · Esc back"
     else g="type · ↑↓ · Space hear · Enter use · Esc"; fi
     printf '\033[%d;%dH%s%s%s%s' "$TH" "$LM" "$D" "$g" "$R" "$SYNC_OFF" >&2
 
     KEY=""; tick 0.5; [ -n "$KEY" ] || continue
+    PICK_NOTE=""
     case "$KEY" in
       $'\033[A'|$'\033OA'|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
       $'\033[B'|$'\033OB'|$'\033[<65;'*M) [ "$sel" -lt $(( ${#list[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
       $'\033[5~') sel=$(( sel > view ? sel - view : 0 )) ;;
       $'\033[6~') sel=$(( sel + view < ${#list[@]} ? sel + view : ${#list[@]} - 1 )) ;;
-      " ") [ "${#list[@]}" -gt 0 ] && voice_sample "${list[sel]}" ;;
-      $'\n'|$'\r')
-        if [ "${#list[@]}" -gt 0 ]; then
-          v=${list[sel]}; tui_save KOKORO_VOICE "$v"
-          tui_save KOKORO_LANG "${TUI_VOICE_LANG[${v:0:1}]:-$KOKORO_LANG}"   # its own language
-          return 0
-        fi ;;
+      " ") [ "${#list[@]}" -gt 0 ] || continue
+           if [ "$mode" = blend ]; then voice_sample "$(voice_mix "$KOKORO_VOICE" "${list[sel]}:$(blend_amount)")"
+           else voice_sample "${list[sel]}"; fi ;;
+      $'\n'|$'\r') [ "${#list[@]}" -gt 0 ] && tui_pick "${list[sel]}" "$mode" && return 0 ;;
       $'\177'|$'\b') filter=${filter%?}; sel=0; top=0 ;;
       [a-z_]) filter+=$KEY; sel=0; top=0 ;;
       $'\033[<0;'*M)
         [[ "$KEY" =~ \;([0-9]+)M$ ]] || continue
         i=${rowsel[${BASH_REMATCH[1]}]:-}; [ -n "$i" ] || continue
-        if [ "$i" = "$sel" ]; then v=${list[sel]}; tui_save KOKORO_VOICE "$v"
-          tui_save KOKORO_LANG "${TUI_VOICE_LANG[${v:0:1}]:-$KOKORO_LANG}"; return 0
+        if [ "$i" = "$sel" ]; then tui_pick "${list[sel]}" "$mode" && return 0
         else sel=$i; fi ;;
       $'\033'|q) return 0 ;;
     esac
@@ -2389,10 +2702,10 @@ jump_to() {      # jump_to PART
   tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
   for f in in.txt title chapters; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
   rm -rf "$old"
-  start=$target; i=$target
+  start=$target; i=$target; was_parts=0          # (a part in this run's own numbering)
   write_job
   run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
-  if [ "$ui" = tui ]; then tui_hist=(); TUI_PART=0; TUI_WRAP=(); TUI_OFFS=(); TUI_INFO="$voice · ${speed}×"; tui_draw; fi
+  if [ "$ui" = tui ]; then tui_hist=(); TUI_PART=0; TUI_WRAP=(); TUI_OFFS=(); TUI_INFO="$(voice_label "$voice") · ${speed}×"; tui_draw; fi
 }
 
 # Commands that change where or how it reads (from a key, a click or the menu).
@@ -2758,11 +3071,13 @@ CFG
     cp "$SRC/engine.py" "$SRC/words.py" "$APP/"
     rm -f "$APP/speak.py"   # from older versions
     ;;
-  models)
-    if [ -s "$APP/models/kokoro-v1.0-timestamped.int8.onnx" ] && [ -s "$APP/models/voices-v1.0.bin" ]; then
+  models)   # setup.sh models [standard|high]: high also keeps the full-precision model
+    quality=${2:-standard}
+    if [ -s "$APP/models/kokoro-v1.0-timestamped.int8.onnx" ] && [ -s "$APP/models/voices-v1.0.bin" ] &&
+       { [ "$quality" != high ] || [ -s "$APP/models/kokoro-v1.0-timestamped.fp32.onnx" ]; }; then
       printf 'already downloaded' > "$SRC/.note"
     fi
-    "$APP/venv/bin/python" -u "$APP/engine.py" download
+    "$APP/venv/bin/python" -u "$APP/engine.py" download --quality "$quality"
     ;;
   tidy)
     apt-get clean
@@ -2785,7 +3100,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
 # localhost (fast); otherwise each call starts the container (slower).
 set -euo pipefail
 
-KOKOMUX_VERSION="0.10.0"
+KOKOMUX_VERSION="0.11.0"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -2798,6 +3113,8 @@ env_overrides=""
 # The defaults, in one place (the settings menu's "Reset to defaults" uses them too).
 KOKORO_DEFAULTS=(
   KOKORO_VOICE=af_heart         # see: kokoro --list-voices
+  KOKORO_BLEND=                 # a second voice mixed in, and how much: af_bella:30 (empty: none)
+  KOKORO_QUALITY=standard       # standard (92 MB model) or high (326 MB, full precision)
   KOKORO_SPEED=1.0              # 0.5 to 2.0
   KOKORO_LANG=en-us
   KOKORO_OUT=kokoro.wav         # file name when -o isn't given
@@ -2818,6 +3135,8 @@ KOKORO_REPO_RAW=https://raw.githubusercontent.com/Anesu/kokomux/main
 eval "$env_overrides"
 
 DISTRO=kokoro
+ROOTFS="$PREFIX/var/lib/proot-distro/installed-rootfs/$DISTRO"   # the container, seen from Termux
+MODEL_HQ="$ROOTFS/opt/kokoro/models/kokoro-v1.0-timestamped.fp32.onnx"
 PY=/opt/kokoro/venv/bin/python
 ENGINE=/opt/kokoro/engine.py
 SRV_DIR="$PREFIX/tmp/kokoro-server"
@@ -2896,6 +3215,43 @@ status_clear() { [ "$LIVE" = 1 ] && printf '\r\033[K' >&2; return 0; }
 
 # shellcheck disable=SC2088  # a literal ~ is the point
 tilde() { case "$1" in "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac; }
+# Voices: one, or several blended ("af_heart:70+af_bella:30").
+VOICE_RE='^[a-z]{2}_[a-z0-9]+(:[0-9]{1,3})?(\+[a-z]{2}_[a-z0-9]+(:[0-9]{1,3})?){0,3}$'
+voice_mix() {    # voice_mix [VOICE [BLEND]]: the voice to use, with KOKORO_BLEND ("af_bella:30") mixed in
+  local v=${1:-$KOKORO_VOICE} b=${2-$KOKORO_BLEND} n a=30
+  n=${b%%:*}; [[ "$b" == *:* ]] && a=${b#*:}
+  if [ -n "$n" ] && [ "$n" != "$v" ] && [[ "$v" != *[+:]* ]] && [[ "$a" =~ ^[0-9]+$ ]] && [ "$a" -gt 0 ] && [ "$a" -lt 100 ]; then
+    printf '%s:%s+%s:%s' "$v" $(( 100 - a )) "$n" "$a"
+  else printf '%s' "$v"; fi
+}
+voice_label() {  # voice_label SPEC: "af_heart:70+af_bella:30" -> "af_heart + af_bella"
+  local s=$1
+  while [[ "$s" =~ ^(.*):[0-9]+(.*)$ ]]; do s=${BASH_REMATCH[1]}${BASH_REMATCH[2]}; done
+  printf '%s' "${s//+/ + }"
+}
+hq_ready() { [ -s "$MODEL_HQ" ]; }   # is the full-precision model on the phone?
+conf_set() {     # conf_set NAME VALUE: keep a setting in the settings file
+  mkdir -p "$CONF_DIR"; [ -f "$CONF" ] || : > "$CONF"
+  if grep -q "^$1=" "$CONF"; then sed -i "s|^$1=[^ #]*|$1=$2|" "$CONF"; else echo "$1=$2" >> "$CONF"; fi
+  printf -v "$1" '%s' "$2"
+}
+hq_download() {  # fetch the full-precision model, showing how far it's got; resumes if stopped
+  local line pct got total rc
+  exec 3< <(proot-distro login "$DISTRO" -- "$PY" -u "$ENGINE" download --quality high 2>&1; echo "@@rc $?")
+  while IFS= read -r line <&3; do
+    case "$line" in
+      "@@progress high-quality "*)
+        read -r _ _ pct got total <<< "$line"
+        status "Downloading the high-quality model" "$pct% · $got of $total MB" ;;
+      "@@rc "*) rc=${line#@@rc } ;;
+      "@@progress "*) ;;
+      *) [ "$LIVE" = 1 ] || printf '%s\n' "$line" >&2 ;;
+    esac
+  done
+  exec 3<&-
+  status_clear
+  [ "${rc:-1}" = 0 ] && hq_ready
+}
 human_size() {
   local b=$1
   if [ "$b" -ge 1048576 ]; then awk "BEGIN { printf \"%.1f MB\", $b / 1048576 }"
@@ -2925,7 +3281,7 @@ usage() {
   opt_rows <<'ROWS'
 -p, --play|play as it's made
 -o FILE|save as .wav .mp3 .ogg or .flac
--v VOICE|voice, e.g. af_heart, bm_george
+-v VOICE|voice, e.g. af_heart, or a blend: af_heart:70+af_bella:30
 -s SPEED|0.5 to 2.0
 -l LANG|en-us en-gb es fr-fr it pt-br hi
 ROWS
@@ -2950,6 +3306,7 @@ ROWS
 --list-voices|all 54 voices by language
 --status|server status and settings
 --settings|voice, speed, highlighting and more
+--quality high|a cleaner voice (326 MB download); standard: back
 --config|edit the settings file directly
 --serve / --stop-server|start or stop the server
 --update|update kokomux and Kokoro
@@ -2979,7 +3336,7 @@ start_server() {
   # Ignore Ctrl+C and hang-ups so the server outlives the command that started it.
   ( trap '' INT HUP
     exec nohup proot-distro login "$DISTRO" --shared-tmp -- \
-      "$PY" "$ENGINE" serve --port "$KOKORO_PORT" --idle "$((KOKORO_IDLE_MINUTES * 60))"
+      "$PY" "$ENGINE" serve --port "$KOKORO_PORT" --idle "$((KOKORO_IDLE_MINUTES * 60))" --quality "$KOKORO_QUALITY"
   ) > "$SRV_DIR/log" 2>&1 < /dev/null &
   local pid=$! n=0
   [ "$LIVE" = 1 ] || echo "Starting the Kokoro server..." >&2
@@ -3128,6 +3485,30 @@ case "${1:-}" in
     done_msg "Server ready." "port $(server_port) · stops after ${KOKORO_IDLE_MINUTES} min unused"
     exit 0 ;;
   --stop-server) stop_server; exit 0 ;;
+  --quality)
+    case "${2:-}" in
+      high)
+        if ! hq_ready; then
+          info "Downloading the high-quality model (326 MB). If it stops, run this again to carry on."
+          hq_download || die "The download didn't finish." "Run kokoro --quality high again: it picks up where it stopped."
+        fi
+        conf_set KOKORO_QUALITY high
+        done_msg "Voice quality: high." "Each sentence takes longer to make. kokoro --quality standard switches back." ;;
+      standard)
+        conf_set KOKORO_QUALITY standard
+        done_msg "Voice quality: standard."
+        if hq_ready && [ -t 0 ] && [ "${3:-}" != --keep ]; then
+          read -r -p "Delete the high-quality model to free 326 MB? [y/N] " ans
+          if [[ "$ans" =~ ^[Yy] ]]; then
+            proot-distro login "$DISTRO" -- "$PY" "$ENGINE" forget-high && done_msg "Deleted the high-quality model."
+          fi
+        fi ;;
+      "") info "Voice quality: $KOKORO_QUALITY$( [ "$KOKORO_QUALITY" = high ] && ! hq_ready && echo " (not downloaded yet)")"
+          printf '  %skokoro --quality high   a cleaner voice: the full-precision model (326 MB)%s\n' "$D" "$R" >&2
+          printf '  %skokoro --quality standard   the 92 MB model: quicker, lighter on the battery%s\n' "$D" "$R" >&2 ;;
+      *) die "Quality is standard or high." "kokoro --quality high, or kokoro --quality standard" ;;
+    esac
+    exit 0 ;;
   --status)
     printf '%skokomux%s %sv%s%s\n\n' "$B" "$R" "$ACC" "$KOKOMUX_VERSION" "$R"
     if server_up; then
@@ -3138,7 +3519,10 @@ case "${1:-}" in
       printf '  %s○%s Server    off %s(KOKORO_AUTOSERVE=0)%s\n' "$D" "$R" "$D" "$R"
     fi
     idle="${KOKORO_IDLE_MINUTES} min"; [ "$KOKORO_IDLE_MINUTES" = 0 ] && idle="never"
-    printf '    Voice     %s%s%s\n' "$ACC2" "$KOKORO_VOICE" "$R"
+    printf '    Voice     %s%s%s\n' "$ACC2" "$(voice_mix)" "$R"
+    if [ "$KOKORO_QUALITY" = high ] && ! hq_ready; then
+      printf '    Quality   high %s(not downloaded, so standard: kokoro --quality high)%s\n' "$D" "$R"
+    else printf '    Quality   %s\n' "$KOKORO_QUALITY"; fi
     printf '    Speed     %s\n' "$KOKORO_SPEED"
     printf '    Language  %s\n' "$KOKORO_LANG"
     printf '    Idle stop %s\n' "$idle"
@@ -3205,7 +3589,7 @@ esac
 # ------------------------------------------------------------ options
 
 out=""; infile=""; url=""; play=0; clip=0; restart=0; words=()
-voice="$KOKORO_VOICE"; speed="$KOKORO_SPEED"; lang="$KOKORO_LANG"
+voice="$(voice_mix)"; speed="$KOKORO_SPEED"; lang="$KOKORO_LANG"
 need() { [ $# -ge 2 ] || die "$1 needs a value." "See: kokoro --help"; }
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -3230,7 +3614,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[[ "$voice" =~ ^[A-Za-z0-9_]+$ ]] || die "\"$voice\" isn't a voice name." "See: kokoro --list-voices"
+[[ "$voice" =~ $VOICE_RE ]] || die "\"$voice\" isn't a voice name." "One voice, like af_heart, or a blend, like af_heart:70+af_bella:30. See: kokoro --list-voices"
 [[ "$speed" =~ ^[0-9]*\.?[0-9]+$ ]] || die "Speed must be a number, like 1.2"
 [[ "$lang" =~ ^[A-Za-z0-9-]+$ ]] || die "\"$lang\" isn't a language code." "Try en-us, en-gb, es, fr-fr, it, pt-br or hi."
 
@@ -3324,15 +3708,18 @@ fi
 if [ -n "$url" ]; then kind=url source=$url name=$url
 elif [ -n "$infile" ]; then kind=file source="$(realpath "$infile")" name="$(basename "$infile")"
 else kind=text source="" name="$(head -c 60 "$text" | tr '\n' ' ')"; fi
-book_id=""; start=1
+book_id=""; start=1; was_parts=0
 if [ "$play" = 1 ] && [ -z "$out" ]; then
   if [ "$kind" = url ]; then book_id="$(printf '%s' "$url" | sha256sum | cut -c1-16)"
   else book_id="$(sha256sum < "$text" | cut -c1-16)"; fi
   mark="$BOOKS/$book_id.mark"
   if [ "$restart" = 1 ]; then rm -f "$mark" "$BOOKS/$book_id.txt"
   elif [ -f "$mark" ] && [ "$(mark_get "$mark" part)" -gt 1 ] 2>/dev/null; then
-    start="$(mark_get "$mark" part)"
-    info "Picking up at part $start of $(mark_get "$mark" parts)."
+    start="$(mark_get "$mark" part)"; was_parts="$(mark_get "$mark" parts)"
+    [[ "$was_parts" =~ ^[0-9]+$ ]] && [ "$was_parts" -gt 0 ] || was_parts=0
+    if [ "$was_parts" -gt 0 ]; then
+      info "Picking up where you stopped, $(( (start - 1) * 100 / was_parts ))% of the way through."
+    else info "Picking up where you stopped."; fi
     printf '  %s(--restart starts from the top)%s\n' "$D" "$R" >&2
   fi
 fi
@@ -3352,9 +3739,12 @@ write_job() {    # the job, for the engine (where it starts and how fast can cha
     echo "voice=$voice"
     echo "speed=$speed"
     echo "lang=$lang"
+    echo "quality=$KOKORO_QUALITY"
     [ -n "$url" ] && echo "url=$url"
     echo "name=$name"
     [ "$start" -gt 1 ] && echo "start=$start"
+    [ "$was_parts" -gt 0 ] && echo "of=$was_parts"   # the bookmark's count: the engine maps it if its parts differ
+    echo "gap_ms=${KOKORO_WORDS_OFFSET_MS:-100}"     # play-audio's start-up gap, taken off each pause
     [ -n "$out" ] && echo "out=out.$ext"
     [ "$play" = 1 ] && echo "stream=1"
     [ "$show_words" = 1 ] && echo "words=1"
@@ -3414,13 +3804,13 @@ if [ "$play" = 1 ]; then
 fi
 run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
 if [ "$ui" = tui ]; then
-  TUI_TITLE=$name; TUI_INFO="$voice · ${speed}×"; tui_open
+  TUI_TITLE=$name; TUI_INFO="$(voice_label "$voice") · ${speed}×"; tui_open
 fi
 
 i=$start
 while :; do
   # The engine starts over at part 1 if a bookmark points past the end (the text changed).
-  [ "$i" = "$start" ] && [ -f "$tmpd/stream/first" ] && { read -r i < "$tmpd/stream/first" || i=$start; start=$i; }
+  [ "$i" = "$start" ] && [ -f "$tmpd/stream/first" ] && { read -r i < "$tmpd/stream/first" || i=$start; start=$i; was_parts=0; }
   f="$(printf '%s/stream/%04d.wav' "$tmpd" "$i")"
   if [ "$play" = 1 ] && [ -f "$f" ]; then
     play_line "$f" "$i"
@@ -3534,6 +3924,8 @@ kokoro_command() {
 # kokomux settings, used by every `kokoro` command. Edit with: kokoro --config
 
 KOKORO_VOICE=af_heart     # see: kokoro --list-voices
+KOKORO_BLEND=             # mix in a second voice, and how much of it: e.g. af_bella:30
+KOKORO_QUALITY=standard   # standard, or high: a cleaner voice (kokoro --quality high downloads it)
 KOKORO_SPEED=1.0          # 0.5 to 2.0
 KOKORO_LANG=en-us         # en-us en-gb es fr-fr it pt-br hi
 KOKORO_OUT=kokoro.wav     # file name when -o isn't given (.wav .mp3 .ogg .flac)
@@ -3623,9 +4015,12 @@ step "Python" \
 step "Kokoro" \
   "Installing Python packages failed. Check your connection and try again." \
   in_container pip
+# The voice quality chosen in the settings: high keeps the full-precision model too.
+QUALITY="$(sed -n 's/^KOKORO_QUALITY=\([a-z]*\).*/\1/p' "$HOME/.config/kokoro/config" 2>/dev/null | tail -n 1)"
+[ "$QUALITY" = high ] || QUALITY=standard
 step "Download" \
   "The download was interrupted. Running the installer again resumes it." \
-  in_container models
+  in_container models "$QUALITY"
 step "kokoro command" \
   "Couldn't finish setting up. The log below says why." \
   kokoro_command

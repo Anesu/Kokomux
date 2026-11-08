@@ -35,11 +35,13 @@ CFG
     cp "$SRC/engine.py" "$SRC/words.py" "$APP/"
     rm -f "$APP/speak.py"   # from older versions
     ;;
-  models)
-    if [ -s "$APP/models/kokoro-v1.0-timestamped.int8.onnx" ] && [ -s "$APP/models/voices-v1.0.bin" ]; then
+  models)   # setup.sh models [standard|high]: high also keeps the full-precision model
+    quality=${2:-standard}
+    if [ -s "$APP/models/kokoro-v1.0-timestamped.int8.onnx" ] && [ -s "$APP/models/voices-v1.0.bin" ] &&
+       { [ "$quality" != high ] || [ -s "$APP/models/kokoro-v1.0-timestamped.fp32.onnx" ]; }; then
       printf 'already downloaded' > "$SRC/.note"
     fi
-    "$APP/venv/bin/python" -u "$APP/engine.py" download
+    "$APP/venv/bin/python" -u "$APP/engine.py" download --quality "$quality"
     ;;
   tidy)
     apt-get clean

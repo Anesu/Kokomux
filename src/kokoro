@@ -20,6 +20,8 @@ env_overrides=""
 # The defaults, in one place (the settings menu's "Reset to defaults" uses them too).
 KOKORO_DEFAULTS=(
   KOKORO_VOICE=af_heart         # see: kokoro --list-voices
+  KOKORO_BLEND=                 # a second voice mixed in, and how much: af_bella:30 (empty: none)
+  KOKORO_QUALITY=standard       # standard (92 MB model) or high (326 MB, full precision)
   KOKORO_SPEED=1.0              # 0.5 to 2.0
   KOKORO_LANG=en-us
   KOKORO_OUT=kokoro.wav         # file name when -o isn't given
@@ -40,6 +42,8 @@ KOKORO_REPO_RAW=https://raw.githubusercontent.com/Anesu/kokomux/main
 eval "$env_overrides"
 
 DISTRO=kokoro
+ROOTFS="$PREFIX/var/lib/proot-distro/installed-rootfs/$DISTRO"   # the container, seen from Termux
+MODEL_HQ="$ROOTFS/opt/kokoro/models/kokoro-v1.0-timestamped.fp32.onnx"
 PY=/opt/kokoro/venv/bin/python
 ENGINE=/opt/kokoro/engine.py
 SRV_DIR="$PREFIX/tmp/kokoro-server"
@@ -118,6 +122,43 @@ status_clear() { [ "$LIVE" = 1 ] && printf '\r\033[K' >&2; return 0; }
 
 # shellcheck disable=SC2088  # a literal ~ is the point
 tilde() { case "$1" in "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac; }
+# Voices: one, or several blended ("af_heart:70+af_bella:30").
+VOICE_RE='^[a-z]{2}_[a-z0-9]+(:[0-9]{1,3})?(\+[a-z]{2}_[a-z0-9]+(:[0-9]{1,3})?){0,3}$'
+voice_mix() {    # voice_mix [VOICE [BLEND]]: the voice to use, with KOKORO_BLEND ("af_bella:30") mixed in
+  local v=${1:-$KOKORO_VOICE} b=${2-$KOKORO_BLEND} n a=30
+  n=${b%%:*}; [[ "$b" == *:* ]] && a=${b#*:}
+  if [ -n "$n" ] && [ "$n" != "$v" ] && [[ "$v" != *[+:]* ]] && [[ "$a" =~ ^[0-9]+$ ]] && [ "$a" -gt 0 ] && [ "$a" -lt 100 ]; then
+    printf '%s:%s+%s:%s' "$v" $(( 100 - a )) "$n" "$a"
+  else printf '%s' "$v"; fi
+}
+voice_label() {  # voice_label SPEC: "af_heart:70+af_bella:30" -> "af_heart + af_bella"
+  local s=$1
+  while [[ "$s" =~ ^(.*):[0-9]+(.*)$ ]]; do s=${BASH_REMATCH[1]}${BASH_REMATCH[2]}; done
+  printf '%s' "${s//+/ + }"
+}
+hq_ready() { [ -s "$MODEL_HQ" ]; }   # is the full-precision model on the phone?
+conf_set() {     # conf_set NAME VALUE: keep a setting in the settings file
+  mkdir -p "$CONF_DIR"; [ -f "$CONF" ] || : > "$CONF"
+  if grep -q "^$1=" "$CONF"; then sed -i "s|^$1=[^ #]*|$1=$2|" "$CONF"; else echo "$1=$2" >> "$CONF"; fi
+  printf -v "$1" '%s' "$2"
+}
+hq_download() {  # fetch the full-precision model, showing how far it's got; resumes if stopped
+  local line pct got total rc
+  exec 3< <(proot-distro login "$DISTRO" -- "$PY" -u "$ENGINE" download --quality high 2>&1; echo "@@rc $?")
+  while IFS= read -r line <&3; do
+    case "$line" in
+      "@@progress high-quality "*)
+        read -r _ _ pct got total <<< "$line"
+        status "Downloading the high-quality model" "$pct% · $got of $total MB" ;;
+      "@@rc "*) rc=${line#@@rc } ;;
+      "@@progress "*) ;;
+      *) [ "$LIVE" = 1 ] || printf '%s\n' "$line" >&2 ;;
+    esac
+  done
+  exec 3<&-
+  status_clear
+  [ "${rc:-1}" = 0 ] && hq_ready
+}
 human_size() {
   local b=$1
   if [ "$b" -ge 1048576 ]; then awk "BEGIN { printf \"%.1f MB\", $b / 1048576 }"
@@ -147,7 +188,7 @@ usage() {
   opt_rows <<'ROWS'
 -p, --play|play as it's made
 -o FILE|save as .wav .mp3 .ogg or .flac
--v VOICE|voice, e.g. af_heart, bm_george
+-v VOICE|voice, e.g. af_heart, or a blend: af_heart:70+af_bella:30
 -s SPEED|0.5 to 2.0
 -l LANG|en-us en-gb es fr-fr it pt-br hi
 ROWS
@@ -172,6 +213,7 @@ ROWS
 --list-voices|all 54 voices by language
 --status|server status and settings
 --settings|voice, speed, highlighting and more
+--quality high|a cleaner voice (326 MB download); standard: back
 --config|edit the settings file directly
 --serve / --stop-server|start or stop the server
 --update|update kokomux and Kokoro
@@ -201,7 +243,7 @@ start_server() {
   # Ignore Ctrl+C and hang-ups so the server outlives the command that started it.
   ( trap '' INT HUP
     exec nohup proot-distro login "$DISTRO" --shared-tmp -- \
-      "$PY" "$ENGINE" serve --port "$KOKORO_PORT" --idle "$((KOKORO_IDLE_MINUTES * 60))"
+      "$PY" "$ENGINE" serve --port "$KOKORO_PORT" --idle "$((KOKORO_IDLE_MINUTES * 60))" --quality "$KOKORO_QUALITY"
   ) > "$SRV_DIR/log" 2>&1 < /dev/null &
   local pid=$! n=0
   [ "$LIVE" = 1 ] || echo "Starting the Kokoro server..." >&2
@@ -350,6 +392,30 @@ case "${1:-}" in
     done_msg "Server ready." "port $(server_port) · stops after ${KOKORO_IDLE_MINUTES} min unused"
     exit 0 ;;
   --stop-server) stop_server; exit 0 ;;
+  --quality)
+    case "${2:-}" in
+      high)
+        if ! hq_ready; then
+          info "Downloading the high-quality model (326 MB). If it stops, run this again to carry on."
+          hq_download || die "The download didn't finish." "Run kokoro --quality high again: it picks up where it stopped."
+        fi
+        conf_set KOKORO_QUALITY high
+        done_msg "Voice quality: high." "Each sentence takes longer to make. kokoro --quality standard switches back." ;;
+      standard)
+        conf_set KOKORO_QUALITY standard
+        done_msg "Voice quality: standard."
+        if hq_ready && [ -t 0 ] && [ "${3:-}" != --keep ]; then
+          read -r -p "Delete the high-quality model to free 326 MB? [y/N] " ans
+          if [[ "$ans" =~ ^[Yy] ]]; then
+            proot-distro login "$DISTRO" -- "$PY" "$ENGINE" forget-high && done_msg "Deleted the high-quality model."
+          fi
+        fi ;;
+      "") info "Voice quality: $KOKORO_QUALITY$( [ "$KOKORO_QUALITY" = high ] && ! hq_ready && echo " (not downloaded yet)")"
+          printf '  %skokoro --quality high   a cleaner voice: the full-precision model (326 MB)%s\n' "$D" "$R" >&2
+          printf '  %skokoro --quality standard   the 92 MB model: quicker, lighter on the battery%s\n' "$D" "$R" >&2 ;;
+      *) die "Quality is standard or high." "kokoro --quality high, or kokoro --quality standard" ;;
+    esac
+    exit 0 ;;
   --status)
     printf '%skokomux%s %sv%s%s\n\n' "$B" "$R" "$ACC" "$KOKOMUX_VERSION" "$R"
     if server_up; then
@@ -360,7 +426,10 @@ case "${1:-}" in
       printf '  %s○%s Server    off %s(KOKORO_AUTOSERVE=0)%s\n' "$D" "$R" "$D" "$R"
     fi
     idle="${KOKORO_IDLE_MINUTES} min"; [ "$KOKORO_IDLE_MINUTES" = 0 ] && idle="never"
-    printf '    Voice     %s%s%s\n' "$ACC2" "$KOKORO_VOICE" "$R"
+    printf '    Voice     %s%s%s\n' "$ACC2" "$(voice_mix)" "$R"
+    if [ "$KOKORO_QUALITY" = high ] && ! hq_ready; then
+      printf '    Quality   high %s(not downloaded, so standard: kokoro --quality high)%s\n' "$D" "$R"
+    else printf '    Quality   %s\n' "$KOKORO_QUALITY"; fi
     printf '    Speed     %s\n' "$KOKORO_SPEED"
     printf '    Language  %s\n' "$KOKORO_LANG"
     printf '    Idle stop %s\n' "$idle"
@@ -427,7 +496,7 @@ esac
 # ------------------------------------------------------------ options
 
 out=""; infile=""; url=""; play=0; clip=0; restart=0; words=()
-voice="$KOKORO_VOICE"; speed="$KOKORO_SPEED"; lang="$KOKORO_LANG"
+voice="$(voice_mix)"; speed="$KOKORO_SPEED"; lang="$KOKORO_LANG"
 need() { [ $# -ge 2 ] || die "$1 needs a value." "See: kokoro --help"; }
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -452,7 +521,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[[ "$voice" =~ ^[A-Za-z0-9_]+$ ]] || die "\"$voice\" isn't a voice name." "See: kokoro --list-voices"
+[[ "$voice" =~ $VOICE_RE ]] || die "\"$voice\" isn't a voice name." "One voice, like af_heart, or a blend, like af_heart:70+af_bella:30. See: kokoro --list-voices"
 [[ "$speed" =~ ^[0-9]*\.?[0-9]+$ ]] || die "Speed must be a number, like 1.2"
 [[ "$lang" =~ ^[A-Za-z0-9-]+$ ]] || die "\"$lang\" isn't a language code." "Try en-us, en-gb, es, fr-fr, it, pt-br or hi."
 
@@ -546,15 +615,18 @@ fi
 if [ -n "$url" ]; then kind=url source=$url name=$url
 elif [ -n "$infile" ]; then kind=file source="$(realpath "$infile")" name="$(basename "$infile")"
 else kind=text source="" name="$(head -c 60 "$text" | tr '\n' ' ')"; fi
-book_id=""; start=1
+book_id=""; start=1; was_parts=0
 if [ "$play" = 1 ] && [ -z "$out" ]; then
   if [ "$kind" = url ]; then book_id="$(printf '%s' "$url" | sha256sum | cut -c1-16)"
   else book_id="$(sha256sum < "$text" | cut -c1-16)"; fi
   mark="$BOOKS/$book_id.mark"
   if [ "$restart" = 1 ]; then rm -f "$mark" "$BOOKS/$book_id.txt"
   elif [ -f "$mark" ] && [ "$(mark_get "$mark" part)" -gt 1 ] 2>/dev/null; then
-    start="$(mark_get "$mark" part)"
-    info "Picking up at part $start of $(mark_get "$mark" parts)."
+    start="$(mark_get "$mark" part)"; was_parts="$(mark_get "$mark" parts)"
+    [[ "$was_parts" =~ ^[0-9]+$ ]] && [ "$was_parts" -gt 0 ] || was_parts=0
+    if [ "$was_parts" -gt 0 ]; then
+      info "Picking up where you stopped, $(( (start - 1) * 100 / was_parts ))% of the way through."
+    else info "Picking up where you stopped."; fi
     printf '  %s(--restart starts from the top)%s\n' "$D" "$R" >&2
   fi
 fi
@@ -574,9 +646,12 @@ write_job() {    # the job, for the engine (where it starts and how fast can cha
     echo "voice=$voice"
     echo "speed=$speed"
     echo "lang=$lang"
+    echo "quality=$KOKORO_QUALITY"
     [ -n "$url" ] && echo "url=$url"
     echo "name=$name"
     [ "$start" -gt 1 ] && echo "start=$start"
+    [ "$was_parts" -gt 0 ] && echo "of=$was_parts"   # the bookmark's count: the engine maps it if its parts differ
+    echo "gap_ms=${KOKORO_WORDS_OFFSET_MS:-100}"     # play-audio's start-up gap, taken off each pause
     [ -n "$out" ] && echo "out=out.$ext"
     [ "$play" = 1 ] && echo "stream=1"
     [ "$show_words" = 1 ] && echo "words=1"
@@ -636,13 +711,13 @@ if [ "$play" = 1 ]; then
 fi
 run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
 if [ "$ui" = tui ]; then
-  TUI_TITLE=$name; TUI_INFO="$voice · ${speed}×"; tui_open
+  TUI_TITLE=$name; TUI_INFO="$(voice_label "$voice") · ${speed}×"; tui_open
 fi
 
 i=$start
 while :; do
   # The engine starts over at part 1 if a bookmark points past the end (the text changed).
-  [ "$i" = "$start" ] && [ -f "$tmpd/stream/first" ] && { read -r i < "$tmpd/stream/first" || i=$start; start=$i; }
+  [ "$i" = "$start" ] && [ -f "$tmpd/stream/first" ] && { read -r i < "$tmpd/stream/first" || i=$start; start=$i; was_parts=0; }
   f="$(printf '%s/stream/%04d.wav' "$tmpd" "$i")"
   if [ "$play" = 1 ] && [ -f "$f" ]; then
     play_line "$f" "$i"

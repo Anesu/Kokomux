@@ -431,6 +431,8 @@ kokoro_command() {
 # kokomux settings, used by every `kokoro` command. Edit with: kokoro --config
 
 KOKORO_VOICE=af_heart     # see: kokoro --list-voices
+KOKORO_BLEND=             # mix in a second voice, and how much of it: e.g. af_bella:30
+KOKORO_QUALITY=standard   # standard, or high: a cleaner voice (kokoro --quality high downloads it)
 KOKORO_SPEED=1.0          # 0.5 to 2.0
 KOKORO_LANG=en-us         # en-us en-gb es fr-fr it pt-br hi
 KOKORO_OUT=kokoro.wav     # file name when -o isn't given (.wav .mp3 .ogg .flac)
@@ -520,9 +522,12 @@ step "Python" \
 step "Kokoro" \
   "Installing Python packages failed. Check your connection and try again." \
   in_container pip
+# The voice quality chosen in the settings: high keeps the full-precision model too.
+QUALITY="$(sed -n 's/^KOKORO_QUALITY=\([a-z]*\).*/\1/p' "$HOME/.config/kokoro/config" 2>/dev/null | tail -n 1)"
+[ "$QUALITY" = high ] || QUALITY=standard
 step "Download" \
   "The download was interrupted. Running the installer again resumes it." \
-  in_container models
+  in_container models "$QUALITY"
 step "kokoro command" \
   "Couldn't finish setting up. The log below says why." \
   kokoro_command

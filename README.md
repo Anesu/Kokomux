@@ -18,7 +18,7 @@ While it reads aloud, kokomux shows the text and lights up each word as it's spo
 
 ## Install
 
-You need **Termux from F-Droid or GitHub** (the Play Store version is outdated), a 64-bit phone, and about **600 MB** of free space. Then run this in Termux:
+You need **Termux from F-Droid or GitHub** (the Play Store version is outdated), a 64-bit phone, and about **600 MB** of free space (another 330 MB if you choose the high-quality voice later). Then run this in Termux:
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/Anesu/kokomux/main/install.sh && bash install.sh
@@ -53,7 +53,7 @@ kokoro --stop                             # stop playback
 |---|---|
 | `-p` | Play while it's being made. Nothing is saved unless you also give `-o`. |
 | `-o FILE` | Save to FILE. The ending picks the format: `.wav`, `.mp3`, `.ogg` or `.flac`. |
-| `-v NAME` | Voice, e.g. `af_heart`, `am_adam`, `bf_emma`, `bm_george` |
+| `-v NAME` | Voice, e.g. `af_heart`, `am_adam`, `bf_emma`, `bm_george`, or a blend: `af_heart:70+bf_emma:30` |
 | `-s N` | Speed, 0.5–2.0 |
 | `-l CODE` | Language: `en-us`, `en-gb`, `es`, `fr-fr`, `it`, `pt-br`, `hi`. Use a voice for that language too. |
 | `-f FILE` | Read a text file, an EPUB or a PDF |
@@ -61,6 +61,22 @@ kokoro --stop                             # stop playback
 | `-u URL` | Read a web page. Menus, sidebars, tables and references are skipped. |
 
 **Voices:** the first two letters of a voice name tell you its accent and gender. `a` is American, `b` British, then `f` for female and `m` for male. Other languages have their own voices, such as `ef_dora` for Spanish and `ff_siwis` for French. `kokoro --list-voices` shows all 54.
+
+## Better-sounding speech
+
+- **Voice quality.** kokomux normally uses the 8-bit version of Kokoro (92 MB). It's quick and light on the battery, but it can sound faintly buzzy. `kokoro --quality high` downloads the full-precision model (326 MB) and switches to it, for a cleaner voice. Each sentence then takes longer to make, so try it on your phone and see whether playback keeps up. `kokoro --quality standard` switches back, and offers to delete the big model. It's also in the settings, as **Voice quality**.
+- **Blend voices.** Mix two (or up to four) voices into one of your own: `-v af_heart:70+bf_emma:30` is 70% `af_heart` and 30% `bf_emma`, and `af_heart+af_bella` is half and half. In the settings, **Blend with** picks the second voice and **Blend amount** sets how much of it you hear (10% to 90%). Press Space on either to hear the mix. `af_heart` and `af_bella` are Kokoro's strongest voices, so they make a good base.
+- **Smooth joins.** A long text is read in parts of a few whole sentences each (up to 360 characters), never across a paragraph. Each part ends with a pause that fits where it is: 0.25 s after a sentence, as Kokoro pauses inside a part, then longer after a paragraph (0.65 s) and a chapter (1.06 s). Those are golden-ratio steps. The edges of each part are softened by a few milliseconds, so they can't click. Saved files get the same pauses.
+- **Text made speakable.** Before reading, kokomux tidies what's meant for the eye:
+  - ligatures from PDFs (ﬁ), footnote marks (¹, [3]) and markdown
+  - links, read as just their site (`example.com`)
+  - dashes, read as a pause, and number ranges ("1990–1995" is read as "1990 to 1995")
+  - Roman numerals in headings ("Chapter IV" is read as "Chapter 4") and ALL-CAPS headings
+  - in English, titles (Dr., Mrs., St.), abbreviations (e.g., i.e., etc., vs., No., p.), times (5 p.m.) and units (km, mph, °C, kg)
+
+  The reader shows the tidied text, so the word that's lit is the word you hear. An abbreviation or initial ("J. R. R. Tolkien") never ends a part.
+
+Bookmarks made before this version still work: kokomux finds the same place in the text, even though the parts are now longer.
 
 **Saving where other apps can find it:** run `termux-setup-storage` once, then save to shared storage, e.g. `-o ~/storage/shared/Music/note.mp3`.
 
@@ -187,8 +203,10 @@ Before 0.8, a separate speech recogniser (Whistle) listened to each line to find
 
 - **Voice and speech:**
   - **Voice:** a picker for all 54 voices. Type to filter (`bf` shows the British female voices), press Space to hear one say a line in its own language, and Enter to choose it. Choosing a voice also sets the matching language.
+  - **Blend with** and **Blend amount:** a second voice mixed into yours, from 10% to 90%. Space hears the mix; ← on **Blend with** turns it off.
   - **Speed:** a slider from 0.5× to 2×.
   - **Language:** cycle through Kokoro's nine languages.
+  - **Voice quality:** Standard, or High, which offers to download the full-precision model (see [Better-sounding speech](#better-sounding-speech)).
   - **Save files as:** the default file name.
 - **Reading:**
   - **Full-screen reader:** on or off.
@@ -237,7 +255,7 @@ Kokoro's Python packages (`onnxruntime`, `espeakng-loader`, `soundfile`) only sh
 - **`words.py`** (inside Debian): turns Kokoro's per-sound timings into word timings, for the highlight.
 - **Sharing files:** the two sides exchange text and audio through `$PREFIX/tmp`, which the container sees as `/tmp`.
 
-The installer only keeps what's needed in the container. It skips documentation and man pages, and clears the apt and pip download caches after installing. The model is the 8-bit timestamped export from onnx-community (92 MB, pinned to one version), plus about 28 MB of voices.
+The installer only keeps what's needed in the container. It skips documentation and man pages, and clears the apt and pip download caches after installing. The model is the 8-bit timestamped export from onnx-community (92 MB, pinned to one version), plus about 28 MB of voices. With **Voice quality: High**, the full-precision export of the same version (326 MB) is added.
 
 **Why not run natively in Termux?** Termux now packages onnxruntime, numpy, espeak and libsndfile, but kokoro-onnx's own dependencies still can't be installed there. `espeakng-loader` ships only glibc builds. `phonemizer` needs `segments`, which needs the `regex` C extension, and `soundfile` needs `cffi`; Termux packages neither, so both would have to be compiled on the phone. Until that's simpler, and can be tested on a real device, the container stays.
 
@@ -264,6 +282,8 @@ The files in `src/` are the source. `./build.sh` bundles them into the single `i
 | `src/words.py` | word timings from Kokoro's per-sound timings (container side) |
 | `tests/test_words.py` | tests for word timings, on recorded Kokoro output: `python3 tests/test_words.py` |
 | `tests/test_books.py` | tests for reading EPUB, PDF and text: `python3 tests/test_books.py` |
+| `tests/test_text.py` | tests for tidying text and splitting it into parts: `python3 tests/test_text.py` |
+| `tests/test_job.py` | tests for running a job with a stand-in for Kokoro (pauses, blends, quality, old bookmarks): `python3 tests/test_job.py` |
 | `tests/test_reader.py` | tests for the reader's focus effect: `python3 tests/test_reader.py` |
 | `tests/test_theme.py` | tests for the colours: contrast on 15 terminal themes, the golden steps, asking the terminal: `python3 tests/test_theme.py` |
 | `src/setup-container.sh` | installs everything inside the container |

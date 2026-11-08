@@ -206,10 +206,10 @@ jump_to() {      # jump_to PART
   tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
   for f in in.txt title chapters; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
   rm -rf "$old"
-  start=$target; i=$target
+  start=$target; i=$target; was_parts=0          # (a part in this run's own numbering)
   write_job
   run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
-  if [ "$ui" = tui ]; then tui_hist=(); TUI_PART=0; TUI_WRAP=(); TUI_OFFS=(); TUI_INFO="$voice · ${speed}×"; tui_draw; fi
+  if [ "$ui" = tui ]; then tui_hist=(); TUI_PART=0; TUI_WRAP=(); TUI_OFFS=(); TUI_INFO="$(voice_label "$voice") · ${speed}×"; tui_draw; fi
 }
 
 # Commands that change where or how it reads (from a key, a click or the menu).

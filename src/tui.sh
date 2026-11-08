@@ -443,7 +443,7 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
     printf '\033[%d;%dH%sStart something new%s' "$y" "$x0" "$B" "$R" >&2; y=$(( y + 1 ))
     for spec in "c|Read the clipboard$clip_note|clip" "f|Open a file  ${D}text, EPUB or PDF${R}|file" \
                 "u|Read a web page|url" "t|Type something to hear|text" \
-                "v|Voice  ${D}$KOKORO_VOICE · ${KOKORO_SPEED}×${R}|voice" "s|Settings  ${D}speed, colours, highlighting…${R}|settings"; do
+                "v|Voice  ${D}$(voice_label "$(voice_mix)") · ${KOKORO_SPEED}×${R}|voice" "s|Settings  ${D}speed, colours, highlighting…${R}|settings"; do
       IFS='|' read -r key r cmd <<< "$spec"
       printf '\033[%d;%dH %s%s%s  %s' "$y" "$x0" "$ACC2" "$key" "$R" "$r" >&2
       rowact[$y]=$cmd; y=$(( y + 1 ))
@@ -508,6 +508,12 @@ voice_desc() {   # voice_desc VOICE: "British English, female"
   printf '%s, %s' "${TUI_LANG_NAME[${TUI_VOICE_LANG[${v:0:1}]:-}]:-Other}" "$g"
 }
 
+blend_amount() {  # how much of the blended voice is in the mix, in percent (30 if unsaid)
+  local a=30; [[ "$KOKORO_BLEND" == *:* ]] && a=${KOKORO_BLEND#*:}
+  [[ "$a" =~ ^[0-9]+$ ]] && [ "$a" -ge 10 ] && [ "$a" -le 90 ] || a=30
+  echo "$a"
+}
+
 voice_sample() { # voice_sample VOICE: hear a voice say a line in its own language
   local v=$1 lang=${TUI_VOICE_LANG[${1:0:1}]:-en-us}
   KOKORO_TUI=0 KOKORO_WORDS=0 KOKORO_NOTIFY=0 \
@@ -527,8 +533,11 @@ tui_save() {     # tui_save NAME VALUE: keep a setting (and use it straight away
 TUI_SETTINGS=(
   "#Voice and speech"
   "voice|Voice|The voice that reads to you. Enter opens the list of 54 voices; Space plays a sample."
+  "blend|Blend with|Mix a second voice into yours, for a voice of your own. Enter picks it, Space hears the mix, and ← turns blending off."
+  "blendamt|Blend amount|How much of the second voice is in the mix, from 10% to 90%. ← and → change it in steps of 10; Space hears it."
   "speed|Speed|How fast it reads, from 0.5× to 2×. Use ← and → to change it in steps of 0.1."
   "lang|Language|How words are pronounced. Choosing a voice sets this to match; change it to read another language."
+  "quality|Voice quality|Standard is the 92 MB model: quick, and light on the battery. High is the same voice at full precision (a 326 MB download): cleaner, but each sentence takes longer to make."
   "out|Save files as|The file name used when you save without -o. The ending picks the format: .wav .mp3 .ogg or .flac."
   "#Reading"
   "KOKORO_TUI|Full-screen reader|Open the full-screen reader when you listen on a terminal. Off: show the text below the command instead."
@@ -552,6 +561,21 @@ setting_value() {  # what the row shows on the right for setting $1
   case "$id" in
     voice) printf '%s%s%s' "$ACC2" "$KOKORO_VOICE" "$R"
            [ "$SET_NARROW" = 1 ] || printf '  %s%s%s' "$D" "$(voice_desc "$KOKORO_VOICE")" "$R" ;;
+    blend) if [ -z "$KOKORO_BLEND" ]; then printf '%snone%s' "$D" "$R"
+           else printf '%s%s%s' "$ACC2" "${KOKORO_BLEND%%:*}" "$R"
+                [ "$SET_NARROW" = 1 ] || printf '  %s%s%s' "$D" "$(voice_desc "${KOKORO_BLEND%%:*}")" "$R"; fi ;;
+    blendamt)
+      if [ -z "$KOKORO_BLEND" ]; then printf '%s—%s' "$D" "$R"; return 0; fi
+      local w=15 a; [ "$SET_NARROW" = 1 ] && w=9
+      a=$(blend_amount); f=$(( (a - 10) * w / 80 ))
+      printf -v bar '%*s' "$f" ''; bar="$ACC${bar// /━}●$R"
+      printf -v e '%*s' $(( w - f )) ''; bar+="$D${e// /─}$R"
+      printf '%s  %s%%' "$bar" "$a" ;;
+    quality)
+      if [ "$KOKORO_QUALITY" = high ]; then printf '‹ %sHigh%s ›' "$ACC2" "$R"; t="326 MB"
+        hq_ready || t="not downloaded yet"
+      else printf '‹ %sStandard%s ›' "$ACC2" "$R"; t="92 MB"; fi
+      [ "$SET_NARROW" = 1 ] || printf '  %s%s%s' "$D" "$t" "$R" ;;
     speed)
       local w=15; [ "$SET_NARROW" = 1 ] && w=9
       t=$(speed_tenths); f=$(( (t - 5) * w / 15 )); [ "$f" -lt 0 ] && f=0
@@ -585,6 +609,30 @@ setting_change() { # setting_change ID STEP: ←/→ (-1/+1); 0 means Enter, a c
   local id=$1 step=$2 t i
   case "$id" in
     voice) [ "$step" = 0 ] && tui_voices ;;
+    blend)
+      if [ "$step" = -1 ]; then
+        [ -n "$KOKORO_BLEND" ] && { tui_save KOKORO_BLEND ""; SETTINGS_NOTE="Blending is off."; }
+      else tui_voices blend; fi ;;
+    blendamt)
+      if [ -z "$KOKORO_BLEND" ]; then SETTINGS_NOTE="Choose a voice to blend with first (Blend with, above)."; return 0; fi
+      [ "$step" = 0 ] && step=1
+      t=$(( $(blend_amount) + step * 10 ))
+      [ "$t" -ge 10 ] && [ "$t" -le 90 ] && tui_save KOKORO_BLEND "${KOKORO_BLEND%%:*}:$t" ;;
+    quality)
+      if [ "$KOKORO_QUALITY" = high ]; then
+        tui_save KOKORO_QUALITY standard
+        hq_ready && SETTINGS_NOTE="Standard. The high-quality model stays on the phone: kokoro --quality standard can delete it."
+      elif hq_ready; then tui_save KOKORO_QUALITY high
+      else
+        tui_prompt "Download the high-quality model now (326 MB)? (y/N)"
+        [[ "$ANSWER" =~ ^[Yy] ]] || return 0
+        tui_cooked; printf '\033[0m\033[?1049l' >&2              # the download, in the open
+        "$0" --quality high </dev/tty >/dev/tty 2>&1 || true
+        read -r -p "Press Enter to go back to the settings. " _ </dev/tty || true
+        printf '\033[?1049h' >&2; tui_raw
+        if hq_ready; then tui_save KOKORO_QUALITY high
+        else SETTINGS_NOTE="The download didn't finish. Choose High again to carry on where it stopped."; fi
+      fi ;;
     speed)
       if [ "$step" = 0 ]; then tui_prompt "Speed, 0.5 to 2.0:" "$KOKORO_SPEED"
         [[ "$ANSWER" =~ ^(0\.[5-9][0-9]?|1(\.[0-9]{1,2})?|2(\.0+)?)$ ]] && tui_save KOKORO_SPEED "$ANSWER"
@@ -704,7 +752,7 @@ tui_settings() { # the settings menu; works on its own or from the home screen
       $'\033[D'|$'\033OD'|h|-) setting_change "${items[sel]}" -1 ;;
       $'\033[C'|$'\033OC'|l|+|=) setting_change "${items[sel]}" 1 ;;
       $'\n'|$'\r') setting_change "${items[sel]}" 0 ;;
-      " ") if [ "${items[sel]}" = voice ]; then voice_sample "$KOKORO_VOICE"; else setting_change "${items[sel]}" 0; fi ;;
+      " ") case "${items[sel]}" in voice|blend|blendamt) voice_sample "$(voice_mix)" ;; *) setting_change "${items[sel]}" 0 ;; esac ;;
       $'\033[<0;'*M)
         [[ "$KEY" =~ \;([0-9]+)M$ ]] || continue
         r=${rowsel[${BASH_REMATCH[1]}]:-}
@@ -716,24 +764,42 @@ tui_settings() { # the settings menu; works on its own or from the home screen
   if [ "$own" = 1 ]; then tui_close; fi
 }
 
-tui_voices() {   # the voice picker: type to filter, Space to hear, Enter to choose
-  local filter="" sel=0 top=0 list=() v i y view lang prev g key
+tui_pick() {     # tui_pick VOICE MODE: choose it as your voice, or (MODE blend) as the one blended in
+  if [ "$2" = blend ]; then
+    if [ "$1" = "$KOKORO_VOICE" ]; then PICK_NOTE="That's your own voice. Pick another to blend with it."; return 1; fi
+    tui_save KOKORO_BLEND "$1:$(blend_amount)"
+  else
+    tui_save KOKORO_VOICE "$1"
+    tui_save KOKORO_LANG "${TUI_VOICE_LANG[${1:0:1}]:-$KOKORO_LANG}"   # its own language
+  fi
+}
+
+tui_voices() {   # tui_voices [blend]: the voice picker: type to filter, Space to hear, Enter to choose
+  local mode=${1:-} filter="" sel=0 top=0 list=() v i y view lang prev g key cur=$KOKORO_VOICE title="Choose a voice"
   local -A rowsel=()
-  for i in "${!TUI_VOICES[@]}"; do [ "${TUI_VOICES[i]}" = "$KOKORO_VOICE" ] && sel=$i; done
+  PICK_NOTE=""
+  if [ "$mode" = blend ]; then cur=${KOKORO_BLEND%%:*}; title="Blend with a voice"; fi
+  for i in "${!TUI_VOICES[@]}"; do [ "${TUI_VOICES[i]}" = "$cur" ] && sel=$i; done
   while :; do
     tui_size; view=$(( TH - 7 ))
     list=(); for v in "${TUI_VOICES[@]}"; do [[ -z "$filter" || "$v" == *"$filter"* ]] && list+=("$v"); done
     [ "$sel" -ge "${#list[@]}" ] && sel=$(( ${#list[@]} > 0 ? ${#list[@]} - 1 : 0 ))
     [ "$sel" -lt "$top" ] && top=$sel
     [ "$sel" -ge $(( top + view )) ] && top=$(( sel - view + 1 ))
-    printf '%s%s\033[2J\033[1;1H  %skokomux%s  %sChoose a voice%s' "$SYNC_ON" "$R" "$ACC" "$R" "$B" "$R" >&2
+    printf '%s%s\033[2J\033[1;1H  %skokomux%s  %s%s%s' "$SYNC_ON" "$R" "$ACC" "$R" "$B" "$title" "$R" >&2
     printf '\033[1;%dH%s%s%s' $(( TW - 20 )) "$D" "${#list[@]} of ${#TUI_VOICES[@]} voices" "$R" >&2
     printf '\033[2;1H%s%s%s' "$LINE" "$(rule "$TW")" "$R" >&2
     printf '\033[3;%dH%sFilter:%s %s%s▏' "$LM" "$D" "$R" "$filter" "$ACC" >&2; printf '%s' "$R" >&2
+    g=""
+    if [ -n "$PICK_NOTE" ]; then g=$PICK_NOTE
+    elif [ "$mode" = blend ]; then g="mixed into $KOKORO_VOICE at $(blend_amount)%"; fi
+    if [ -n "$g" ] && [ $(( LM + 14 + ${#filter} + ${#g} )) -lt "$TW" ]; then
+      printf '\033[3;%dH%s%s%s' $(( LM + CW - ${#g} )) "$D" "$g" "$R" >&2
+    fi
     rowsel=(); prev=""
     for (( i = top, y = 5; i < ${#list[@]} && y <= TH - 3; i++, y++ )); do
       v=${list[i]}; lang=${TUI_VOICE_LANG[${v:0:1}]:-}; g=female; [ "${v:1:1}" = m ] && g=male
-      local mark=" "; [ "$v" = "$KOKORO_VOICE" ] && mark="$GRN✓$R"
+      local mark=" "; [ "$v" = "$cur" ] && mark="$GRN✓$R"
       if [ "$i" = "$sel" ]; then
         printf '\033[%d;%dH%s%*s\033[%d;%dH%s▎%s%s %s%s %s%-16s%s %s%s · %s%s' \
           "$y" "$LM" "$SEL" "$CW" "" "$y" "$LM" "$ACC" "$R" "$SEL" "${mark//$R/$R$SEL}" "$SEL" "$ACC2" "$v" "$R$SEL" "$D" "${TUI_LANG_NAME[$lang]:-}" "$g" "$R" >&2
@@ -744,30 +810,30 @@ tui_voices() {   # the voice picker: type to filter, Space to hear, Enter to cho
     done
     [ "${#list[@]}" = 0 ] && printf '\033[5;%dH%sNo voice matches "%s".%s' "$LM" "$D" "$filter" "$R" >&2
     printf '\033[%d;1H%s%s%s' $(( TH - 1 )) "$LINE" "$(rule "$TW")" "$R" >&2
-    if [ "$TW" -ge 72 ]; then g="type to filter · ↑↓ choose · Space hear it · Enter use it · Esc back"
+    if [ "$mode" = blend ]; then
+      if [ "$TW" -ge 72 ]; then g="type to filter · ↑↓ choose · Space hear the mix · Enter blend it · Esc back"
+      else g="type · ↑↓ · Space hear · Enter blend · Esc"; fi
+    elif [ "$TW" -ge 72 ]; then g="type to filter · ↑↓ choose · Space hear it · Enter use it · Esc back"
     else g="type · ↑↓ · Space hear · Enter use · Esc"; fi
     printf '\033[%d;%dH%s%s%s%s' "$TH" "$LM" "$D" "$g" "$R" "$SYNC_OFF" >&2
 
     KEY=""; tick 0.5; [ -n "$KEY" ] || continue
+    PICK_NOTE=""
     case "$KEY" in
       $'\033[A'|$'\033OA'|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
       $'\033[B'|$'\033OB'|$'\033[<65;'*M) [ "$sel" -lt $(( ${#list[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
       $'\033[5~') sel=$(( sel > view ? sel - view : 0 )) ;;
       $'\033[6~') sel=$(( sel + view < ${#list[@]} ? sel + view : ${#list[@]} - 1 )) ;;
-      " ") [ "${#list[@]}" -gt 0 ] && voice_sample "${list[sel]}" ;;
-      $'\n'|$'\r')
-        if [ "${#list[@]}" -gt 0 ]; then
-          v=${list[sel]}; tui_save KOKORO_VOICE "$v"
-          tui_save KOKORO_LANG "${TUI_VOICE_LANG[${v:0:1}]:-$KOKORO_LANG}"   # its own language
-          return 0
-        fi ;;
+      " ") [ "${#list[@]}" -gt 0 ] || continue
+           if [ "$mode" = blend ]; then voice_sample "$(voice_mix "$KOKORO_VOICE" "${list[sel]}:$(blend_amount)")"
+           else voice_sample "${list[sel]}"; fi ;;
+      $'\n'|$'\r') [ "${#list[@]}" -gt 0 ] && tui_pick "${list[sel]}" "$mode" && return 0 ;;
       $'\177'|$'\b') filter=${filter%?}; sel=0; top=0 ;;
       [a-z_]) filter+=$KEY; sel=0; top=0 ;;
       $'\033[<0;'*M)
         [[ "$KEY" =~ \;([0-9]+)M$ ]] || continue
         i=${rowsel[${BASH_REMATCH[1]}]:-}; [ -n "$i" ] || continue
-        if [ "$i" = "$sel" ]; then v=${list[sel]}; tui_save KOKORO_VOICE "$v"
-          tui_save KOKORO_LANG "${TUI_VOICE_LANG[${v:0:1}]:-$KOKORO_LANG}"; return 0
+        if [ "$i" = "$sel" ]; then tui_pick "${list[sel]}" "$mode" && return 0
         else sel=$i; fi ;;
       $'\033'|q) return 0 ;;
     esac
