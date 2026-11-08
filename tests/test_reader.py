@@ -41,7 +41,7 @@ now_ms() {{ local t=${{EPOCHREALTIME//[!0-9]/}}; NOW=$(( t / 1000 )); }}
 tmpd={d}; TW=104 TH=34 CW=76 LM=14 TUI_FOCUS={focus}
 tui_hist=(1 2 3 4); TUI_PART=5 TUI_PARTS=9 TUI_A={a} TUI_B={b}
 {ease} {extra}
-tui_text; echo "ease_at=$TUI_EASE_AT" >&2
+tui_text; flush; echo "ease_at=$TUI_EASE_AT" >&2   # (a frame is written in one go)
 """
         env = {"PATH": os.environ["PATH"], "HOME": d, "KOKORO_TRUECOLOR": "1", "LANG": "C.UTF-8"}
         out = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, check=True).stderr

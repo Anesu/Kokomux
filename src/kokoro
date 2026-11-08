@@ -302,6 +302,7 @@ keys_on() {      # read keys from the terminal, unechoed (restored on exit)
 keys_off() { [ -n "$KEYS_TTY" ] && stty "$KEYS_TTY" 2>/dev/null </dev/tty; KEYS_TTY=""; return 0; }
 tick() {
   local c rest=""
+  [ -n "${FRAME:-}" ] && flush          # the frame drawn since the last wait, in one write
   IN_TICK=1; KEY=""
   if [ -n "$KBD" ]; then
     if IFS= read -rsn1 -d '' -t "$1" -u "$KBD" KEY && [ "$KEY" = $'\033' ]; then

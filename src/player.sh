@@ -50,17 +50,18 @@ block_draw() {   # block_draw A B: draw the visible rows with bytes A..B lit (A 
   local LC_ALL=C a=$1 b=$2 k o row len x y
   for (( k = view_top; k < view_top + view_h; k++ )); do
     o=${blk_offs[k]} row=${blk_lines[k]} len=${#blk_lines[k]}
-    printf '\r\033[K  ' >&2
+    out '\r\033[K  '
     if [ "$a" -lt 0 ] || [ $(( o + len )) -le "$a" ]; then
-      printf '%s' "$row" >&2                                  # already spoken
+      out '%s' "$row"                                  # already spoken
     elif [ "$o" -ge "$b" ]; then
-      printf '%s%s%s' "$D" "$row" "$R" >&2                    # still to come
+      out '%s%s%s' "$D" "$row" "$R"                    # still to come
     else
       x=$(( a > o ? a - o : 0 )); y=$(( b - o < len ? b - o : len ))
-      printf '%s%s%s%s%s%s' "${row:0:x}" "$HL" "${row:x:y-x}" "$R$D" "${row:y}" "$R" >&2
+      out '%s%s%s%s%s%s' "${row:0:x}" "$HL" "${row:x:y-x}" "$R$D" "${row:y}" "$R"
     fi
-    printf '\n' >&2
+    out '\n'
   done
+  flush                                       # the whole block in one write
 }
 
 block_redraw() { # back up over the visible rows and draw them again, moving the window to the lit word
@@ -71,12 +72,12 @@ block_redraw() { # back up over the visible rows and draw them again, moving the
       view_top=$(( k + view_h > ${#blk_lines[@]} ? ${#blk_lines[@]} - view_h : k ))
     fi
   fi
-  printf '\r\033[K\033[%dA' "$view_h" >&2
+  out '\r\033[K\033[%dA' "$view_h"
   block_draw "$@"
 }
 
 block_finish() { # the whole line as read, nothing lit (it stays on screen as a transcript)
-  printf '\r\033[K\033[%dA' "$view_h" >&2
+  out '\r\033[K\033[%dA' "$view_h"
   view_top=0; view_h=${#blk_lines[@]}
   block_draw -1 -1
 }
