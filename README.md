@@ -64,6 +64,38 @@ kokoro --stop                             # stop playback
 
 **Saving where other apps can find it:** run `termux-setup-storage` once, then save to shared storage, e.g. `-o ~/storage/shared/Music/note.mp3`.
 
+## The reader and the home screen
+
+On a terminal, `kokoro -p` opens a full-screen reader. Across the top are the title, voice and speed. In the middle is a reading column, with what you've heard above it, the part being read marked with a bar and the spoken word lit, and what's coming next dimmed below. At the bottom are a progress bar and a row of buttons. The column stays at a comfortable reading width, so it works on a phone held upright and just as well on a wide Samsung DeX or tablet screen. It follows the window when you resize it.
+
+<p>
+  <img src="docs/reader-wide.png" width="68%" alt="The reader on a wide screen: header, centred reading column with the spoken word highlighted, progress bar and buttons">
+  <img src="docs/reader-phone.png" width="28%" alt="The same reader on a phone held upright">
+</p>
+
+| Key | Click or tap | Does |
+|---|---|---|
+| Space | **Pause** / **Play** | pause, or carry on |
+| → | **Next** | skip to the next part |
+| ← | **Again** | hear this part again |
+| q or Esc | **Stop** | stop, keeping your place |
+
+With a keyboard and mouse (DeX, a tablet, or a Bluetooth keyboard), the keys and clicks both work. On a phone, tap the buttons. When you stop, kokoro says where you stopped and how to carry on.
+
+Run `kokoro` on its own to open the **home screen**. It lists the books and long texts you're partway through, with progress bars: choose one with ↑↓ and Enter, its number, or a click. It also has one-key actions:
+
+| Key | Does |
+|---|---|
+| c | read the clipboard |
+| f | open a file (text, EPUB or PDF), with Tab completion |
+| u | read a web page |
+| t | type something to hear |
+| v / s | change and save your default voice or speed |
+
+<p><img src="docs/home.png" width="80%" alt="The home screen: books in progress with progress bars, and one-key actions"></p>
+
+Prefer the old inline view? Set `KOKORO_TUI=0`. The keys still work there. Scripts and pipes get plain output as before.
+
 ## Listening to long texts and books
 
 `kokoro -p -f` reads EPUBs (chapters in order, using the book's own title) and PDFs (with lines joined back into sentences, and page numbers dropped), as well as text files and web pages. DRM-protected EPUBs and scanned PDFs, which contain pictures of pages rather than text, can't be read.
@@ -161,6 +193,7 @@ The files in `src/` are the source. `./build.sh` bundles them into the single `i
 | File | What it is |
 |---|---|
 | `src/kokoro` | the `kokoro` command (Termux side) |
+| `src/tui.sh` | the full-screen reader and home screen, installed to `$PREFIX/share/kokomux/` |
 | `src/engine.py` | Kokoro engine, server, web-page reader and model downloader (container side) |
 | `src/words.py` | word timings: Whistle, the matching, and the cache (container side) |
 | `tests/test_words.py` | tests for the matching: `python3 tests/test_words.py` |

@@ -342,6 +342,10 @@ cat > "$WORK/words.py" <<'__KOKOMUX_WORDS__'
 #@EMBED words.py
 __KOKOMUX_WORDS__
 
+cat > "$WORK/tui.sh" <<'__KOKOMUX_TUI__'
+#@EMBED tui.sh
+__KOKOMUX_TUI__
+
 cat > "$WORK/setup.sh" <<'__KOKOMUX_SETUP__'
 #@EMBED setup-container.sh
 __KOKOMUX_SETUP__
@@ -397,6 +401,8 @@ kokoro_command() {
   stop_old_server
   { printf '#!%s/bin/bash\n' "$PREFIX"; tail -n +2 "$WORK/kokoro"; } > "$PREFIX/bin/kokoro"
   chmod +x "$PREFIX/bin/kokoro"
+  mkdir -p "$PREFIX/share/kokomux"
+  cp "$WORK/tui.sh" "$PREFIX/share/kokomux/tui.sh"   # the full-screen reader and home screen
 
   local conf="$HOME/.config/kokoro/config"
   if [ ! -f "$conf" ]; then
@@ -424,6 +430,10 @@ KOKORO_WORDS_OFFSET_MS=100
 # While listening, a notification with pause / next / again buttons (needs the
 # Termux:API app). Swiping it away stops.
 KOKORO_NOTIFY=1
+
+# -p on a terminal opens the full-screen reader (Space pauses, arrows skip, q
+# stops; click or tap the buttons). Set to 0 to keep the inline view.
+KOKORO_TUI=1
 CFG
   fi
 
@@ -499,6 +509,7 @@ else
 fi
 say "  $bar"
 tips=(
+  'kokoro|home: books, clipboard, files'
   'kokoro -p "Hello there"|speak, words lit as read'
   'kokoro -c -p|read the clipboard'
   'kokoro -u URL -p|read a web page'

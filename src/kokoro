@@ -27,6 +27,7 @@ KOKORO_PORT=8880
 KOKORO_WORDS=1                 # light up each word as it's spoken (-p on a terminal)
 KOKORO_WORDS_OFFSET_MS=100     # play-audio's start-up delay, so the highlight isn't early
 KOKORO_NOTIFY=1                # a notification with pause / next / again buttons (Termux:API)
+KOKORO_TUI=1                   # -p on a terminal opens the full-screen reader (0: inline)
 KOKORO_REPO_RAW=https://raw.githubusercontent.com/Anesu/kokomux/main
 # shellcheck source=/dev/null
 [ -f "$CONF" ] && . "$CONF"
@@ -43,6 +44,14 @@ PLAYER_STATE="$PREFIX/tmp/kokoro-state"   # "playing" or "paused", for --pause t
 BOOKS="$HOME/.local/share/kokomux/bookmarks"
 
 # ------------------------------------------------------------ look & feel
+
+# Count characters, not bytes ("…", "▶" and "␣" are one column each), so text
+# lines up whatever locale the terminal was started with. Byte-exact slicing of
+# the text being read still uses a local LC_ALL=C where it needs it.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *UTF-8*|*utf8*|*UTF8*) ;;
+  *) export LC_CTYPE=C.UTF-8 2>/dev/null ;;
+esac
 # Messages go to stderr. Colours and live status only on a terminal, so
 # scripts and pipes get plain, quiet output.
 
@@ -65,6 +74,7 @@ cols() {
 
 # die "what went wrong" ["what to do about it"]
 die() {
+  declare -F tui_close >/dev/null && tui_close
   status_clear
   printf '%s✗%s %s\n' "$RED" "$R" "$1" >&2
   [ -n "${2:-}" ] && printf '  %s%s%s\n' "$D" "$2" "$R" >&2
@@ -131,6 +141,7 @@ ROWS
 ROWS
   printf '\n%sWhile listening%s\n' "$B" "$R"
   opt_rows <<'ROWS'
+Space ← → q|keys while it plays: pause, again, next, stop
 --pause|pause, or carry on
 --next|skip to the next part
 --again|hear this part again
@@ -221,6 +232,66 @@ stop_playback() {
   [ -n "$pid" ] && [ "$pid" != "$$" ] && kill "$pid" 2>/dev/null
 }
 
+# ------------------------------------------------------------ keys and the frame timer
+# tick waits a moment (no process) and, on a terminal, reads one key or click
+# into KEY. A stop signal during the wait must not exit from inside `read -t`:
+# if cleanup then outlives the timer, bash's alarm jumps back into a read that's
+# gone and bash crashes (seen with bash 5.2). So during the wait the signal only
+# sets a flag, and tick exits once read has returned.
+
+STOP=""; IN_TICK=0; KEY=""; CMD=""; KBD=""; KEYS_TTY=""
+exec {TICK}<> <(:)                    # read -t on this is a sleep with no process
+keys_on() {      # read keys from the terminal, unechoed (restored on exit)
+  [ -n "$KBD" ] && return 0
+  [ "$LIVE" = 1 ] && [ -r /dev/tty ] || return 0
+  { exec {KBD}</dev/tty; } 2>/dev/null || { KBD=""; return 0; }
+  KEYS_TTY="$(stty -g 2>/dev/null </dev/tty)" || KEYS_TTY=""
+  stty -echo -icanon 2>/dev/null </dev/tty || true
+}
+keys_off() { [ -n "$KEYS_TTY" ] && stty "$KEYS_TTY" 2>/dev/null </dev/tty; KEYS_TTY=""; return 0; }
+tick() {
+  local c rest=""
+  IN_TICK=1; KEY=""
+  if [ -n "$KBD" ]; then
+    if IFS= read -rsn1 -d '' -t "$1" -u "$KBD" KEY && [ "$KEY" = $'\033' ]; then
+      # an arrow key or a click: the rest of the sequence follows at once
+      while IFS= read -rsn1 -d '' -t 0.01 -u "$KBD" c; do
+        rest+=$c; [[ "$c" == [A-Za-z~] ]] && [ "${#rest}" -gt 1 ] && break
+      done
+      KEY=$'\033'$rest
+    fi
+  else
+    read -r -t "$1" -u "$TICK" _ || true
+  fi
+  IN_TICK=0
+  [ -z "$STOP" ] || exit 130
+}
+key_cmd() {      # what KEY asks for: toggle, next, again or quit (or a clicked button)
+  CMD=""
+  case "$KEY" in
+    " "|p|P|k) CMD=toggle ;;
+    n|N|l|$'\033[C'|$'\033OC') CMD=next ;;
+    b|B|h|$'\033[D'|$'\033OD') CMD=again ;;
+    q|Q|$'\033') CMD=quit ;;
+    $'\033[<'*M) [ "${ui:-}" = tui ] && tui_click "$KEY" ;;
+  esac
+  KEY=""
+}
+
+TUI_LIB="$PREFIX/share/kokomux/tui.sh"
+# shellcheck source=src/tui.sh
+[ -f "$TUI_LIB" ] && . "$TUI_LIB"
+
+# kokoro on its own, on a terminal: the home screen.
+if [ $# = 0 ] && [ "$LIVE" = 1 ] && [ -t 0 ] && [ -t 1 ] && declare -F tui_home >/dev/null; then
+  keys_on
+  trap 'tui_close; keys_off; exit 130' INT TERM HUP
+  tui_home
+  keys_off; trap - INT TERM HUP
+  [ "${#HOME_CHOICE[@]}" -gt 0 ] && exec "$0" "${HOME_CHOICE[@]}"
+  exit 0
+fi
+
 # ------------------------------------------------------------ admin commands
 
 case "${1:-}" in
@@ -236,7 +307,9 @@ case "${1:-}" in
   --next) control next "Skipping to the next part."; exit 0 ;;
   --again) control again "Playing this part again."; exit 0 ;;
   --continue)
-    last="$(ls -t "$BOOKS"/*.mark 2>/dev/null | head -n 1)" || true
+    last="${2:-}"
+    case "$last" in "$BOOKS"/*.mark) [ -f "$last" ] || last="" ;; *) last="" ;; esac
+    [ -n "$last" ] || last="$(ls -t "$BOOKS"/*.mark 2>/dev/null | head -n 1)" || true
     [ -n "$last" ] || die "There's nothing to continue." "A bookmark is kept when you stop a long text partway."
     case "$(mark_get "$last" kind)" in
       url)  src=(-u "$(mark_get "$last" source)") ;;
@@ -298,7 +371,7 @@ case "${1:-}" in
              "$HOME/.shortcuts/tasks/"Kokoro*; do
       if [ -f "$f" ] && grep -q '^# kokomux' "$f"; then rm -f "$f"; done_msg "Removed $(tilde "$f")"; fi
     done
-    rm -rf "$CONF_DIR" "$SRV_DIR" "$HOME/kokoro-test.wav" "$HOME/.cache/kokomux" "$HOME/.local/share/kokomux"
+    rm -rf "$CONF_DIR" "$SRV_DIR" "$HOME/kokoro-test.wav" "$HOME/.cache/kokomux" "$HOME/.local/share/kokomux" "$PREFIX/share/kokomux"
     done_msg "Settings removed"
     rm -f "$0"
     done_msg "kokomux is uninstalled." "Thanks for trying it!"
@@ -366,7 +439,12 @@ gen_pid=""; play_pid=""
 cleanup() {
   set +e   # best effort from here: a process that's already gone mustn't change the exit code
   status_clear
-  [ "${in_line:-0}" = 1 ] && [ "${show_words:-0}" = 1 ] && block_finish   # stopped mid-line: nothing lit
+  [ "${in_line:-0}" = 1 ] && [ "${ui:-}" = inline ] && [ "${show_words:-0}" = 1 ] && block_finish   # nothing lit
+  declare -F tui_close >/dev/null && tui_close
+  keys_off
+  if [ "${ui:-none}" != none ] && [ -n "${book_id:-}" ] && [ -f "$BOOKS/$book_id.mark" ]; then
+    info "Stopped at part $(mark_get "$BOOKS/$book_id.mark" part) of $(mark_get "$BOOKS/$book_id.mark" parts). ${D}kokoro --continue picks up there.${R}"
+  fi
   if [ "${play:-0}" = 1 ]; then notify_clear; rm -f "$PLAYER_STATE"; fi
   [ -n "$play_pid" ] && kill "$play_pid" 2>/dev/null
   [ -n "$gen_pid" ] && kill "$gen_pid" 2>/dev/null
@@ -375,11 +453,7 @@ cleanup() {
   return 0
 }
 trap cleanup EXIT
-# A stop signal (Ctrl+C, kokoro --stop) during the frame timer must not exit from
-# inside `read -t`: if cleanup then outlives the timer, bash's alarm jumps back into
-# a read that's gone and bash crashes (seen with bash 5.2). So during the timer the
-# signal only sets a flag, and tick() exits once read has returned.
-STOP=""; IN_TICK=0
+# (see tick: during the frame timer a stop signal only sets a flag)
 on_signal() { if [ "$IN_TICK" = 1 ]; then STOP=1; else exit 130; fi; }
 trap on_signal INT TERM HUP
 
@@ -436,9 +510,15 @@ if [ "$play" = 1 ] && [ -z "$out" ]; then
   fi
 fi
 
-# With -p on a terminal, show each line as it's read and light the spoken word.
+# With -p on a terminal, show each line as it's read and light the spoken word,
+# in the full-screen reader (ui=tui) or inline below the command (ui=inline).
 show_words=0
 [ "$play" = 1 ] && [ "$LIVE" = 1 ] && [ "$KOKORO_WORDS" = 1 ] && show_words=1
+ui=none
+if [ "$play" = 1 ] && [ "$LIVE" = 1 ]; then
+  ui=inline; keys_on
+  if [ "$KOKORO_TUI" = 1 ] && [ -n "$KBD" ] && declare -F tui_open >/dev/null && tui_fits; then ui=tui; fi
+fi
 
 {
   echo "voice=$voice"
@@ -481,6 +561,7 @@ progress() {
 }
 waiting_label() {
   if [ "$play" = 1 ] && [ "$i" -gt "$start" ]; then echo "Preparing"
+  elif [ "$start" -gt 1 ]; then echo "Picking up at part $start"
   elif [ -f "$tmpd/progress" ]; then echo "Making speech"
   elif [ -n "$url" ]; then echo "Fetching the page"
   else echo "Getting ready"; fi
@@ -499,8 +580,6 @@ HL=$'\033[48;5;61m\033[38;5;231m'   # the soft highlight
 blk_lines=(); blk_offs=(); view_top=0; view_h=0
 w_s=(); w_e=(); w_a=(); w_b=(); w_state=none
 TERM_ROWS=24
-exec {TICK}<> <(:)                    # read -t on this is a sleep with no process
-tick() { IN_TICK=1; read -r -t "$1" -u "$TICK" _ || true; IN_TICK=0; [ -z "$STOP" ] || exit 130; }
 now_ms() { local t=${EPOCHREALTIME//[!0-9]/}; NOW=$(( t / 1000 )); }   # no subshell: called every frame
 in_line=0
 
@@ -559,6 +638,29 @@ block_finish() { # the whole line as read, nothing lit (it stays on screen as a 
   block_draw -1 -1
 }
 
+# The view the player draws through: the full-screen reader or the inline block.
+view_part() {    # view_part IDX BASE: a part starts playing
+  local parts=1
+  if [ "$ui" = tui ]; then
+    [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
+    TUI_TITLE=${book_title:-$name}
+    tui_part "$1" "$parts"
+    [ "$w_state" = off ] && tui_light -1 -1
+  elif [ "$show_words" = 1 ]; then
+    block_load "$2.txt"; status_clear
+    if [ "$w_state" = off ]; then block_draw -1 -1; else block_draw 0 0; fi   # dim until words light
+  fi
+  return 0
+}
+view_light() { if [ "$ui" = tui ]; then tui_light "$@"; elif [ "$show_words" = 1 ]; then block_redraw "$@"; fi; }
+view_state() {   # view_state TEXT EXTRA [SYMBOL] [PAUSED]: what's happening (a spinner if no symbol)
+  local sym=${3:-${SPIN[frame % 10]}}
+  frame=$(( frame + 1 ))
+  if [ "$ui" = tui ]; then tui_state "$1" "$2" "$sym" "${4:-0}"; else status "$1" "$2" "$sym"; fi
+}
+view_part_end() { if [ "$ui" = tui ]; then tui_light -1 -1; elif [ "$show_words" = 1 ]; then block_finish; fi; }
+view_refresh() { [ "$ui" = tui ] && tui_refresh; return 0; }
+
 words_load() {   # read NNNN.words once it lands
   local f=$1 s e a b
   [ -f "$f" ] || return 1
@@ -567,7 +669,7 @@ words_load() {   # read NNNN.words once it lands
     while read -r s e a b; do w_s+=("$s"); w_e+=("$e"); w_a+=("$a"); w_b+=("$b"); done
   } < "$f"
   if [ "${#w_s[@]}" -gt 0 ]; then w_state=ready
-  else w_state=none; block_redraw -1 -1; fi   # below the bar: the line plain, nothing lit
+  else w_state=none; view_light -1 -1; fi    # below the bar: the line plain, nothing lit
 }
 
 # ------------------------------------------------------------ listening
@@ -609,14 +711,11 @@ notify_clear() {
 play_line() {    # play_line WAV IDX: play one part; light its words; obey pause / next / again
   local wav=$1 i=$2 base="${1%.wav}" cur=-1 lit=-2 lit_now t t0 label last="" cmd paused=0 restart=1
   w_state=pending
-  [ -f "$tmpd/stream/words-off" ] && w_state=off
+  { [ -f "$tmpd/stream/words-off" ] || [ "$show_words" = 0 ]; } && w_state=off
   echo "$i" > "$tmpd/stream/playing"          # the engine and aligner work from the part being heard
   title_get; part_of "$i"
   bookmark_save "$i"; notify "${PART% · }"
-  if [ "$show_words" = 1 ]; then
-    block_load "$base.txt"; status_clear
-    if [ "$w_state" = off ]; then block_draw -1 -1; else block_draw 0 0; fi   # dim until words light
-  fi
+  view_part "$i" "$base"
   in_line=1
   # Nothing in this loop starts a process except when something changes: it
   # runs ~30 times a second on a phone.
@@ -626,8 +725,10 @@ play_line() {    # play_line WAV IDX: play one part; light its words; obey pause
       now_ms; t0=$NOW; cur=-1; lit=-2; restart=0
       echo playing > "$PLAYER_STATE"
     fi
-    if [ -f "$CONTROL" ]; then                # kokoro --pause / --next / --again
-      read -r cmd < "$CONTROL" || cmd=""; rm -f "$CONTROL"
+    cmd=""                                    # kokoro --pause / --next / --again, or a key or click
+    if [ -f "$CONTROL" ]; then read -r cmd < "$CONTROL" || cmd=""; rm -f "$CONTROL"; fi
+    if [ -z "$cmd" ] && [ -n "$KEY" ]; then key_cmd; cmd=$CMD; fi
+    if [ -n "$cmd" ]; then
       case "$cmd" in
         toggle)
           if [ "$paused" = 1 ]; then paused=0; restart=1; notify "${PART% · }"   # carry on from the part's start
@@ -636,10 +737,15 @@ play_line() {    # play_line WAV IDX: play one part; light its words; obey pause
           continue ;;
         next)  kill "$play_pid" 2>/dev/null; wait "$play_pid" || true; break ;;
         again) kill "$play_pid" 2>/dev/null; wait "$play_pid" || true; restart=1; continue ;;
+        quit)  exit 0 ;;                          # the bookmark is kept; cleanup says where
       esac
     fi
+    view_refresh
     if [ "$paused" = 1 ]; then
-      [ -n "$last" ] || { status "Paused" "${PART}--pause to carry on" "‖"; last=paused; }
+      if [ -z "$last" ]; then
+        if [ "$ui" = tui ]; then view_state "Paused" "" "‖" 1; else view_state "Paused" "${PART}space to carry on" "‖"; fi
+        last=paused
+      fi
       tick 0.1
       continue
     fi
@@ -653,22 +759,23 @@ play_line() {    # play_line WAV IDX: play one part; light its words; obey pause
         lit_now=$cur
         if [ "$cur" -eq $(( ${#w_s[@]} - 1 )) ] && [ "$t" -gt "${w_e[cur]}" ]; then lit_now=-1; fi
         if [ "$lit_now" -ne "$lit" ]; then
-          if [ "$lit_now" -ge 0 ]; then block_redraw "${w_a[lit_now]}" "${w_b[lit_now]}"
-          elif [ "$cur" -ge 0 ]; then block_redraw -1 -1    # past the last word
-          else block_redraw 0 0; fi                          # before the first
+          if [ "$lit_now" -ge 0 ]; then view_light "${w_a[lit_now]}" "${w_b[lit_now]}"
+          elif [ "$cur" -ge 0 ]; then view_light -1 -1      # past the last word
+          else view_light 0 0; fi                            # before the first
           lit=$lit_now; last=""
         fi
       fi
     fi
     part_of "$i"
-    label="${PART}Ctrl+C to stop"; [ "$show_words" = 1 ] && [ "$w_state" = pending ] && label="${PART}word timings…"
-    if [ "$label" != "$last" ]; then status "Playing" "$label" "▶"; last=$label; fi
+    if [ "$ui" = tui ]; then label=""; [ "$w_state" = pending ] && label="word timings…"
+    else label="${PART}␣ pause · → next · q stop"; [ "$w_state" = pending ] && label="${PART}word timings…"; fi
+    if [ "$label|playing" != "$last" ]; then view_state "Playing" "$label" "▶"; last="$label|playing"; fi
     tick 0.03
   done
   wait "$play_pid" || true
   play_pid=""; in_line=0
   echo $(( i + 1 )) > "$tmpd/stream/playing"  # heard: the aligner can drop this part
-  [ "$show_words" = 1 ] && block_finish
+  view_part_end
   rm -f "$wav"
 }
 
@@ -680,6 +787,9 @@ if [ "$play" = 1 ]; then
   echo "$$" > "$PLAYER_PID"
 fi
 run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
+if [ "$ui" = tui ]; then
+  TUI_TITLE=$name; TUI_INFO="$voice · ${speed}×"; tui_open
+fi
 
 i=$start
 while :; do
@@ -695,14 +805,17 @@ while :; do
     [ "$play" = 1 ] && [ -f "$f" ] && continue
     break
   else
-    status "$(waiting_label)" "$(progress)"
-    sleep 0.1
+    view_state "$(waiting_label)" "$(progress)"
+    view_refresh
+    tick 0.1
+    if [ -n "$KEY" ]; then key_cmd; [ "$CMD" = quit ] && exit 0; fi
   fi
 done
 rc=0; wait "$gen_pid" || rc=$?
 gen_pid=""
+declare -F tui_close >/dev/null && tui_close
 status_clear
-[ "$play" = 1 ] && [ "$rc" = 0 ] && bookmark_done   # read to the end: nothing to come back to
+if [ "$play" = 1 ] && [ "$rc" = 0 ]; then bookmark_done; book_id=""; fi   # read to the end: no bookmark
 
 if [ "$rc" != 0 ]; then
   msg="$(grep -m1 '^Error: ' "$tmpd/engine.log" | sed 's/^Error: //')" || true
