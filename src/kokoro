@@ -21,8 +21,8 @@ env_overrides=""
 KOKORO_DEFAULTS=(
   KOKORO_VOICE=af_heart         # see: kokoro --list-voices
   KOKORO_BLEND=                 # a second voice mixed in, and how much: af_bella:30 (empty: none)
-  KOKORO_QUALITY=standard       # standard (92 MB model) or high (326 MB, full precision)
-  KOKORO_PRONUNCIATION=standard # English: standard (espeak) or dictionary (misaki, an extra 260 MB)
+  KOKORO_QUALITY=high           # high (326 MB, full precision) or standard (the 92 MB 8-bit model)
+  KOKORO_PRONUNCIATION=dictionary  # English: dictionary (misaki, as Kokoro learned) or standard (espeak)
   KOKORO_SPEED=1.0              # 0.5 to 2.0
   KOKORO_LANG=en-us
   KOKORO_OUT=kokoro.wav         # file name when -o isn't given
@@ -243,8 +243,8 @@ ROWS
 --list-voices|all 54 voices by language
 --status|server status and settings
 --settings|voice, speed, highlighting and more
---quality high|a cleaner voice (326 MB download); standard: back
---pronunciation dictionary|English read as Kokoro learned it (260 MB)
+--quality standard|the quicker 8-bit model; high: the default
+--pronunciation standard|English with espeak; dictionary: the default
 --config|edit the settings file directly
 --serve / --stop-server|start or stop the server
 --update|update kokomux and Kokoro

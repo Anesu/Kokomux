@@ -1,7 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # kokomux: Kokoro text-to-speech for Termux. https://github.com/Anesu/kokomux
 #
-#   bash install.sh [--yes] [--verbose]
+#   bash install.sh [--yes] [--verbose] [--standard]
 #
 # Sets up a small Debian container ("kokoro") with proot-distro, installs
 # Kokoro in it, and adds the `kokoro` command to Termux. Kokoro's Python
@@ -11,15 +11,16 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.12.0"
+KOKOMUX_VERSION="0.13.0"
 DISTRO=kokoro
 
-ASSUME_YES=0; VERBOSE=0
+ASSUME_YES=0; VERBOSE=0; LIGHT=0
 for arg in "$@"; do
   case "$arg" in
     -y|--yes) ASSUME_YES=1 ;;
     -v|--verbose) VERBOSE=1 ;;
-    -h|--help) echo "Usage: bash install.sh [--yes] [--verbose]"; exit 0 ;;
+    --standard) LIGHT=1 ;;   # the smaller setup: the 8-bit model and espeak pronunciation
+    -h|--help) echo "Usage: bash install.sh [--yes] [--verbose] [--standard]"; exit 0 ;;
     *) echo "Unknown option: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -503,15 +504,33 @@ else
   warn "Termux looks old" "get the F-Droid or GitHub build if anything fails"
 fi
 
+# What to install. By default the best-sounding setup: the full-precision model
+# (Voice quality: High) and misaki for English (Pronunciation: Dictionary), unless
+# the settings say standard or --standard asks for the smaller setup.
+setting() { sed -n "s/^$1=\\([a-z]*\\).*/\\1/p" "$HOME/.config/kokoro/config" 2>/dev/null | tail -n 1; }
+QUALITY="$(setting KOKORO_QUALITY)"; [ "$QUALITY" = standard ] || QUALITY=high
+PRONUNCIATION="$(setting KOKORO_PRONUNCIATION)"; [ "$PRONUNCIATION" = standard ] || PRONUNCIATION=dictionary
+SET_STANDARD=0                     # 1: write standard into the settings (asked for, or no room)
+[ "$LIGHT" = 1 ] && { QUALITY=standard PRONUNCIATION=standard SET_STANDARD=1; }
+ROOTFS="$PREFIX/var/lib/proot-distro/installed-rootfs/$DISTRO"
+extras_mb=0                        # what the extras still need, beyond the basic setup
+[ "$QUALITY" = high ] && [ ! -s "$ROOTFS/opt/kokoro/models/kokoro-v1.0-timestamped.fp32.onnx" ] && extras_mb=$(( extras_mb + 330 ))
+[ "$PRONUNCIATION" = dictionary ] && ! compgen -G "$ROOTFS/opt/kokoro/venv/lib/python3*/site-packages/misaki" >/dev/null &&
+  extras_mb=$(( extras_mb + 260 ))
+
 free_kb="$(df -Pk "$HOME" 2>/dev/null | awk 'NR == 2 { print $4 }')" || true
-need_mb=600; [ "$MODE" = update ] && need_mb=200
+base_mb=600; [ "$MODE" = update ] && base_mb=200
 if [[ "${free_kb:-}" =~ ^[0-9]+$ ]]; then
   free_mb=$(( free_kb / 1024 ))
   if [ "$free_mb" -ge 1024 ]; then free_h="$(awk "BEGIN { printf \"%.1f GB\", $free_mb / 1024 }")"; else free_h="$free_mb MB"; fi
-  if [ "$free_mb" -ge "$need_mb" ]; then
+  if [ "$free_mb" -ge $(( base_mb + extras_mb )) ]; then
     ok "$free_h free"
+  elif [ "$free_mb" -ge "$base_mb" ]; then
+    # Room for kokomux, not for the extras: the smaller setup, which can be upgraded later.
+    warn "$free_h free" "enough for the standard voice; the high-quality extras need $extras_mb MB more"
+    QUALITY=standard PRONUNCIATION=standard SET_STANDARD=1 extras_mb=0
   else
-    bad "Only $free_h free" "kokomux needs about $need_mb MB"; problems=1
+    bad "Only $free_h free" "kokomux needs about $base_mb MB"; problems=1
   fi
 fi
 
@@ -535,9 +554,16 @@ if [ "$MODE" = install ]; then
   heading "Here's the plan"
   bullet "A small Debian system to run Kokoro in"
   bullet "Python, Kokoro and 54 voices (a 200 MB download)"
+  if [ "$QUALITY" = high ] || [ "$PRONUNCIATION" = dictionary ]; then
+    bullet "The high-quality voice and English pronunciation dictionary (another 400 MB download)"
+  fi
   bullet "The kokoro command, plus Share and widget shortcuts"
   blank
-  wrap "  " "${D}Takes 5–15 minutes and about 600 MB. You can use your phone meanwhile; it stays awake until done.${R}"
+  if [ "$extras_mb" -gt 0 ]; then
+    wrap "  " "${D}Takes 10–25 minutes and about 1.2 GB. You can use your phone meanwhile; it stays awake until done. For the smaller, quicker setup (600 MB), run the installer with --standard.${R}"
+  else
+    wrap "  " "${D}Takes 5–15 minutes and about 600 MB. You can use your phone meanwhile; it stays awake until done.${R}"
+  fi
 else
   if [ "$OLD_VERSION" = "$KOKOMUX_VERSION" ]; then
     heading "Reinstalling kokomux v$KOKOMUX_VERSION"
@@ -547,6 +573,10 @@ else
     heading "Updating kokomux to ${ACC}v$KOKOMUX_VERSION"
   fi
   say "  ${D}Your settings and downloaded voices are kept.${R}"
+  if [ "$extras_mb" -gt 0 ]; then
+    blank
+    wrap "  " "This update adds the high-quality voice and the English pronunciation dictionary: about 400 MB to download and $extras_mb MB on your phone. ${D}For the smaller setup, run the installer with --standard instead.${R}"
+  fi
 fi
 
 if [ "$ASSUME_YES" = 0 ] && [ -r /dev/tty ] && [ -t 1 ]; then
@@ -3157,9 +3187,11 @@ CFG
     "$APP/venv/bin/pip" uninstall -y cactus-compute pillow huggingface-hub hf-xet fsspec filelock \
       pyyaml httpcore2 httpx2 truststore $shared 2>/dev/null || true
     if [ "${2:-}" = dictionary ]; then   # the same packages as kokoro --pronunciation dictionary
+      # An extra: if it can't be installed, kokoro reads English with espeak, and
+      # kokoro --pronunciation dictionary tries again later.
       "$APP/venv/bin/pip" install --upgrade "misaki>=0.7.4,<0.8" num2words "spacy>=3.8,<3.9" \
         "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" \
-        | tee -a /tmp/kokoro-setup/.pip
+        2>&1 | tee -a /tmp/kokoro-setup/.pip || true
     fi
     grep -q '^Successfully installed' /tmp/kokoro-setup/.pip || printf 'up to date' > "$SRC/.note"
     cp "$SRC/engine.py" "$SRC/words.py" "$APP/"
@@ -3171,7 +3203,12 @@ CFG
        { [ "$quality" != high ] || [ -s "$APP/models/kokoro-v1.0-timestamped.fp32.onnx" ]; }; then
       printf 'already downloaded' > "$SRC/.note"
     fi
-    "$APP/venv/bin/python" -u "$APP/engine.py" download --quality "$quality"
+    "$APP/venv/bin/python" -u "$APP/engine.py" download
+    # The full-precision model is an extra: if it doesn't arrive, kokoro uses the
+    # 8-bit one, and kokoro --quality high carries on with the download later.
+    if [ "$quality" = high ]; then
+      "$APP/venv/bin/python" -u "$APP/engine.py" download --quality high || echo "The high-quality model didn't finish downloading."
+    fi
     ;;
   tidy)
     apt-get clean
@@ -3194,7 +3231,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
 # localhost (fast); otherwise each call starts the container (slower).
 set -euo pipefail
 
-KOKOMUX_VERSION="0.12.0"
+KOKOMUX_VERSION="0.13.0"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -3208,8 +3245,8 @@ env_overrides=""
 KOKORO_DEFAULTS=(
   KOKORO_VOICE=af_heart         # see: kokoro --list-voices
   KOKORO_BLEND=                 # a second voice mixed in, and how much: af_bella:30 (empty: none)
-  KOKORO_QUALITY=standard       # standard (92 MB model) or high (326 MB, full precision)
-  KOKORO_PRONUNCIATION=standard # English: standard (espeak) or dictionary (misaki, an extra 260 MB)
+  KOKORO_QUALITY=high           # high (326 MB, full precision) or standard (the 92 MB 8-bit model)
+  KOKORO_PRONUNCIATION=dictionary  # English: dictionary (misaki, as Kokoro learned) or standard (espeak)
   KOKORO_SPEED=1.0              # 0.5 to 2.0
   KOKORO_LANG=en-us
   KOKORO_OUT=kokoro.wav         # file name when -o isn't given
@@ -3430,8 +3467,8 @@ ROWS
 --list-voices|all 54 voices by language
 --status|server status and settings
 --settings|voice, speed, highlighting and more
---quality high|a cleaner voice (326 MB download); standard: back
---pronunciation dictionary|English read as Kokoro learned it (260 MB)
+--quality standard|the quicker 8-bit model; high: the default
+--pronunciation standard|English with espeak; dictionary: the default
 --config|edit the settings file directly
 --serve / --stop-server|start or stop the server
 --update|update kokomux and Kokoro
@@ -4083,8 +4120,8 @@ kokoro_command() {
 
 KOKORO_VOICE=af_heart     # see: kokoro --list-voices
 KOKORO_BLEND=             # mix in a second voice, and how much of it: e.g. af_bella:30
-KOKORO_QUALITY=standard   # standard, or high: a cleaner voice (kokoro --quality high downloads it)
-KOKORO_PRONUNCIATION=standard  # English: standard (espeak) or dictionary (kokoro --pronunciation dictionary)
+KOKORO_QUALITY=high       # high: the full-precision model (326 MB); standard: the 8-bit one, quicker
+KOKORO_PRONUNCIATION=dictionary  # English: dictionary (misaki, as Kokoro learned) or standard (espeak)
 KOKORO_SPEED=1.0          # 0.5 to 2.0
 KOKORO_LANG=en-us         # en-us en-gb es fr-fr it pt-br hi
 KOKORO_OUT=kokoro.wav     # file name when -o isn't given (.wav .mp3 .ogg .flac)
@@ -4118,6 +4155,12 @@ KOKORO_THEME=auto
 # read, like a camera's depth of field. 0 shows it all evenly.
 KOKORO_FOCUS=1
 CFG
+  fi
+  if [ "$SET_STANDARD" = 1 ]; then    # --standard, or no room for the extras: say so in the settings
+    local k
+    for k in KOKORO_QUALITY KOKORO_PRONUNCIATION; do
+      if grep -q "^$k=" "$conf"; then sed -i "s|^$k=[^ #]*|$k=standard|" "$conf"; else echo "$k=standard" >> "$conf"; fi
+    done
   fi
 
   # Share a link to Termux -> read the page. Share text or a file -> read it.
@@ -4171,11 +4214,6 @@ step "Debian container" \
 step "Python" \
   "Debian's servers may be busy. Wait a minute and try again." \
   in_container apt
-# The voice quality chosen in the settings: high keeps the full-precision model too.
-# The same for English pronunciation: dictionary keeps misaki installed.
-setting() { sed -n "s/^$1=\\([a-z]*\\).*/\\1/p" "$HOME/.config/kokoro/config" 2>/dev/null | tail -n 1; }
-QUALITY="$(setting KOKORO_QUALITY)"; [ "$QUALITY" = high ] || QUALITY=standard
-PRONUNCIATION="$(setting KOKORO_PRONUNCIATION)"; [ "$PRONUNCIATION" = dictionary ] || PRONUNCIATION=standard
 step "Kokoro" \
   "Installing Python packages failed. Check your connection and try again." \
   in_container pip "$PRONUNCIATION"
@@ -4233,6 +4271,21 @@ else
   say "  $bar  ${D}○${R} Clipboard: ${D}install the Termux:API app${R}"
 fi
 say "  $bar  ${D}○${R} Home-screen buttons: ${D}Termux:Widget app${R}"
+# The extras: on unless --standard or no room; each says if it didn't arrive.
+if [ "$QUALITY" = high ]; then
+  if [ -s "$ROOTFS/opt/kokoro/models/kokoro-v1.0-timestamped.fp32.onnx" ]; then
+    say "  $bar  ${GRN}✓${R} High-quality voice ${D}(326 MB model)${R}"
+  else wrap "  $bar  " "${YEL}!${R} High-quality voice ${D}didn't download, so the standard one is used. kokoro --quality high tries again.${R}"; fi
+else
+  say "  $bar  ${D}○${R} Standard voice: ${D}kokoro --quality high for a cleaner one${R}"
+fi
+if [ "$PRONUNCIATION" = dictionary ]; then
+  if compgen -G "$ROOTFS/opt/kokoro/venv/lib/python3*/site-packages/misaki/__init__.py" >/dev/null; then
+    say "  $bar  ${GRN}✓${R} English pronunciation dictionary ${D}(misaki)${R}"
+  else wrap "  $bar  " "${YEL}!${R} Pronunciation dictionary ${D}didn't install, so English uses espeak. kokoro --pronunciation dictionary tries again.${R}"; fi
+else
+  say "  $bar  ${D}○${R} English pronunciation: ${D}kokoro --pronunciation dictionary for better${R}"
+fi
 if [ -s "$SKIPPED" ]; then
   while read -r f; do
     wrap "  $bar  " "${YEL}!${R} ${D}Kept your own $f, so sharing that type won't use kokoro.${R}"

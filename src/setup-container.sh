@@ -36,9 +36,11 @@ CFG
     "$APP/venv/bin/pip" uninstall -y cactus-compute pillow huggingface-hub hf-xet fsspec filelock \
       pyyaml httpcore2 httpx2 truststore $shared 2>/dev/null || true
     if [ "${2:-}" = dictionary ]; then   # the same packages as kokoro --pronunciation dictionary
+      # An extra: if it can't be installed, kokoro reads English with espeak, and
+      # kokoro --pronunciation dictionary tries again later.
       "$APP/venv/bin/pip" install --upgrade "misaki>=0.7.4,<0.8" num2words "spacy>=3.8,<3.9" \
         "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" \
-        | tee -a /tmp/kokoro-setup/.pip
+        2>&1 | tee -a /tmp/kokoro-setup/.pip || true
     fi
     grep -q '^Successfully installed' /tmp/kokoro-setup/.pip || printf 'up to date' > "$SRC/.note"
     cp "$SRC/engine.py" "$SRC/words.py" "$APP/"
@@ -50,7 +52,12 @@ CFG
        { [ "$quality" != high ] || [ -s "$APP/models/kokoro-v1.0-timestamped.fp32.onnx" ]; }; then
       printf 'already downloaded' > "$SRC/.note"
     fi
-    "$APP/venv/bin/python" -u "$APP/engine.py" download --quality "$quality"
+    "$APP/venv/bin/python" -u "$APP/engine.py" download
+    # The full-precision model is an extra: if it doesn't arrive, kokoro uses the
+    # 8-bit one, and kokoro --quality high carries on with the download later.
+    if [ "$quality" = high ]; then
+      "$APP/venv/bin/python" -u "$APP/engine.py" download --quality high || echo "The high-quality model didn't finish downloading."
+    fi
     ;;
   tidy)
     apt-get clean
