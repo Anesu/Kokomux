@@ -64,17 +64,16 @@ def run(text, *, stream=True, out=None, g2p=None, **job):
         return made[engine.MODEL]
 
     # misaki for English: a stand-in, or none (text as given) to check the rest
-    old = engine.tts, engine._wait_for_listener, dict(engine._g2p)
+    old = engine.tts, dict(engine._g2p)
     engine.tts = fake_tts
-    engine._wait_for_listener = lambda *a: None
     engine._g2p.clear()
     engine._g2p.update({False: g2p, True: g2p})
     try:
         engine.run_job(os.path.join(jobdir, "job"))
     finally:
-        engine.tts, engine._wait_for_listener = old[:2]
+        engine.tts = old[0]
         engine._g2p.clear()
-        engine._g2p.update(old[2])
+        engine._g2p.update(old[1])
     return jobdir, made
 
 
@@ -102,14 +101,13 @@ def needs_audio(fn):
 @needs_audio
 def test_parts_end_with_the_pause_their_boundary_asks_for():
     para = " ".join(["The road went on and on over the hills."] * 12)
-    jobdir, _ = run(f"Hello there. {para}\nThe end.", gap_ms="100")
+    jobdir, _ = run(f"Hello there. {para}\nThe end.")
     try:
         parts = sorted(f for f in os.listdir(os.path.join(jobdir, "stream")) if f.endswith(".wav"))
         pauses = [speech_and_pause(wav(jobdir, i + 1))[1] / RATE for i in range(len(parts))]
-        lead = 0.1                                         # the player's own gap is taken off
-        assert abs(pauses[0] - (engine.PAUSE["sentence"] - lead)) < 0.002
-        assert abs(pauses[-2] - (engine.PAUSE["paragraph"] - lead)) < 0.002
-        assert abs(pauses[-1] - (engine.PAUSE["chapter"] - lead)) < 0.002
+        assert abs(pauses[0] - engine.PAUSE["sentence"]) < 0.002          # mpv plays them back to back
+        assert abs(pauses[-2] - engine.PAUSE["paragraph"]) < 0.002
+        assert abs(pauses[-1] - engine.PAUSE["chapter"]) < 0.002
     finally:
         shutil.rmtree(jobdir)
 
@@ -227,6 +225,90 @@ def test_english_goes_through_misaki_other_languages_through_espeak():
     jobdir, made = run("Bonjour.", g2p=FakeMisaki(), lang="fr-fr")
     shutil.rmtree(jobdir)
     assert made[engine.MODEL].calls[0][0] == "Bonjour." and made[engine.MODEL].calls[0][-1] != "phonemes"
+
+
+def with_cache(fn):
+    """Run fn with the engine's cache in a fresh folder under /tmp (beside the job folders)."""
+    def wrapper():
+        if np is None:
+            return
+        old, engine.CACHE_ROOT = engine.CACHE_ROOT, f"/tmp/kokomux-cache-test-{secrets.token_hex(4)}"
+        try:
+            fn()
+        finally:
+            shutil.rmtree(engine.CACHE_ROOT, ignore_errors=True)
+            engine.CACHE_ROOT = old
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+BOOK = "0123456789abcdef"
+LONG = " ".join(f"Sentence {n} of the story goes on for a little while." for n in range(30))
+
+
+@with_cache
+def test_parts_are_kept_and_reused():
+    jobdir, made = run(LONG, cache=BOOK)
+    first = len(made[engine.MODEL].calls)
+    stream = os.path.join(jobdir, "stream")
+    link = os.path.join(stream, "0001.wav")
+    assert os.path.islink(link) and not os.readlink(link).startswith("/")    # relative: works on both sides
+    kept = sorted(os.listdir(stream))
+    shutil.rmtree(jobdir)
+    jobdir, made = run(LONG, cache=BOOK)                                      # again: nothing to make
+    try:
+        assert first > 1 and made[engine.MODEL].calls == []
+        assert sorted(os.listdir(os.path.join(jobdir, "stream"))) == kept
+    finally:
+        shutil.rmtree(jobdir)
+    jobdir, made = run(LONG, cache=BOOK, voice="af_bella")                    # other settings: made afresh
+    shutil.rmtree(jobdir)
+    assert len(made[engine.MODEL].calls) == first
+
+
+@with_cache
+def test_a_changed_part_is_made_again():
+    jobdir, _ = run(LONG, cache=BOOK)
+    shutil.rmtree(jobdir)
+    jobdir, made = run(LONG.replace("Sentence 0 ", "Line zero "), cache=BOOK)  # only the first part differs
+    shutil.rmtree(jobdir)
+    calls = made[engine.MODEL].calls
+    assert len(calls) == 1 and calls[0][0].startswith("Line zero")
+
+
+@with_cache
+def test_a_file_from_kept_parts_is_the_same():
+    jobdir, _ = run(LONG, stream=False, out="out.wav", cache=BOOK)
+    a, _ = sf.read(os.path.join(jobdir, "out.wav"), dtype="float32")
+    shutil.rmtree(jobdir)
+    jobdir, made = run(LONG, stream=False, out="out.wav", cache=BOOK)
+    b, _ = sf.read(os.path.join(jobdir, "out.wav"), dtype="float32")
+    shutil.rmtree(jobdir)
+    assert made[engine.MODEL].calls == []
+    assert len(a) == len(b) and np.allclose(a, b, atol=1e-4)
+
+
+@needs_audio
+def test_a_saved_book_records_where_each_chapter_starts():
+    jobdir = f"/tmp/kokoro.{secrets.token_hex(6)}"
+    os.mkdir(jobdir)
+    old = engine.read_source, engine.tts
+    made = FakeKokoro(engine.MODEL)
+    engine.read_source = lambda d, j: ("A Book", [("One", "First chapter text."), ("Two", "Second chapter, a bit longer.")])
+    engine.tts = lambda: made
+    engine._g2p.update({False: None, True: None})
+    try:
+        with open(os.path.join(jobdir, "job"), "w") as f:
+            f.write("voice=af_heart\nout=out.wav\n")
+        engine.run_job(os.path.join(jobdir, "job"))
+        with open(os.path.join(jobdir, "chapters_ms")) as f:
+            rows = [line.rstrip("\n").split("\t") for line in f]
+        first_len = len("First chapter text.") * PER_CHAR / RATE + engine.PAUSE["chapter"]
+        assert rows[0] == ["0", "One"] and rows[1][1] == "Two"
+        assert abs(int(rows[1][0]) / 1000 - first_len) < 0.01
+    finally:
+        engine.read_source, engine.tts = old
+        shutil.rmtree(jobdir)
 
 
 if __name__ == "__main__":

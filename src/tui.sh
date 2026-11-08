@@ -388,6 +388,8 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
   local -A rowact=()
   tui_enter
   mapfile -t marks < <(ls -t "$BOOKS"/*.mark 2>/dev/null | head -n 6)
+  local queue=() qn=0
+  if [ -s "$QUEUE" ]; then mapfile -t queue < <(cut -f4 "$QUEUE"); qn=${#queue[@]}; fi
   HOME_CHOICE=()
   while IFS= read -rsn1 -t 0.05 -u "$KBD" _; do :; done   # drop keys typed before it opened
   local api=0
@@ -400,6 +402,7 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
     n=${#marks[@]}; [ "$n" -gt 0 ] || n=1
     if [ "$TH" -ge 22 ]; then h=6; else h=2; fi
     h=$(( h + 1 + n + 1 + 1 + 6 ))
+    [ "$qn" -gt 0 ] && h=$(( h + 2 + (qn < 3 ? qn : 3) + 1 ))     # Up next
     free=$(( TH - 2 - h )); [ "$free" -gt 0 ] || free=0
     golden "$free"; y=$(( 1 + REPLY ))
     if [ "$TH" -ge 22 ]; then                     # the logo, when there's room for it
@@ -439,6 +442,14 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
       rowact[$y]="mark:$i"; y=$(( y + 1 ))
     done
     y=$(( y + 1 ))
+    if [ "$qn" -gt 0 ]; then                      # shared links and files, waiting their turn
+      printf '\033[%d;%dH%sUp next%s  %s%d in the queue%s' "$y" "$x0" "$B" "$R" "$D" "$qn" "$R" >&2; y=$(( y + 1 ))
+      for (( i = 0; i < qn && i < 3; i++ )); do
+        title=${queue[i]}; [ "${#title}" -gt $(( CW - 6 )) ] && title="${title:0:$(( CW - 7 ))}…"
+        printf '\033[%d;%dH   %s%s%s' "$y" "$x0" "$D" "$title" "$R" >&2; rowact[$y]=queue; y=$(( y + 1 ))
+      done
+      printf '\033[%d;%dH %sp%s  Play the queue' "$y" "$x0" "$ACC2" "$R" >&2; rowact[$y]=queue; y=$(( y + 2 ))
+    fi
     local clip_note=""; [ "$api" = 1 ] || clip_note="  ${D}needs the Termux:API app${R}"
     printf '\033[%d;%dH%sStart something new%s' "$y" "$x0" "$B" "$R" >&2; y=$(( y + 1 ))
     for spec in "c|Read the clipboard$clip_note|clip" "f|Open a file  ${D}text, EPUB or PDF${R}|file" \
@@ -461,12 +472,14 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
       $'\033[A'|$'\033OA'|k|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;   # also the mouse wheel
       $'\033[B'|$'\033OB'|j|$'\033[<65;'*M) [ "$sel" -lt $(( ${#marks[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
       c) cmd="clip" ;; f) cmd="file" ;; u) cmd="url" ;; t) cmd="text" ;; v) cmd="voice" ;; s|o|,) cmd="settings" ;;
+      p) [ "$qn" -gt 0 ] && cmd="queue" ;;
       q|Q|$'\033') break ;;
       $'\033[<0;'*M) [[ "$KEY" =~ \;([0-9]+)M$ ]] && cmd="${rowact[${BASH_REMATCH[1]}]:-}" ;;
     esac
     case "$cmd" in
       mark:*)  HOME_CHOICE=(--continue "${marks[${cmd#mark:}]}"); break ;;
       clip)    HOME_CHOICE=(-p -c); break ;;
+      queue)   HOME_CHOICE=(--queue); break ;;
       file)    tui_prompt "File to read:"; [ -n "$ANSWER" ] && { HOME_CHOICE=(-p -f "${ANSWER/#\~/$HOME}"); break; } ;;
       url)     tui_prompt "Web address:" "https://"; [ "${ANSWER:-https://}" != "https://" ] && { HOME_CHOICE=(-p -u "$ANSWER"); break; } ;;
       text)    tui_prompt "Say:"; [ -n "$ANSWER" ] && { HOME_CHOICE=(-p "$ANSWER"); break; } ;;

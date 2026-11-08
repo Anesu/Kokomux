@@ -41,6 +41,7 @@ If a step fails, the installer shows what went wrong and how to fix it ([example
 kokoro -p "Say this out loud"             # speak (starts after the first sentence)
 kokoro "Save this"                        # save to kokoro.wav
 kokoro -o note.mp3 "Smaller file"         # .wav .mp3 .ogg or .flac
+kokoro -f book.epub -o book.m4b           # an audiobook, with chapters
 kokoro -c -p                              # read the clipboard
 kokoro -u https://example.com/article -p  # read a web page
 kokoro -f story.txt -o story.mp3          # read a text file
@@ -52,13 +53,13 @@ kokoro --stop                             # stop playback
 | Option | Meaning |
 |---|---|
 | `-p` | Play while it's being made. Nothing is saved unless you also give `-o`. |
-| `-o FILE` | Save to FILE. The ending picks the format: `.wav`, `.mp3`, `.ogg` or `.flac`. |
+| `-o FILE` | Save to FILE. The ending picks the format: `.wav`, `.mp3`, `.ogg`, `.flac`, or `.m4b` for an audiobook with chapters. |
 | `-v NAME` | Voice, e.g. `af_heart`, `am_adam`, `bf_emma`, `bm_george`, or a blend: `af_heart:70+bf_emma:30` |
 | `-s N` | Speed, 0.5–2.0 |
 | `-l CODE` | Language: `en-us`, `en-gb`, `es`, `fr-fr`, `it`, `pt-br`, `hi`. Use a voice for that language too. |
 | `-f FILE` | Read a text file, an EPUB or a PDF |
 | `-c` | Read the clipboard. A copied link reads that web page. |
-| `-u URL` | Read a web page. Menus, sidebars, tables and references are skipped. |
+| `-u URL` | Read a web page: just the article (found by trafilatura), up to where the links start. |
 
 **Voices:** the first two letters of a voice name tell you its accent and gender. `a` is American, `b` British, then `f` for female and `m` for male. Other languages have their own voices, such as `ef_dora` for Spanish and `ff_siwis` for French. `kokoro --list-voices` shows all 54.
 
@@ -167,15 +168,33 @@ Without 24-bit colour, the nearest of the terminal's 256 colours is used. `NO_CO
 **Controls while it plays:**
 
 ```sh
-kokoro --pause     # pause, or carry on (picks up at the start of the part)
+kokoro --pause     # pause, or carry on from that exact word
 kokoro --next      # skip to the next part
 kokoro --again     # hear this part again
 kokoro --stop      # stop (the bookmark is kept)
 ```
 
-A part is a sentence or two. With the Termux:API app installed, a notification shows the title and which part is playing, with **previous** (again), **pause**, **play** and **next** buttons. They work from the lock screen too. Swiping the notification away stops playback. To turn the notification off, set `KOKORO_NOTIFY=0`.
+A part is a few sentences. With the Termux:API app installed, a notification shows the title and which part is playing, with **previous** (again), **pause**, **play** and **next** buttons. They work from the lock screen too. Swiping the notification away stops playback. To turn the notification off, set `KOKORO_NOTIFY=0`.
 
-Only a few parts are made ahead of the one you're hearing, so a whole book never piles up on the phone's storage while you listen or pause. Saving a book with `-o` writes the file as it goes, so even a long book doesn't have to fit in memory.
+**Gapless, and made ahead.** One mpv plays the whole listen as a playlist, so each part runs straight into the next, and pause stops mid-word and carries on from there. Behind it, the whole text is made as fast as the phone can (the reader shows "made 40%" until it's done), so skipping, chapters and seeking are instant once a part exists. Everything made is kept per book, voice and speed in `$PREFIX/tmp/kokomux-cache`, so listening again, or making the audiobook, reuses it. A book's audio is deleted once you've heard it to the end; the cache never grows past `KOKORO_CACHE_GB` (50 GB), letting go of the books heard least recently.
+
+## Audiobooks
+
+`kokoro -f book.epub -o book.m4b` makes an audiobook: AAC in an `.m4b`, with a chapter mark for each of the book's chapters, its title and author, and its cover. Any app that plays audiobooks shows the chapters, so it works in the car, on a watch or in your favourite player. It reuses whatever you've already listened to in the same voice and speed, keeps the phone awake while it works, and shows how far it's got. Text files and web pages work too, as one chapter.
+
+## The queue
+
+Share a link or a file to Termux and it joins your **queue** instead of playing at once, like a podcast playlist. Play it when you're ready:
+
+```sh
+kokoro --queue          # play the queue in order (also p on the home screen, or the Kokoro play queue widget)
+kokoro --queue list     # what's waiting
+kokoro --queue skip     # drop the first one
+kokoro --queue clear    # empty it
+kokoro --add -u URL     # add a page yourself (or -f FILE, -c for the clipboard, or some text)
+```
+
+Each item plays to the end and leaves the queue, and the next one starts. Stopping (q, the notification, or the sleep timer) stops the queue and keeps your place: the item stays first, with its bookmark. The home screen shows what's up next.
 
 ## Words light up as they're read
 
@@ -185,20 +204,16 @@ How it works:
 
 1. **Kokoro times itself.** kokomux uses an export of the Kokoro model that also reports how long it spends on every sound it makes. Those timings come with the audio, at no extra cost.
 2. **Sounds become words.** Each word of the line is turned into its sounds on its own, and those are lined up against the sounds Kokoro actually spoke. So "1999" covers the three words it's spoken as, and two short words run together in speech ("in the") each still get their own moment.
-3. **Highlight.** The player lights the word that matches the time since the line started playing. A line where too few sounds lined up gets no highlight rather than a wrong one, and is shown in plain text.
+3. **Highlight.** The player lights the word that matches mpv's playback position in the line. A line where too few sounds lined up gets no highlight rather than a wrong one, and is shown in plain text.
 
-It works in every language Kokoro speaks, offline, and needs no extra download. To turn it off, set `KOKORO_WORDS=0`. If the highlight runs ahead of the voice on your phone, raise `KOKORO_WORDS_OFFSET_MS` (default 100); if it lags, lower it. `play-audio` doesn't report its position, so this offset covers its start-up delay.
-
-Before 0.8, a separate speech recogniser (Whistle) listened to each line to find the words. Kokoro's own timings are more accurate, cover all nine languages instead of four, use no extra processing, and take about 70 MB less space. Updating removes Whistle.
+It works in every language Kokoro speaks, offline, and needs no extra download. To turn it off, set `KOKORO_WORDS=0`. The highlight follows mpv's own playback clock; to shift it, use **Highlight timing** in the settings (`KOKORO_WORDS_OFFSET_MS`, + later, − earlier).
 
 ## Use it from other apps
 
-- **Share to Termux.** In any app, tap **Share → Termux**:
-  - A **link** reads the web page aloud.
-  - **Text, a text file, an EPUB or a PDF** reads that aloud.
+- **Share to Termux.** In any app, tap **Share → Termux**. A **link**, **text, a text file, an EPUB or a PDF** joins your [queue](#the-queue).
 
   The installer sets this up with `~/bin/termux-url-opener` and `~/bin/termux-file-editor`. If you already had your own versions of these files, it leaves them alone and tells you.
-- **Home-screen buttons.** With Termux:Widget installed, add a Termux widget to the home screen. It lists **Kokoro read clipboard**, **Kokoro pause**, **Kokoro next**, **Kokoro continue** and **Kokoro stop**. Copy some text, then tap **Kokoro read clipboard**; tap **Kokoro continue** to pick up your book.
+- **Home-screen buttons.** With Termux:Widget installed, add a Termux widget to the home screen. It lists **Kokoro read clipboard**, **Kokoro play queue**, **Kokoro pause**, **Kokoro next**, **Kokoro continue** and **Kokoro stop**. Copy some text, then tap **Kokoro read clipboard**; tap **Kokoro continue** to pick up your book.
 
 ## Settings
 
@@ -243,6 +258,8 @@ kokoro --stop-server   # stop it and free its memory
 
 If you'd rather not have it, set `KOKORO_AUTOSERVE=0` in the settings. Each command then loads Kokoro on its own, which is slower but uses no memory in between.
 
+`kokoro --benchmark` times Kokoro on your phone a few ways (thread counts, and how work is spread across cores of different speeds), shows how many times faster than real time each is, and keeps the fastest for the server.
+
 The server only listens on the phone itself (127.0.0.1). It needs a secret token that only Termux can read, so other apps can't use it.
 
 ## Update and uninstall
@@ -258,7 +275,7 @@ kokoro --uninstall   # remove the container, the command, settings and helper sc
 Kokoro's Python packages (`onnxruntime`, `espeakng-loader`, `soundfile`) only ship builds for standard Linux (glibc). Termux uses Android's own C library, so they can't run there directly. The installer therefore creates a small Debian container called `kokoro` with `proot-distro`, and runs Kokoro inside it. The parts:
 
 - **`kokoro`** (Termux side): reads your text, starts or uses the server, and hands each run to the player.
-- **`player.sh`, `tui.sh` and `theme.sh`** (Termux side): play the audio with `play-audio`, and draw the reader, home screen and settings in colours made from the terminal's own.
+- **`player.sh`, `tui.sh` and `theme.sh`** (Termux side): play the audio through one mpv (gapless, controlled over its IPC socket with socat), and draw the reader, home screen and settings in colours made from the terminal's own. ffmpeg makes the audiobooks.
 - **`engine.py`** (inside Debian): splits the text into sentences and runs Kokoro. With `-p` it hands back audio one chunk at a time, so playback starts after the first sentence.
 - **misaki** (inside Debian): turns English into sounds the way Kokoro was trained, using spaCy to tell a noun from a verb.
 - **`words.py`** (inside Debian): turns Kokoro's per-sound timings into word timings, for the highlight.
@@ -273,7 +290,7 @@ The installer only keeps what's needed in the container. It skips documentation 
 - **`pkg` errors or mirror problems:** run `termux-change-repo`, pick another mirror, then `pkg upgrade`.
 - **A download failed:** run the installer again. Model downloads pick up where they stopped.
 - **`-c` hangs or fails:** you need both the Termux:API **app** and `pkg install termux-api`.
-- **No sound:** check the media volume. Also make sure `play-audio` is installed (`pkg install play-audio`).
+- **No sound:** check the media volume. `mpv some.mp3` in Termux should play; if not, `pkg install mpv socat`.
 - **"Process completed (signal 9)", or the server keeps disappearing:** Android 12+ kills background processes it considers excessive. Search for "Termux phantom process killer" for the one-time fix.
 - **Server problems:** `kokoro --stop-server` and try again. Its log is in `$PREFIX/tmp/kokoro-server/log`.
 
@@ -292,7 +309,8 @@ The files in `src/` are the source. `./build.sh` bundles them into the single `i
 | `tests/test_words.py` | tests for word timings, on recorded Kokoro output: `python3 tests/test_words.py` |
 | `tests/test_books.py` | tests for reading EPUB, PDF and text: `python3 tests/test_books.py` |
 | `tests/test_text.py` | tests for tidying text and splitting it into parts: `python3 tests/test_text.py` |
-| `tests/test_job.py` | tests for running a job with a stand-in for Kokoro (pauses, blends, quality, old bookmarks): `python3 tests/test_job.py` |
+| `tests/test_job.py` | tests for running a job with a stand-in for Kokoro (pauses, kept parts, blends, misaki, chapter times, old bookmarks): `python3 tests/test_job.py` |
+| `tests/test_web.py` | tests for reading web pages (needs trafilatura): `python3 tests/test_web.py` |
 | `tests/test_reader.py` | tests for the reader's focus effect: `python3 tests/test_reader.py` |
 | `tests/test_theme.py` | tests for the colours: contrast on 15 terminal themes, the golden steps, asking the terminal: `python3 tests/test_theme.py` |
 | `src/setup-container.sh` | installs everything inside the container |

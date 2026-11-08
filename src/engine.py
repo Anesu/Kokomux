@@ -11,7 +11,7 @@ or through the background server:
   engine.py download                        fetch model files (resumable)
 
 A job folder holds `job` (key=value lines: voice, speed, lang, and optionally
-url, out, stream, words, start, of, gap_ms) and `in.txt` (the text,
+url, out, stream, words, start, of) and `in.txt` (the text,
 unless url is set). A voice can be a blend: af_heart:70+bf_emma:30. Output goes into
 the same folder: `out.<ext>` for a saved file, and with stream=1 one WAV per
 chunk in `stream/0001.wav`, `stream/0002.wav`, ... followed by `stream/end`.
@@ -48,7 +48,6 @@ JOB_DIR_RE = re.compile(r"^/tmp/kokoro\.[A-Za-z0-9]+$")
 FORMATS = ("wav", "mp3", "ogg", "flac")
 USER_AGENT = "Mozilla/5.0 (Linux; Android) kokomux"
 MAX_CHUNK = 360  # characters per part: whole sentences, under Kokoro's 510 sounds
-AHEAD = 3        # while listening, parts made ahead of the one being heard
 SERVING = False
 
 
@@ -70,13 +69,32 @@ _tts_lock = threading.Lock()
 SYNTH_LOCK = threading.Lock()
 
 
+# How onnxruntime runs the model: threads (0: its own choice) and the dynamic block
+# base (0: off), which spreads work across cores of different speeds. kokoro
+# --benchmark finds the fastest on the phone; serve and job take them as set.
+TUNING = {"threads": 0, "block": 0}
+
+
+def load_kokoro(threads=0, block=0):
+    """Kokoro on a CPU session tuned this way."""
+    import onnxruntime as rt
+    from kokoro_onnx import Kokoro
+    so = rt.SessionOptions()
+    so.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_ALL
+    so.inter_op_num_threads = 1
+    if threads:
+        so.intra_op_num_threads = threads
+    if block:
+        so.add_session_config_entry("session.dynamic_block_base", str(block))
+    return Kokoro.from_session(rt.InferenceSession(MODEL, so, providers=["CPUExecutionProvider"]), VOICES)
+
+
 def tts():
     """Kokoro, loaded once."""
     global _tts
     with _tts_lock:
         if _tts is None:
-            from kokoro_onnx import Kokoro
-            _tts = Kokoro(MODEL, VOICES)
+            _tts = load_kokoro(TUNING["threads"], TUNING["block"])
             # kokoro-onnx looks for an output called "duration"; this export calls it
             # "durations". It's the second output either way, which is what it reads.
             _tts.has_timings = len(_tts.sess.get_outputs()) > 1
@@ -258,7 +276,7 @@ def normalise(text, lang="en-us"):
     text = re.sub(r"\b(?:https?://|www\.)(?:www\.)?([\w-]+(?:\.[\w-]+)+)[^\s)\]]*?(?=[.,;:!?)\]]?(?:\s|$))",
                   r"\1", text)                                                         # links: their site
     text = re.sub(r"(?m)^[ \t]*(?:#{1,6}|>+|[-*+•·▪◦‣])[ \t]+", "", text)            # markdown marks, bullets
-    text = re.sub(r"(?<![\w*])(\*\*|__|\*|_)(?=\S)([^\n]+?)(?<=\S)\1(?![\w*])", r"\2", text)
+    text = re.sub(r"(?<![\w*])(\*\*\*|___|\*\*|__|\*|_)(?=\S)([^\n]+?)(?<=\S)\1(?![\w*])", r"\2", text)
     text = re.sub(r"(?<=\d)[ \t]?[–—][ \t]?(?=\d)", " to ", text)                     # 1990–1995
     text = re.sub(r"[ \t]*(?:—|–|--)[ \t]*", ", ", text)                             # dashes: a pause
     text = re.sub(r"([!?])\1+", r"\1", text)
@@ -451,12 +469,47 @@ def fetch_url(url):
         return url, body
     if "html" not in ctype and "xml" not in ctype:
         raise JobError(f"That link is {ctype}, not a web page")
-    ex = _Extractor()
-    ex.feed(body)
-    text = ex.text()
-    if not text.strip():
+    return page_text(body, url)
+
+
+# Where an article ends: from a heading like these on it's links, not reading.
+_PAGE_END = set(_Extractor.END_SECTIONS) | {
+    "more recent articles", "recent articles", "recent posts", "related", "related posts", "related stories",
+    "read more", "more from", "more stories", "you might also like", "you may also like", "popular",
+    "most popular", "most read", "share this", "share", "tags", "about the author", "newsletter", "sign up"}
+
+
+def page_text(html, url):
+    """A web page's (title, text to read), found by trafilatura: the article, not the menus,
+    sidebars, ads or comments, and stopping where the links start ("See also", "Recent posts")."""
+    import trafilatura
+    # Two line breaks in a row are a paragraph break (older pages lay text out that way).
+    html = re.sub(r"(?i)(?:<br\s*/?>\s*){2,}", "</p><p>", html)
+    md = trafilatura.extract(html, url=url, output_format="markdown", include_comments=False,
+                             include_images=False, include_links=False, include_tables=False) or ""
+    meta = trafilatura.extract_metadata(html, default_url=url)
+    lines = []
+    for line in md.splitlines():
+        line = re.sub(r"<[^>]+>", "", line.replace("\\", "")).strip()       # markdown escapes, stray tags
+        head = re.match(r"^#{1,6}\s+(.*)$", line)
+        if head:
+            name = re.sub(r"[^\w\s]", "", head.group(1)).strip().lower()
+            if name in _PAGE_END:
+                break
+            line = head.group(1)
+            if not re.search(r"[.!?:…]$", line):
+                line += "."                   # a heading gets its own pause
+        line = re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", line)         # list items
+        if line and line != "[edit]":
+            lines.append(line)
+    text = "\n".join(lines)
+    if len(text.split()) < 5:                # a menu or a "Home" link is not an article
         raise JobError("Couldn't find any readable text on that page")
-    return ex.page_title() or url, text
+    title = (meta.title if meta is not None and meta.title else "") or url
+    short = title.split(" - ")[0].split(" | ")[0].strip()
+    if short and short not in text.split("\n", 1)[0]:
+        text = f"{short}.\n{text}"           # say what it is first
+    return title, text
 
 
 # ------------------------------------------------------------------ books
@@ -502,6 +555,34 @@ def read_epub(path, name):
     if not parts:
         raise JobError("That EPUB has no readable text")
     return (title or "").strip() or name, parts
+
+
+def epub_meta(path):
+    """An EPUB's author and cover image, as (author, cover bytes, extension); blanks if it has none."""
+    import posixpath
+    import xml.etree.ElementTree as ET
+
+    def local(tag):
+        return tag.rsplit("}", 1)[-1]
+    try:
+        with zipfile.ZipFile(path) as z:
+            container = ET.fromstring(z.read("META-INF/container.xml"))
+            opf_path = next(el.get("full-path") for el in container.iter() if local(el.tag) == "rootfile")
+            opf = ET.fromstring(z.read(opf_path))
+            author = next((el.text.strip() for el in opf.iter() if local(el.tag) == "creator" and el.text), "")
+            items = [el for el in opf.iter() if local(el.tag) == "item"]
+            cover_id = next((el.get("content") for el in opf.iter()
+                             if local(el.tag) == "meta" and el.get("name") == "cover"), None)
+            item = next((el for el in items if "cover-image" in (el.get("properties") or "").split()), None) or \
+                next((el for el in items if el.get("id") == cover_id), None)
+            if item is None or not (item.get("media-type") or "").startswith("image/"):
+                return author, b"", ""
+            inner = posixpath.normpath(posixpath.join(posixpath.dirname(opf_path),
+                                                      urllib.parse.unquote(item.get("href", ""))))
+            ext = {"image/jpeg": "jpg", "image/png": "png"}.get(item.get("media-type"), "")
+            return author, (z.read(inner) if ext else b""), ext
+    except (KeyError, StopIteration, zipfile.BadZipFile, ET.ParseError):
+        return "", b"", ""
 
 
 def read_pdf(path, name):
@@ -579,6 +660,64 @@ def read_job(path):
     return jobdir, job
 
 
+CACHE_ROOT = "/tmp/kokomux-cache"   # Termux's $PREFIX/tmp/kokomux-cache: made parts, kept per book
+
+
+def cache_dir(book, voice, speed, lang):
+    """Where a book's parts are kept for these settings (None: not kept)."""
+    if not re.fullmatch(r"[0-9a-f]{8,64}", book or ""):
+        return None
+    import hashlib
+    key = hashlib.sha1(f"{voice}|{speed:.2f}|{lang}|{os.path.basename(MODEL)}".encode()).hexdigest()[:12]
+    d = os.path.join(CACHE_ROOT, book, key)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def cached_part(cache, name, text):
+    """A kept part's audio, if it was made from exactly this text."""
+    wav, txt = os.path.join(cache, f"{name}.wav"), os.path.join(cache, f"{name}.txt")
+    try:
+        with open(txt, encoding="utf-8") as fh:
+            same = fh.read() == text
+    except OSError:
+        return None
+    return wav if same and os.path.exists(wav) else None
+
+
+def _link(src, dest):
+    """A relative link, so it resolves both in the container (/tmp) and in Termux ($PREFIX/tmp)."""
+    tmp = dest + ".lnk"
+    if os.path.lexists(tmp):
+        os.remove(tmp)
+    os.symlink(os.path.relpath(src, os.path.dirname(dest)), tmp)
+    os.replace(tmp, dest)
+
+
+def synthesize(engine, g2p, chunk, voice, speed, lang, timed, i):
+    """One part's audio, and its word timings when timed (else None)."""
+    import words
+    with SYNTH_LOCK:
+        ps, per = None, None
+        if g2p is not None:
+            try:
+                ps, per = dictionary_phonemes(g2p, chunk)
+            except Exception as e:      # a sentence misaki can't parse: espeak reads it
+                log(f"misaki: part {i}: {e.__class__.__name__}: {e}")
+                ps = None
+        if timed:
+            if ps:
+                samples, rate, timings = engine.create_timed(ps, voice=voice, speed=speed, lang=lang, is_phonemes=True)
+                return samples, rate, words.words_from_timings(chunk, timings, lambda ws: per)
+            samples, rate, timings = engine.create_timed(chunk, voice=voice, speed=speed, lang=lang)
+            return samples, rate, words.words_from_timings(chunk, timings, lambda ws: phonemize_many(ws, lang, engine))
+        if ps:
+            samples, rate = engine.create(ps, voice=voice, speed=speed, lang=lang, is_phonemes=True)
+        else:
+            samples, rate = engine.create(chunk, voice=voice, speed=speed, lang=lang)
+        return samples, rate, None
+
+
 def edges(samples, rate):
     """Soften a part's first and last few milliseconds, so a trimmed edge can't click."""
     import numpy as np
@@ -599,6 +738,7 @@ def silence(seconds, rate):
 def run_job(path):
     import numpy as np
     import soundfile as sf
+    import words
 
     t0 = time.time()
     jobdir, job = read_job(path)
@@ -635,6 +775,14 @@ def run_job(path):
     try:
         title, chapters = read_source(jobdir, job)
         _write_atomic(os.path.join(jobdir, "title"), (title or "").replace("\n", " ")[:120] + "\n")
+        if job.get("meta") == "1":            # for an audiobook: who wrote it, and its cover
+            src = os.path.join(jobdir, job.get("file", "in.txt"))
+            if not job.get("url") and zipfile.is_zipfile(src):
+                author, cover, ext = epub_meta(src)
+                _write_atomic(os.path.join(jobdir, "author"), author.replace("\n", " ")[:200] + "\n")
+                if cover:
+                    with open(os.path.join(jobdir, f"cover.{ext}"), "wb") as fh:
+                        fh.write(cover)
         # Each chapter is split on its own, so a part never runs across chapters, and
         # where each chapter starts is written down for the player's chapter list.
         chunks, starts = [], []
@@ -664,58 +812,58 @@ def run_job(path):
         if stream:
             _write_atomic(os.path.join(stream, "first"), f"{first}\n")
 
-        try:
-            lead = max(0, min(500, int(job.get("gap_ms", "0")))) / 1000   # the player's own start-up gap
-        except ValueError:
-            lead = 0.0
+        cache = cache_dir(job.get("cache", ""), job.get("voice", "af_heart"), speed, lang)
+        if cache and engine.has_timings:
+            timed = True                    # kept parts carry their word timings, whatever this run shows
+        chapter_at = {int(line.split("\t", 1)[0]): line.split("\t", 1)[1] for line in starts}
+        chapter_times, written = [], 0
         for i in range(first, len(chunks) + 1):
             chunk, pause = chunks[i - 1]
-            if stream:
-                _wait_for_listener(jobdir, stream, i, first)
             # The kokoro command deletes its job folder when it exits or is
             # stopped, so a vanished folder means nobody is waiting any more.
             if not os.path.isdir(jobdir) or (stream and not os.path.isdir(stream)):
                 raise JobError("Cancelled")
             _write_atomic(os.path.join(jobdir, "progress"), f"{i} {len(chunks)}\n")
-            with SYNTH_LOCK:
-                ps, per = None, None
-                if g2p is not None:
-                    try:
-                        ps, per = dictionary_phonemes(g2p, chunk)
-                    except Exception as e:      # a sentence misaki can't parse: espeak reads it
-                        log(f"misaki: part {i}: {e.__class__.__name__}: {e}")
-                        ps = None
-                if timed:
-                    import words
-                    if ps:
-                        samples, rate, timings = engine.create_timed(ps, voice=voice, speed=speed, lang=lang, is_phonemes=True)
-                        marks = words.words_from_timings(chunk, timings, lambda ws: per)
-                    else:
-                        samples, rate, timings = engine.create_timed(chunk, voice=voice, speed=speed, lang=lang)
-                        marks = words.words_from_timings(chunk, timings, lambda ws: phonemize_many(ws, lang, engine))
-                elif ps:
-                    samples, rate = engine.create(ps, voice=voice, speed=speed, lang=lang, is_phonemes=True)
-                else:
-                    samples, rate = engine.create(chunk, voice=voice, speed=speed, lang=lang)
-            samples = edges(samples, rate)
-            total += len(samples) / rate + pause
-            if stream:
-                # The text and its word timings first, so the player has them the
-                # moment the audio lands.
-                _write_atomic(os.path.join(stream, f"{i:04d}.txt"), chunk)
-                if timed:
-                    _write_atomic(os.path.join(stream, f"{i:04d}.words"), words.player_rows(chunk, marks))
-                tmp = os.path.join(stream, f"{i:04d}.tmp.wav")
-                # The pause goes on the end, less the gap the player leaves anyway.
-                sf.write(tmp, np.concatenate([samples, silence(pause - lead, rate)]), rate)
-                os.replace(tmp, os.path.join(stream, f"{i:04d}.wav"))
+            name = f"{i:04d}"
+            got = cached_part(cache, name, chunk) if cache else None
+            if got:
+                info = sf.info(got)
+                rate, length = info.samplerate, info.frames
+                samples = sf.read(got, dtype="float32")[0] if out else None
+            else:
+                samples, rate, marks = synthesize(engine, g2p, chunk, voice, speed, lang, timed, i)
+                samples = np.concatenate([edges(samples, rate), silence(pause, rate)])   # mpv plays them back to back
+                length = len(samples)
+                home = cache or stream
+                if home:
+                    # The text and word timings first, so the player has them when the audio lands.
+                    _write_atomic(os.path.join(home, f"{name}.txt"), chunk)
+                    if marks is not None:
+                        _write_atomic(os.path.join(home, f"{name}.words"), words.player_rows(chunk, marks))
+                    tmp = os.path.join(home, f"{name}.tmp.wav")
+                    sf.write(tmp, samples, rate)
+                    os.replace(tmp, os.path.join(home, f"{name}.wav"))
+            if stream and cache:
+                for ext in ("txt", "words", "wav"):                  # (the audio last: the player waits for it)
+                    src = os.path.join(cache, f"{name}.{ext}")
+                    if os.path.exists(src):
+                        _link(src, os.path.join(stream, f"{name}.{ext}"))
+            if chapter_at.get(i) is not None and out:
+                chapter_times.append((round(written / rate * 1000), chapter_at[i]))
+            total += length / rate
             if out:
                 # Written as it's made, so a whole book never has to fit in memory.
                 if writer is None:
                     writer = sf.SoundFile(out, "w", samplerate=rate, channels=1)
+                if i == len(chunks):
+                    samples = samples[:max(0, len(samples) - int(pause * rate))]   # no pause after the end
                 writer.write(samples)
-                if i < len(chunks):
-                    writer.write(silence(pause, rate))
+                written += len(samples)
+        if out:
+            total = written / rate if written else total     # (no pause after the last part)
+        if out and chapter_times:
+            _write_atomic(os.path.join(jobdir, "chapters_ms"),
+                          "".join(f"{ms}\t{title}\n" for ms, title in chapter_times))
     finally:
         if writer is not None:
             writer.close()
@@ -725,20 +873,6 @@ def run_job(path):
     elapsed = time.time() - t0
     _write_atomic(os.path.join(jobdir, "result"), f"{total:.1f} {elapsed:.1f} {len(chunks)}\n")
     return f"Made {total:.1f}s of audio in {elapsed:.1f}s"
-
-
-def _wait_for_listener(jobdir, stream, i, first):
-    """While listening, stay at most AHEAD parts ahead of the one being heard, so a
-    whole book isn't rendered to disk while its first chapter plays (or is paused)."""
-    while os.path.isdir(jobdir):
-        try:
-            with open(os.path.join(stream, "playing")) as fh:
-                playing = int(fh.read().strip() or first)
-        except (OSError, ValueError):
-            playing = first
-        if i <= playing + AHEAD:
-            return
-        time.sleep(0.2)
 
 
 def _write_atomic(path, text):
@@ -848,6 +982,34 @@ def serve(port, idle):
 
 # ------------------------------------------------------------------ download
 
+BENCH_TEXT = ("The road left the village at first light and climbed into the hills, where the fields "
+              "gave way to heather. For three days she walked without meeting anyone, sleeping in the "
+              "lee of stone walls and waking to the sound of sheep.")
+
+
+def benchmark():
+    """Time Kokoro on this phone with each way of running it, and say which is fastest.
+    Prints "@@bench THREADS BLOCK SECONDS SPEED" per try, then "@@best THREADS BLOCK SPEED"."""
+    cpus = os.cpu_count() or 4
+    tries = [(0, 0)] + [(t, b) for t in sorted({2, 4, 6, 8, cpus}) if t <= cpus for b in (0, 4)]
+    best = None
+    for threads, block in tries:
+        k = load_kokoro(threads, block)
+        k.create(BENCH_TEXT, voice="af_heart")                    # warm up
+        took = []
+        for _ in range(2):
+            t0 = time.time()
+            audio, rate = k.create(BENCH_TEXT, voice="af_heart")
+            took.append(time.time() - t0)
+        secs = min(took)
+        speed = len(audio) / rate / secs
+        print(f"@@bench {threads} {block} {secs:.2f} {speed:.1f}", flush=True)
+        if best is None or speed > best[2]:
+            best = (threads, block, speed)
+        del k
+    print(f"@@best {best[0]} {best[1]} {best[2]:.1f}", flush=True)
+
+
 def download():
     os.makedirs(MODELS, exist_ok=True)
     for dest, src, label in ((MODEL, MODEL_SRC, "model"), (VOICES, VOICES_SRC, "voices")):
@@ -949,6 +1111,9 @@ def main():
     s = sub.add_parser("serve")
     s.add_argument("--port", type=int, default=8880)
     s.add_argument("--idle", type=int, default=1800, help="stop after this many idle seconds (0 = never)")
+    for sp in (s, j):
+        sp.add_argument("--threads", type=int, default=0, help="onnxruntime threads (0: its choice)")
+        sp.add_argument("--block", type=int, default=0, help="onnxruntime dynamic block base (0: off)")
     v = sub.add_parser("voices")
     v.add_argument("--plain", action="store_true", help="one name per line")
     v.add_argument("--width", type=int, default=60)
@@ -957,8 +1122,11 @@ def main():
     v.add_argument("--accent", default="", help="SGR parameters for the accent colour")
     v.add_argument("--muted", default="", help="SGR parameters for secondary text")
     sub.add_parser("download")
+    sub.add_parser("bench", help="time Kokoro each way it can run here")
     a = p.parse_args()
 
+    if a.cmd in ("job", "serve"):
+        TUNING.update(threads=max(0, a.threads), block=max(0, a.block))
     if a.cmd == "job":
         try:
             log(run_job(a.path))
@@ -974,6 +1142,8 @@ def main():
             print_voices(names, a.width, a.default, a.accent, a.muted)
     elif a.cmd == "download":
         download()
+    elif a.cmd == "bench":
+        benchmark()
 
 
 if __name__ == "__main__":

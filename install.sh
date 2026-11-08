@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.14.0"
+KOKOMUX_VERSION="0.15.0"
 DISTRO=kokoro
 
 ASSUME_YES=0; VERBOSE=0
@@ -576,7 +576,7 @@ or through the background server:
   engine.py download                        fetch model files (resumable)
 
 A job folder holds `job` (key=value lines: voice, speed, lang, and optionally
-url, out, stream, words, start, of, gap_ms) and `in.txt` (the text,
+url, out, stream, words, start, of) and `in.txt` (the text,
 unless url is set). A voice can be a blend: af_heart:70+bf_emma:30. Output goes into
 the same folder: `out.<ext>` for a saved file, and with stream=1 one WAV per
 chunk in `stream/0001.wav`, `stream/0002.wav`, ... followed by `stream/end`.
@@ -613,7 +613,6 @@ JOB_DIR_RE = re.compile(r"^/tmp/kokoro\.[A-Za-z0-9]+$")
 FORMATS = ("wav", "mp3", "ogg", "flac")
 USER_AGENT = "Mozilla/5.0 (Linux; Android) kokomux"
 MAX_CHUNK = 360  # characters per part: whole sentences, under Kokoro's 510 sounds
-AHEAD = 3        # while listening, parts made ahead of the one being heard
 SERVING = False
 
 
@@ -635,13 +634,32 @@ _tts_lock = threading.Lock()
 SYNTH_LOCK = threading.Lock()
 
 
+# How onnxruntime runs the model: threads (0: its own choice) and the dynamic block
+# base (0: off), which spreads work across cores of different speeds. kokoro
+# --benchmark finds the fastest on the phone; serve and job take them as set.
+TUNING = {"threads": 0, "block": 0}
+
+
+def load_kokoro(threads=0, block=0):
+    """Kokoro on a CPU session tuned this way."""
+    import onnxruntime as rt
+    from kokoro_onnx import Kokoro
+    so = rt.SessionOptions()
+    so.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_ALL
+    so.inter_op_num_threads = 1
+    if threads:
+        so.intra_op_num_threads = threads
+    if block:
+        so.add_session_config_entry("session.dynamic_block_base", str(block))
+    return Kokoro.from_session(rt.InferenceSession(MODEL, so, providers=["CPUExecutionProvider"]), VOICES)
+
+
 def tts():
     """Kokoro, loaded once."""
     global _tts
     with _tts_lock:
         if _tts is None:
-            from kokoro_onnx import Kokoro
-            _tts = Kokoro(MODEL, VOICES)
+            _tts = load_kokoro(TUNING["threads"], TUNING["block"])
             # kokoro-onnx looks for an output called "duration"; this export calls it
             # "durations". It's the second output either way, which is what it reads.
             _tts.has_timings = len(_tts.sess.get_outputs()) > 1
@@ -823,7 +841,7 @@ def normalise(text, lang="en-us"):
     text = re.sub(r"\b(?:https?://|www\.)(?:www\.)?([\w-]+(?:\.[\w-]+)+)[^\s)\]]*?(?=[.,;:!?)\]]?(?:\s|$))",
                   r"\1", text)                                                         # links: their site
     text = re.sub(r"(?m)^[ \t]*(?:#{1,6}|>+|[-*+•·▪◦‣])[ \t]+", "", text)            # markdown marks, bullets
-    text = re.sub(r"(?<![\w*])(\*\*|__|\*|_)(?=\S)([^\n]+?)(?<=\S)\1(?![\w*])", r"\2", text)
+    text = re.sub(r"(?<![\w*])(\*\*\*|___|\*\*|__|\*|_)(?=\S)([^\n]+?)(?<=\S)\1(?![\w*])", r"\2", text)
     text = re.sub(r"(?<=\d)[ \t]?[–—][ \t]?(?=\d)", " to ", text)                     # 1990–1995
     text = re.sub(r"[ \t]*(?:—|–|--)[ \t]*", ", ", text)                             # dashes: a pause
     text = re.sub(r"([!?])\1+", r"\1", text)
@@ -1016,12 +1034,47 @@ def fetch_url(url):
         return url, body
     if "html" not in ctype and "xml" not in ctype:
         raise JobError(f"That link is {ctype}, not a web page")
-    ex = _Extractor()
-    ex.feed(body)
-    text = ex.text()
-    if not text.strip():
+    return page_text(body, url)
+
+
+# Where an article ends: from a heading like these on it's links, not reading.
+_PAGE_END = set(_Extractor.END_SECTIONS) | {
+    "more recent articles", "recent articles", "recent posts", "related", "related posts", "related stories",
+    "read more", "more from", "more stories", "you might also like", "you may also like", "popular",
+    "most popular", "most read", "share this", "share", "tags", "about the author", "newsletter", "sign up"}
+
+
+def page_text(html, url):
+    """A web page's (title, text to read), found by trafilatura: the article, not the menus,
+    sidebars, ads or comments, and stopping where the links start ("See also", "Recent posts")."""
+    import trafilatura
+    # Two line breaks in a row are a paragraph break (older pages lay text out that way).
+    html = re.sub(r"(?i)(?:<br\s*/?>\s*){2,}", "</p><p>", html)
+    md = trafilatura.extract(html, url=url, output_format="markdown", include_comments=False,
+                             include_images=False, include_links=False, include_tables=False) or ""
+    meta = trafilatura.extract_metadata(html, default_url=url)
+    lines = []
+    for line in md.splitlines():
+        line = re.sub(r"<[^>]+>", "", line.replace("\\", "")).strip()       # markdown escapes, stray tags
+        head = re.match(r"^#{1,6}\s+(.*)$", line)
+        if head:
+            name = re.sub(r"[^\w\s]", "", head.group(1)).strip().lower()
+            if name in _PAGE_END:
+                break
+            line = head.group(1)
+            if not re.search(r"[.!?:…]$", line):
+                line += "."                   # a heading gets its own pause
+        line = re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", line)         # list items
+        if line and line != "[edit]":
+            lines.append(line)
+    text = "\n".join(lines)
+    if len(text.split()) < 5:                # a menu or a "Home" link is not an article
         raise JobError("Couldn't find any readable text on that page")
-    return ex.page_title() or url, text
+    title = (meta.title if meta is not None and meta.title else "") or url
+    short = title.split(" - ")[0].split(" | ")[0].strip()
+    if short and short not in text.split("\n", 1)[0]:
+        text = f"{short}.\n{text}"           # say what it is first
+    return title, text
 
 
 # ------------------------------------------------------------------ books
@@ -1067,6 +1120,34 @@ def read_epub(path, name):
     if not parts:
         raise JobError("That EPUB has no readable text")
     return (title or "").strip() or name, parts
+
+
+def epub_meta(path):
+    """An EPUB's author and cover image, as (author, cover bytes, extension); blanks if it has none."""
+    import posixpath
+    import xml.etree.ElementTree as ET
+
+    def local(tag):
+        return tag.rsplit("}", 1)[-1]
+    try:
+        with zipfile.ZipFile(path) as z:
+            container = ET.fromstring(z.read("META-INF/container.xml"))
+            opf_path = next(el.get("full-path") for el in container.iter() if local(el.tag) == "rootfile")
+            opf = ET.fromstring(z.read(opf_path))
+            author = next((el.text.strip() for el in opf.iter() if local(el.tag) == "creator" and el.text), "")
+            items = [el for el in opf.iter() if local(el.tag) == "item"]
+            cover_id = next((el.get("content") for el in opf.iter()
+                             if local(el.tag) == "meta" and el.get("name") == "cover"), None)
+            item = next((el for el in items if "cover-image" in (el.get("properties") or "").split()), None) or \
+                next((el for el in items if el.get("id") == cover_id), None)
+            if item is None or not (item.get("media-type") or "").startswith("image/"):
+                return author, b"", ""
+            inner = posixpath.normpath(posixpath.join(posixpath.dirname(opf_path),
+                                                      urllib.parse.unquote(item.get("href", ""))))
+            ext = {"image/jpeg": "jpg", "image/png": "png"}.get(item.get("media-type"), "")
+            return author, (z.read(inner) if ext else b""), ext
+    except (KeyError, StopIteration, zipfile.BadZipFile, ET.ParseError):
+        return "", b"", ""
 
 
 def read_pdf(path, name):
@@ -1144,6 +1225,64 @@ def read_job(path):
     return jobdir, job
 
 
+CACHE_ROOT = "/tmp/kokomux-cache"   # Termux's $PREFIX/tmp/kokomux-cache: made parts, kept per book
+
+
+def cache_dir(book, voice, speed, lang):
+    """Where a book's parts are kept for these settings (None: not kept)."""
+    if not re.fullmatch(r"[0-9a-f]{8,64}", book or ""):
+        return None
+    import hashlib
+    key = hashlib.sha1(f"{voice}|{speed:.2f}|{lang}|{os.path.basename(MODEL)}".encode()).hexdigest()[:12]
+    d = os.path.join(CACHE_ROOT, book, key)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def cached_part(cache, name, text):
+    """A kept part's audio, if it was made from exactly this text."""
+    wav, txt = os.path.join(cache, f"{name}.wav"), os.path.join(cache, f"{name}.txt")
+    try:
+        with open(txt, encoding="utf-8") as fh:
+            same = fh.read() == text
+    except OSError:
+        return None
+    return wav if same and os.path.exists(wav) else None
+
+
+def _link(src, dest):
+    """A relative link, so it resolves both in the container (/tmp) and in Termux ($PREFIX/tmp)."""
+    tmp = dest + ".lnk"
+    if os.path.lexists(tmp):
+        os.remove(tmp)
+    os.symlink(os.path.relpath(src, os.path.dirname(dest)), tmp)
+    os.replace(tmp, dest)
+
+
+def synthesize(engine, g2p, chunk, voice, speed, lang, timed, i):
+    """One part's audio, and its word timings when timed (else None)."""
+    import words
+    with SYNTH_LOCK:
+        ps, per = None, None
+        if g2p is not None:
+            try:
+                ps, per = dictionary_phonemes(g2p, chunk)
+            except Exception as e:      # a sentence misaki can't parse: espeak reads it
+                log(f"misaki: part {i}: {e.__class__.__name__}: {e}")
+                ps = None
+        if timed:
+            if ps:
+                samples, rate, timings = engine.create_timed(ps, voice=voice, speed=speed, lang=lang, is_phonemes=True)
+                return samples, rate, words.words_from_timings(chunk, timings, lambda ws: per)
+            samples, rate, timings = engine.create_timed(chunk, voice=voice, speed=speed, lang=lang)
+            return samples, rate, words.words_from_timings(chunk, timings, lambda ws: phonemize_many(ws, lang, engine))
+        if ps:
+            samples, rate = engine.create(ps, voice=voice, speed=speed, lang=lang, is_phonemes=True)
+        else:
+            samples, rate = engine.create(chunk, voice=voice, speed=speed, lang=lang)
+        return samples, rate, None
+
+
 def edges(samples, rate):
     """Soften a part's first and last few milliseconds, so a trimmed edge can't click."""
     import numpy as np
@@ -1164,6 +1303,7 @@ def silence(seconds, rate):
 def run_job(path):
     import numpy as np
     import soundfile as sf
+    import words
 
     t0 = time.time()
     jobdir, job = read_job(path)
@@ -1200,6 +1340,14 @@ def run_job(path):
     try:
         title, chapters = read_source(jobdir, job)
         _write_atomic(os.path.join(jobdir, "title"), (title or "").replace("\n", " ")[:120] + "\n")
+        if job.get("meta") == "1":            # for an audiobook: who wrote it, and its cover
+            src = os.path.join(jobdir, job.get("file", "in.txt"))
+            if not job.get("url") and zipfile.is_zipfile(src):
+                author, cover, ext = epub_meta(src)
+                _write_atomic(os.path.join(jobdir, "author"), author.replace("\n", " ")[:200] + "\n")
+                if cover:
+                    with open(os.path.join(jobdir, f"cover.{ext}"), "wb") as fh:
+                        fh.write(cover)
         # Each chapter is split on its own, so a part never runs across chapters, and
         # where each chapter starts is written down for the player's chapter list.
         chunks, starts = [], []
@@ -1229,58 +1377,58 @@ def run_job(path):
         if stream:
             _write_atomic(os.path.join(stream, "first"), f"{first}\n")
 
-        try:
-            lead = max(0, min(500, int(job.get("gap_ms", "0")))) / 1000   # the player's own start-up gap
-        except ValueError:
-            lead = 0.0
+        cache = cache_dir(job.get("cache", ""), job.get("voice", "af_heart"), speed, lang)
+        if cache and engine.has_timings:
+            timed = True                    # kept parts carry their word timings, whatever this run shows
+        chapter_at = {int(line.split("\t", 1)[0]): line.split("\t", 1)[1] for line in starts}
+        chapter_times, written = [], 0
         for i in range(first, len(chunks) + 1):
             chunk, pause = chunks[i - 1]
-            if stream:
-                _wait_for_listener(jobdir, stream, i, first)
             # The kokoro command deletes its job folder when it exits or is
             # stopped, so a vanished folder means nobody is waiting any more.
             if not os.path.isdir(jobdir) or (stream and not os.path.isdir(stream)):
                 raise JobError("Cancelled")
             _write_atomic(os.path.join(jobdir, "progress"), f"{i} {len(chunks)}\n")
-            with SYNTH_LOCK:
-                ps, per = None, None
-                if g2p is not None:
-                    try:
-                        ps, per = dictionary_phonemes(g2p, chunk)
-                    except Exception as e:      # a sentence misaki can't parse: espeak reads it
-                        log(f"misaki: part {i}: {e.__class__.__name__}: {e}")
-                        ps = None
-                if timed:
-                    import words
-                    if ps:
-                        samples, rate, timings = engine.create_timed(ps, voice=voice, speed=speed, lang=lang, is_phonemes=True)
-                        marks = words.words_from_timings(chunk, timings, lambda ws: per)
-                    else:
-                        samples, rate, timings = engine.create_timed(chunk, voice=voice, speed=speed, lang=lang)
-                        marks = words.words_from_timings(chunk, timings, lambda ws: phonemize_many(ws, lang, engine))
-                elif ps:
-                    samples, rate = engine.create(ps, voice=voice, speed=speed, lang=lang, is_phonemes=True)
-                else:
-                    samples, rate = engine.create(chunk, voice=voice, speed=speed, lang=lang)
-            samples = edges(samples, rate)
-            total += len(samples) / rate + pause
-            if stream:
-                # The text and its word timings first, so the player has them the
-                # moment the audio lands.
-                _write_atomic(os.path.join(stream, f"{i:04d}.txt"), chunk)
-                if timed:
-                    _write_atomic(os.path.join(stream, f"{i:04d}.words"), words.player_rows(chunk, marks))
-                tmp = os.path.join(stream, f"{i:04d}.tmp.wav")
-                # The pause goes on the end, less the gap the player leaves anyway.
-                sf.write(tmp, np.concatenate([samples, silence(pause - lead, rate)]), rate)
-                os.replace(tmp, os.path.join(stream, f"{i:04d}.wav"))
+            name = f"{i:04d}"
+            got = cached_part(cache, name, chunk) if cache else None
+            if got:
+                info = sf.info(got)
+                rate, length = info.samplerate, info.frames
+                samples = sf.read(got, dtype="float32")[0] if out else None
+            else:
+                samples, rate, marks = synthesize(engine, g2p, chunk, voice, speed, lang, timed, i)
+                samples = np.concatenate([edges(samples, rate), silence(pause, rate)])   # mpv plays them back to back
+                length = len(samples)
+                home = cache or stream
+                if home:
+                    # The text and word timings first, so the player has them when the audio lands.
+                    _write_atomic(os.path.join(home, f"{name}.txt"), chunk)
+                    if marks is not None:
+                        _write_atomic(os.path.join(home, f"{name}.words"), words.player_rows(chunk, marks))
+                    tmp = os.path.join(home, f"{name}.tmp.wav")
+                    sf.write(tmp, samples, rate)
+                    os.replace(tmp, os.path.join(home, f"{name}.wav"))
+            if stream and cache:
+                for ext in ("txt", "words", "wav"):                  # (the audio last: the player waits for it)
+                    src = os.path.join(cache, f"{name}.{ext}")
+                    if os.path.exists(src):
+                        _link(src, os.path.join(stream, f"{name}.{ext}"))
+            if chapter_at.get(i) is not None and out:
+                chapter_times.append((round(written / rate * 1000), chapter_at[i]))
+            total += length / rate
             if out:
                 # Written as it's made, so a whole book never has to fit in memory.
                 if writer is None:
                     writer = sf.SoundFile(out, "w", samplerate=rate, channels=1)
+                if i == len(chunks):
+                    samples = samples[:max(0, len(samples) - int(pause * rate))]   # no pause after the end
                 writer.write(samples)
-                if i < len(chunks):
-                    writer.write(silence(pause, rate))
+                written += len(samples)
+        if out:
+            total = written / rate if written else total     # (no pause after the last part)
+        if out and chapter_times:
+            _write_atomic(os.path.join(jobdir, "chapters_ms"),
+                          "".join(f"{ms}\t{title}\n" for ms, title in chapter_times))
     finally:
         if writer is not None:
             writer.close()
@@ -1290,20 +1438,6 @@ def run_job(path):
     elapsed = time.time() - t0
     _write_atomic(os.path.join(jobdir, "result"), f"{total:.1f} {elapsed:.1f} {len(chunks)}\n")
     return f"Made {total:.1f}s of audio in {elapsed:.1f}s"
-
-
-def _wait_for_listener(jobdir, stream, i, first):
-    """While listening, stay at most AHEAD parts ahead of the one being heard, so a
-    whole book isn't rendered to disk while its first chapter plays (or is paused)."""
-    while os.path.isdir(jobdir):
-        try:
-            with open(os.path.join(stream, "playing")) as fh:
-                playing = int(fh.read().strip() or first)
-        except (OSError, ValueError):
-            playing = first
-        if i <= playing + AHEAD:
-            return
-        time.sleep(0.2)
 
 
 def _write_atomic(path, text):
@@ -1413,6 +1547,34 @@ def serve(port, idle):
 
 # ------------------------------------------------------------------ download
 
+BENCH_TEXT = ("The road left the village at first light and climbed into the hills, where the fields "
+              "gave way to heather. For three days she walked without meeting anyone, sleeping in the "
+              "lee of stone walls and waking to the sound of sheep.")
+
+
+def benchmark():
+    """Time Kokoro on this phone with each way of running it, and say which is fastest.
+    Prints "@@bench THREADS BLOCK SECONDS SPEED" per try, then "@@best THREADS BLOCK SPEED"."""
+    cpus = os.cpu_count() or 4
+    tries = [(0, 0)] + [(t, b) for t in sorted({2, 4, 6, 8, cpus}) if t <= cpus for b in (0, 4)]
+    best = None
+    for threads, block in tries:
+        k = load_kokoro(threads, block)
+        k.create(BENCH_TEXT, voice="af_heart")                    # warm up
+        took = []
+        for _ in range(2):
+            t0 = time.time()
+            audio, rate = k.create(BENCH_TEXT, voice="af_heart")
+            took.append(time.time() - t0)
+        secs = min(took)
+        speed = len(audio) / rate / secs
+        print(f"@@bench {threads} {block} {secs:.2f} {speed:.1f}", flush=True)
+        if best is None or speed > best[2]:
+            best = (threads, block, speed)
+        del k
+    print(f"@@best {best[0]} {best[1]} {best[2]:.1f}", flush=True)
+
+
 def download():
     os.makedirs(MODELS, exist_ok=True)
     for dest, src, label in ((MODEL, MODEL_SRC, "model"), (VOICES, VOICES_SRC, "voices")):
@@ -1514,6 +1676,9 @@ def main():
     s = sub.add_parser("serve")
     s.add_argument("--port", type=int, default=8880)
     s.add_argument("--idle", type=int, default=1800, help="stop after this many idle seconds (0 = never)")
+    for sp in (s, j):
+        sp.add_argument("--threads", type=int, default=0, help="onnxruntime threads (0: its choice)")
+        sp.add_argument("--block", type=int, default=0, help="onnxruntime dynamic block base (0: off)")
     v = sub.add_parser("voices")
     v.add_argument("--plain", action="store_true", help="one name per line")
     v.add_argument("--width", type=int, default=60)
@@ -1522,8 +1687,11 @@ def main():
     v.add_argument("--accent", default="", help="SGR parameters for the accent colour")
     v.add_argument("--muted", default="", help="SGR parameters for secondary text")
     sub.add_parser("download")
+    sub.add_parser("bench", help="time Kokoro each way it can run here")
     a = p.parse_args()
 
+    if a.cmd in ("job", "serve"):
+        TUNING.update(threads=max(0, a.threads), block=max(0, a.block))
     if a.cmd == "job":
         try:
             log(run_job(a.path))
@@ -1539,6 +1707,8 @@ def main():
             print_voices(names, a.width, a.default, a.accent, a.muted)
     elif a.cmd == "download":
         download()
+    elif a.cmd == "bench":
+        benchmark()
 
 
 if __name__ == "__main__":
@@ -2057,6 +2227,8 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
   local -A rowact=()
   tui_enter
   mapfile -t marks < <(ls -t "$BOOKS"/*.mark 2>/dev/null | head -n 6)
+  local queue=() qn=0
+  if [ -s "$QUEUE" ]; then mapfile -t queue < <(cut -f4 "$QUEUE"); qn=${#queue[@]}; fi
   HOME_CHOICE=()
   while IFS= read -rsn1 -t 0.05 -u "$KBD" _; do :; done   # drop keys typed before it opened
   local api=0
@@ -2069,6 +2241,7 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
     n=${#marks[@]}; [ "$n" -gt 0 ] || n=1
     if [ "$TH" -ge 22 ]; then h=6; else h=2; fi
     h=$(( h + 1 + n + 1 + 1 + 6 ))
+    [ "$qn" -gt 0 ] && h=$(( h + 2 + (qn < 3 ? qn : 3) + 1 ))     # Up next
     free=$(( TH - 2 - h )); [ "$free" -gt 0 ] || free=0
     golden "$free"; y=$(( 1 + REPLY ))
     if [ "$TH" -ge 22 ]; then                     # the logo, when there's room for it
@@ -2108,6 +2281,14 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
       rowact[$y]="mark:$i"; y=$(( y + 1 ))
     done
     y=$(( y + 1 ))
+    if [ "$qn" -gt 0 ]; then                      # shared links and files, waiting their turn
+      printf '\033[%d;%dH%sUp next%s  %s%d in the queue%s' "$y" "$x0" "$B" "$R" "$D" "$qn" "$R" >&2; y=$(( y + 1 ))
+      for (( i = 0; i < qn && i < 3; i++ )); do
+        title=${queue[i]}; [ "${#title}" -gt $(( CW - 6 )) ] && title="${title:0:$(( CW - 7 ))}…"
+        printf '\033[%d;%dH   %s%s%s' "$y" "$x0" "$D" "$title" "$R" >&2; rowact[$y]=queue; y=$(( y + 1 ))
+      done
+      printf '\033[%d;%dH %sp%s  Play the queue' "$y" "$x0" "$ACC2" "$R" >&2; rowact[$y]=queue; y=$(( y + 2 ))
+    fi
     local clip_note=""; [ "$api" = 1 ] || clip_note="  ${D}needs the Termux:API app${R}"
     printf '\033[%d;%dH%sStart something new%s' "$y" "$x0" "$B" "$R" >&2; y=$(( y + 1 ))
     for spec in "c|Read the clipboard$clip_note|clip" "f|Open a file  ${D}text, EPUB or PDF${R}|file" \
@@ -2130,12 +2311,14 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
       $'\033[A'|$'\033OA'|k|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;   # also the mouse wheel
       $'\033[B'|$'\033OB'|j|$'\033[<65;'*M) [ "$sel" -lt $(( ${#marks[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
       c) cmd="clip" ;; f) cmd="file" ;; u) cmd="url" ;; t) cmd="text" ;; v) cmd="voice" ;; s|o|,) cmd="settings" ;;
+      p) [ "$qn" -gt 0 ] && cmd="queue" ;;
       q|Q|$'\033') break ;;
       $'\033[<0;'*M) [[ "$KEY" =~ \;([0-9]+)M$ ]] && cmd="${rowact[${BASH_REMATCH[1]}]:-}" ;;
     esac
     case "$cmd" in
       mark:*)  HOME_CHOICE=(--continue "${marks[${cmd#mark:}]}"); break ;;
       clip)    HOME_CHOICE=(-p -c); break ;;
+      queue)   HOME_CHOICE=(--queue); break ;;
       file)    tui_prompt "File to read:"; [ -n "$ANSWER" ] && { HOME_CHOICE=(-p -f "${ANSWER/#\~/$HOME}"); break; } ;;
       url)     tui_prompt "Web address:" "https://"; [ "${ANSWER:-https://}" != "https://" ] && { HOME_CHOICE=(-p -u "$ANSWER"); break; } ;;
       text)    tui_prompt "Say:"; [ -n "$ANSWER" ] && { HOME_CHOICE=(-p "$ANSWER"); break; } ;;
@@ -2493,8 +2676,7 @@ cat > "$WORK/player.sh" <<'__KOKOMUX_PLAYER__'
 # Each line is printed wrapped to the screen while it plays, and a soft
 # highlight moves from word to word. Times come from Kokoro itself via the engine
 # (stream/NNNN.words: "confidence", then "start end a b" per word, with a/b the
-# word's byte range in NNNN.txt). play-audio has no clock to read, so the time
-# is how long it has been playing, less its start-up delay.
+# word's byte range in NNNN.txt). The time is mpv's own playback clock.
 # A line taller than the screen is shown as a window of rows that follows the
 # lit word, then printed in full when it ends.
 
@@ -2504,10 +2686,11 @@ w_s=(); w_e=(); w_a=(); w_b=(); w_state=none
 TERM_ROWS=24
 in_line=0
 
-part_of() {      # PART="part I of N · " while a job has more than one part
-  local parts=1
-  [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
+part_of() {      # PART="part I of N · " while a job has more than one part; MADE="made 40%" until all is
+  local parts=1 made=0
+  [ -f "$tmpd/progress" ] && { read -r made parts < "$tmpd/progress" || parts=1; }
   PART=""; [ "${parts:-1}" -gt 1 ] && PART="part $1 of $parts · "
+  MADE=""; [ "${parts:-1}" -gt 1 ] && [ ! -f "$tmpd/stream/end" ] && MADE="made $(( made * 100 / parts ))%"
   return 0
 }
 
@@ -2612,7 +2795,10 @@ bookmark_save() {   # bookmark_save PART: so the same command, or kokoro --conti
   printf 'part=%s\nparts=%s\ntitle=%s\nkind=%s\nsource=%s\nvoice=%s\nspeed=%s\nlang=%s\n' \
     "$1" "$parts" "${book_title:-$name}" "$kind" "$source" "$voice" "$speed" "$lang" > "$BOOKS/$book_id.mark"
 }
-bookmark_done() { [ -n "$book_id" ] && rm -f "$BOOKS/$book_id.mark" "$BOOKS/$book_id.txt"; return 0; }
+bookmark_done() {  # read to the end: the bookmark and the book's kept audio go
+  [ -n "$book_id" ] && rm -rf "$BOOKS/$book_id.mark" "$BOOKS/$book_id.txt" "${CACHE:?}/${book_id:?}"
+  return 0
+}
 
 # The notification: what's playing, with pause / next / again buttons that run
 # kokoro --pause / --next / --again. Swiping it away stops. In the background,
@@ -2679,7 +2865,7 @@ sleep_due() {    # sleep_due NEXT_PART: is it time to stop, before NEXT_PART sta
 JUMP=""
 jump_to() {      # jump_to PART
   local old=$tmpd target=$1 f
-  if [ -n "$play_pid" ]; then kill "$play_pid" 2>/dev/null || true; wait "$play_pid" 2>/dev/null || true; play_pid=""; fi
+  mpv_stop
   if [ -n "$gen_pid" ]; then kill "$gen_pid" 2>/dev/null || true; wait "$gen_pid" 2>/dev/null || true; gen_pid=""; fi
   tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
   for f in in.txt title chapters; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
@@ -2716,39 +2902,117 @@ listen_cmd() {   # listen_cmd CMD PART
   return 0
 }
 
-play_line() {    # play_line WAV IDX: play one part; light its words; obey pause / next / again
-  local wav=$1 i=$2 base="${1%.wav}" cur=-1 lit=-2 lit_now t t0 label last="" cmd paused=0 restart=1
+# ------------------------------------------------------------ mpv
+# One mpv for the whole listen, playing the parts as a gapless playlist: each
+# part is queued as soon as it's made, so one runs straight into the next.
+# kokomux talks to it over its IPC socket through one socat connection, and
+# follows its clock (playback-time) and place in the playlist (playlist-pos).
+
+MPV_PID=""; MPV_SOCK=""; MPV_IN=""; MPV_OUT=""; MPV_CARRY=""
+MPV_T=0; MPV_POS=-1; MPV_N=0       # seconds into the current part; playlist index; entries queued
+declare -A MPV_IDX=()              # part -> its playlist index
+MPV_PART=()                        # playlist index -> part
+
+mpv_start() {
+  [ -n "$MPV_PID" ] && kill -0 "$MPV_PID" 2>/dev/null && return 0
+  MPV_SOCK="$(realpath "$PREFIX/tmp")/kokomux-mpv.$$"   # (a socket's path can't be longer than 107 bytes)
+  rm -f "$MPV_SOCK"
+  # shellcheck disable=SC2086  # KOKORO_MPV_ARGS: extra mpv options, word by word
+  mpv --idle=yes --no-video --no-terminal --really-quiet --gapless-audio=yes --audio-display=no \
+      --input-ipc-server="$MPV_SOCK" ${KOKORO_MPV_ARGS:-} </dev/null >/dev/null 2>&1 & MPV_PID=$!
+  play_pid=$MPV_PID                # (cleanup stops it)
+  local n=0
+  while [ ! -S "$MPV_SOCK" ]; do
+    n=$(( n + 1 )); [ "$n" -lt 250 ] || die "mpv didn't start." "Try: mpv --version"
+    sleep 0.02
+  done
+  coproc MPVC { exec socat - UNIX-CONNECT:"$MPV_SOCK" 2>/dev/null; }
+  MPV_IN=${MPVC[0]} MPV_OUT=${MPVC[1]}
+  mpv_send '"observe_property",1,"playback-time"'
+  mpv_send '"observe_property",2,"playlist-pos"'
+}
+mpv_send() { printf '{"command":[%s]}\n' "$1" >&"$MPV_OUT"; }
+mpv_pump() {     # take in what mpv has reported since last time
+  local line
+  while :; do
+    if IFS= read -r -t 0.001 -u "$MPV_IN" line; then
+      line=$MPV_CARRY$line; MPV_CARRY=""
+      case "$line" in
+        *'"name":"playback-time"'*) if [[ "$line" =~ \"data\":([0-9.]+) ]]; then MPV_T=${BASH_REMATCH[1]}; fi ;;
+        *'"name":"playlist-pos"'*) if [[ "$line" =~ \"data\":(-?[0-9]+) ]]; then MPV_POS=${BASH_REMATCH[1]}; fi ;;
+      esac
+    else
+      MPV_CARRY+=$line             # half a line: the rest comes next time
+      break
+    fi
+  done
+}
+mpv_ms() {       # MPV_T as whole milliseconds, in MS
+  local s=${MPV_T%%.*} f=0
+  [[ "$MPV_T" == *.* ]] && f=${MPV_T#*.}
+  f="${f}000"; MS=$(( 10#${s:-0} * 1000 + 10#${f:0:3} ))
+}
+mpv_queue() {    # mpv_queue PART WAV: add a part to the playlist (it plays at once if nothing is)
+  mpv_send "\"loadfile\",\"$2\",\"append-play\""
+  MPV_IDX[$1]=$MPV_N; MPV_PART[MPV_N]=$1; MPV_N=$(( MPV_N + 1 ))
+}
+mpv_stop() {     # empty the playlist (a jump starts again from a new part)
+  [ -n "$MPV_PID" ] && mpv_send '"stop"'
+  MPV_IDX=(); MPV_PART=(); MPV_N=0; MPV_POS=-1; MPV_T=0
+  return 0
+}
+mpv_quit() {
+  [ -n "$MPV_PID" ] && { kill "$MPV_PID" 2>/dev/null; wait "$MPV_PID" 2>/dev/null; }
+  [ -n "$MPV_SOCK" ] && rm -f "$MPV_SOCK"
+  MPV_PID=""
+  return 0
+}
+
+play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause / next / again
+  local wav=$1 i=$2 base="${1%.wav}" cur=-1 lit=-2 lit_now t label last="" cmd paused=0 started=0 idx k f waited=0
   w_state=pending
   { [ -f "$tmpd/stream/words-off" ] || [ "$show_words" = 0 ]; } && w_state=off
-  echo "$i" > "$tmpd/stream/playing"          # the engine and aligner work from the part being heard
   title_get; part_of "$i"
   bookmark_save "$i"; notify "${PART% · }"
+  mpv_start
+  [ -n "${MPV_IDX[$i]+x}" ] || mpv_queue "$i" "$wav"
+  idx=${MPV_IDX[$i]}
   view_part "$i" "$base"
   in_line=1
-  # Nothing in this loop starts a process except when something changes: it
-  # runs ~30 times a second on a phone.
+  echo playing > "$PLAYER_STATE"
+  # Nothing in this loop starts a process: it runs ~30 times a second on a phone.
   while :; do
-    if [ "$restart" = 1 ]; then               # (re)start this part from its beginning
-      play-audio "$wav" >/dev/null 2>&1 & play_pid=$!
-      now_ms; t0=$NOW; cur=-1; lit=-2; restart=0
-      echo playing > "$PLAYER_STATE"
+    mpv_pump
+    # The next part goes in the playlist as soon as it's made, so there's no gap
+    # (unless the sleep timer stops before it).
+    k=$(( i + 1 ))
+    if [ -z "${MPV_IDX[$k]+x}" ]; then
+      printf -v f '%s/stream/%04d.wav' "$tmpd" "$k"
+      [ -f "$f" ] && ! sleep_due "$k" && mpv_queue "$k" "$f"
     fi
+    if [ "$MPV_POS" = "$idx" ]; then started=1
+    elif [ "$started" = 1 ] || { [ "$MPV_POS" -gt "$idx" ] 2>/dev/null; }; then break   # on to the next, or done
+    else waited=$(( waited + 1 )); [ "$waited" -lt 300 ] || break; fi                  # (mpv never got to it)
     cmd=""                                    # kokoro --pause / --next / --again, or a key or click
     if [ -f "$CONTROL" ]; then read -r cmd < "$CONTROL" || cmd=""; rm -f "$CONTROL"; fi
     if [ -z "$cmd" ] && [ -n "$KEY" ]; then key_cmd; cmd=$CMD; fi
     if [ -n "$cmd" ]; then
       case "$cmd" in
         toggle)
-          if [ "$paused" = 1 ]; then paused=0; restart=1; notify "${PART% · }"   # carry on from the part's start
-          else { kill "$play_pid" 2>/dev/null || true; }; wait "$play_pid" || true
-               paused=1; last=""; echo paused > "$PLAYER_STATE"; notify "Paused · ${PART% · }"; fi
-          continue ;;
-        next)  { kill "$play_pid" 2>/dev/null || true; }; wait "$play_pid" || true; break ;;
-        again) { kill "$play_pid" 2>/dev/null || true; }; wait "$play_pid" || true; restart=1; continue ;;
-        quit)  exit 0 ;;                          # the bookmark is kept; cleanup says where
+          if [ "$paused" = 1 ]; then mpv_send '"set_property","pause",false'; paused=0; last=""
+               echo playing > "$PLAYER_STATE"; notify "${PART% · }"
+          else mpv_send '"set_property","pause",true'; paused=1; last=""
+               echo paused > "$PLAYER_STATE"; notify "Paused · ${PART% · }"; fi ;;
+        next)  if [ -n "${MPV_IDX[$k]+x}" ]; then mpv_send '"playlist-next"'
+               else mpv_send '"playlist-next","force"'; fi
+               mpv_send '"set_property","pause",false'
+               break ;;
+        again) mpv_send '"seek",0,"absolute"'; mpv_send '"set_property","pause",false'
+               paused=0; cur=-1; lit=-2; last=""; continue ;;
+        quit)  exit "$QUIT_RC" ;;                 # the bookmark is kept; cleanup says where
         *)     if listen_cmd "$cmd" "$i"; then
                  last=""
-                 if [ -n "$JUMP" ]; then { kill "$play_pid" 2>/dev/null || true; }; wait "$play_pid" || true; break; fi
+                 [ -n "$JUMP" ] && break      # jump_to empties the playlist
                fi ;;
       esac
     fi
@@ -2761,11 +3025,11 @@ play_line() {    # play_line WAV IDX: play one part; light its words; obey pause
       tick 0.1
       continue
     fi
-    kill -0 "$play_pid" 2>/dev/null || break  # the part has finished
-    if [ "$show_words" = 1 ]; then
+    if [ "$show_words" = 1 ] && [ "$started" = 1 ]; then
       if [ "$w_state" = pending ]; then words_load "$base.words" || true; fi   # not landed yet
       if [ "$w_state" = ready ]; then
-        now_ms; t=$(( NOW - t0 - KOKORO_WORDS_OFFSET_MS ))
+        mpv_ms; t=$(( MS - KOKORO_WORDS_OFFSET_MS ))
+        if [ "$t" -lt "${w_s[$(( cur < 0 ? 0 : cur ))]:-0}" ]; then cur=-1; fi      # (after a seek back)
         while [ $(( cur + 1 )) -lt "${#w_s[@]}" ] && [ "${w_s[cur + 1]}" -le "$t" ]; do cur=$(( cur + 1 )); done
         # Keep the word lit through the pause after it; the last one goes out when it ends.
         lit_now=$cur
@@ -2779,18 +3043,14 @@ play_line() {    # play_line WAV IDX: play one part; light its words; obey pause
       fi
     fi
     part_of "$i"; sleep_label
-    if [ "$ui" = tui ]; then label="$SLEEP_LABEL"
-    else label="${PART}${SLEEP_LABEL:+$SLEEP_LABEL · }␣ pause · → next · q stop"; fi
+    if [ "$ui" = tui ]; then label="$SLEEP_LABEL${SLEEP_LABEL:+${MADE:+ · }}$MADE"
+    else label="${PART}${SLEEP_LABEL:+$SLEEP_LABEL · }${MADE:+$MADE · }␣ pause · → next · q stop"; fi
     if [ "$label|playing" != "$last" ]; then view_state "Playing" "$label" "▶"; last="$label|playing"; fi
     tick 0.03
   done
-  wait "$play_pid" || true
-  play_pid=""; in_line=0
-  echo $(( i + 1 )) > "$tmpd/stream/playing"  # heard: the aligner can drop this part
+  in_line=0
   view_part_end
-  rm -f "$wav"
 }
-
 __KOKOMUX_PLAYER__
 
 cat > "$WORK/theme.sh" <<'__KOKOMUX_THEME__'
@@ -3043,9 +3303,10 @@ CFG
     mkdir -p "$APP"
     [ -x "$APP/venv/bin/python" ] || python3 -m venv "$APP/venv"
     "$APP/venv/bin/pip" install --upgrade pip
-    # pypdf reads PDFs. misaki turns English into sounds as Kokoro was trained, with
-    # spaCy's small English model (no PyTorch).
-    "$APP/venv/bin/pip" install --upgrade kokoro-onnx soundfile pypdf "misaki>=0.7.4,<0.8" num2words "spacy>=3.8,<3.9" \
+    # pypdf reads PDFs, trafilatura finds the article on a web page. misaki turns
+    # English into sounds as Kokoro was trained, with spaCy's small English model (no PyTorch).
+    "$APP/venv/bin/pip" install --upgrade kokoro-onnx soundfile pypdf "trafilatura>=2.0,<3" \
+      "misaki>=0.7.4,<0.8" num2words "spacy>=3.8,<3.9" \
       "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" \
       | tee /tmp/kokoro-setup/.pip
     # Before 0.8, Whistle (cactus-compute) timed the words; Kokoro does that itself now.
@@ -3083,7 +3344,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
 # localhost (fast); otherwise each call starts the container (slower).
 set -euo pipefail
 
-KOKOMUX_VERSION="0.14.0"
+KOKOMUX_VERSION="0.15.0"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -3104,9 +3365,12 @@ KOKORO_DEFAULTS=(
   KOKORO_IDLE_MINUTES=30        # ...until unused this long (0: never stop)
   KOKORO_PORT=8880
   KOKORO_WORDS=1                # light up each word as it's spoken (-p on a terminal)
-  KOKORO_WORDS_OFFSET_MS=100    # play-audio's start-up delay, so the highlight isn't early
+  KOKORO_WORDS_OFFSET_MS=0      # moves the highlight against mpv's clock (+: later, -: earlier)
   KOKORO_NOTIFY=1               # a notification with pause / next / again buttons (Termux:API)
   KOKORO_TUI=1                  # -p on a terminal opens the full-screen reader (0: inline)
+  KOKORO_CACHE_GB=50            # made audio kept for books in progress, at most this much
+  KOKORO_THREADS=0              # how Kokoro runs on this phone (kokoro --benchmark sets these)
+  KOKORO_BLOCK=0
   KOKORO_THEME=auto             # colours: auto (follow the terminal), dark or light
   KOKORO_FOCUS=1                # the reader fades text with its distance from the line being read
 )
@@ -3125,6 +3389,10 @@ PLAYER_PID="$PREFIX/tmp/kokoro-player.pid"
 CONTROL="$PREFIX/tmp/kokoro-control"      # kokoro --pause/--next/--again leave a word here
 PLAYER_STATE="$PREFIX/tmp/kokoro-state"   # "playing" or "paused", for --pause to report
 BOOKS="$HOME/.local/share/kokomux/bookmarks"
+QUEUE_DIR="$HOME/.local/share/kokomux/queue"   # shared links and files, to hear in order
+QUEUE="$QUEUE_DIR/list"                        # one per line: id, kind (url/file), source, title (tab-separated)
+QUIT_RC=0; [ "${KOKORO_QUEUE:-0}" = 1 ] && QUIT_RC=10   # stopped, not finished: the queue waits
+CACHE="$PREFIX/tmp/kokomux-cache"         # made parts, per book (the container sees /tmp/kokomux-cache)
 
 # ------------------------------------------------------------ look & feel
 
@@ -3209,6 +3477,11 @@ voice_label() {  # voice_label SPEC: "af_heart:70+af_bella:30" -> "af_heart + af
   while [[ "$s" =~ ^(.*):[0-9]+(.*)$ ]]; do s=${BASH_REMATCH[1]}${BASH_REMATCH[2]}; done
   printf '%s' "${s//+/ + }"
 }
+conf_set() {     # conf_set NAME VALUE: keep a setting in the settings file
+  mkdir -p "$CONF_DIR"; [ -f "$CONF" ] || : > "$CONF"
+  if grep -q "^$1=" "$CONF"; then sed -i "s|^$1=[^ #]*|$1=$2|" "$CONF"; else echo "$1=$2" >> "$CONF"; fi
+  printf -v "$1" '%s' "$2"
+}
 human_size() {
   local b=$1
   if [ "$b" -ge 1048576 ]; then awk "BEGIN { printf \"%.1f MB\", $b / 1048576 }"
@@ -3256,6 +3529,8 @@ Space ← → q|keys while it plays: pause, again, next, stop
 --again|hear this part again
 --stop|stop
 --continue|carry on with the last long text
+--add -u URL / -f FILE|add to the queue (Share to Termux does this)
+--queue [list|skip|clear]|play the queue in order
 --restart|with -p: start from the top, not the bookmark
 ROWS
   printf '\n%sMore%s\n' "$B" "$R"
@@ -3265,6 +3540,7 @@ ROWS
 --settings|voice, speed, highlighting and more
 --config|edit the settings file directly
 --serve / --stop-server|start or stop the server
+--benchmark|time Kokoro on this phone and keep the fastest way
 --update [BRANCH]|update kokomux and Kokoro (from main, or a branch)
 --uninstall|remove kokomux
 ROWS
@@ -3292,7 +3568,8 @@ start_server() {
   # Ignore Ctrl+C and hang-ups so the server outlives the command that started it.
   ( trap '' INT HUP
     exec nohup proot-distro login "$DISTRO" --shared-tmp -- \
-      "$PY" "$ENGINE" serve --port "$KOKORO_PORT" --idle "$((KOKORO_IDLE_MINUTES * 60))"
+      "$PY" "$ENGINE" serve --port "$KOKORO_PORT" --idle "$((KOKORO_IDLE_MINUTES * 60))" \
+        --threads "$KOKORO_THREADS" --block "$KOKORO_BLOCK"
   ) > "$SRV_DIR/log" 2>&1 < /dev/null &
   local pid=$! n=0
   [ "$LIVE" = 1 ] || echo "Starting the Kokoro server..." >&2
@@ -3423,6 +3700,61 @@ case "${1:-}" in
     exit 0 ;;
   --next) control next "Skipping to the next part."; exit 0 ;;
   --again) control again "Playing this part again."; exit 0 ;;
+  --add)         # kokoro --add [-u URL | -f FILE | -c | TEXT]: to the queue, to hear later
+    shift
+    mkdir -p "$QUEUE_DIR"
+    id="$(date +%s%N | sha256sum | cut -c1-12)"; kind="file"
+    case "${1:-}" in
+      -u|--url) [[ "${2:-}" =~ ^https?:// ]] || die "That doesn't look like a web address."
+                kind=url src=$2 title=$2 ;;
+      -f|--file) [ -f "${2:-}" ] || die "There's no file called \"${2:-}\"."
+                 ext="${2##*.}"; [ "$ext" = "$2" ] && ext=txt
+                 src="$QUEUE_DIR/$id.${ext,,}"; cp "$2" "$src"; title="$(basename "$2")" ;;
+      -c|--clipboard) command -v termux-clipboard-get >/dev/null || die "Reading the clipboard needs Termux:API."
+                 src="$QUEUE_DIR/$id.txt"; timeout 6 termux-clipboard-get > "$src" || die "Couldn't read the clipboard."
+                 title="$(head -c 60 "$src" | tr '\n\t' '  ')" ;;
+      "") die "What should go in the queue?" "kokoro --add -u URL, -f FILE, -c, or some text" ;;
+      *) src="$QUEUE_DIR/$id.txt"; printf '%s\n' "$*" > "$src"; title="$(head -c 60 "$src" | tr '\n\t' '  ')" ;;
+    esac
+    # A copied link on its own is that page.
+    if [ "$kind" = file ] && [ "${src##*.}" = txt ] && [ "$(wc -l < "$src")" -le 1 ] &&
+       grep -qE '^[[:space:]]*https?://[^[:space:]]+[[:space:]]*$' "$src"; then
+      kind=url title="$(tr -d '[:space:]' < "$src")"; rm -f "$src"; src=$title
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$id" "$kind" "$src" "${title//$'\t'/ }" >> "$QUEUE"
+    n=$(wc -l < "$QUEUE")
+    done_msg "Added to your queue" "$n waiting · kokoro --queue plays it"
+    command -v termux-toast >/dev/null && { timeout 5 termux-toast "kokoro: added to your queue ($n)" >/dev/null 2>&1 & }
+    exit 0 ;;
+  --queue)       # kokoro --queue [list|clear]: play the queue in order
+    case "${2:-}" in
+      list) [ -s "$QUEUE" ] || { info "Your queue is empty."; exit 0; }
+            n=0; while IFS=$'\t' read -r _ _ _ title; do n=$((n + 1)); printf '  %s%2d%s  %s\n' "$ACC2" "$n" "$R" "$title"; done < "$QUEUE"
+            exit 0 ;;
+      clear) while IFS=$'\t' read -r _ kind src _; do [ "$kind" = file ] && rm -f "$src"; done < "$QUEUE" 2>/dev/null
+             rm -f "$QUEUE"; done_msg "Queue cleared."; exit 0 ;;
+      skip) [ -s "$QUEUE" ] || { info "Your queue is empty."; exit 0; }
+            IFS=$'\t' read -r id kind src title < "$QUEUE"
+            [ "$kind" = file ] && rm -f "$src"
+            sed -i "/^$id\t/d" "$QUEUE"; done_msg "Dropped \"$title\"."; exit 0 ;;
+      "") ;;
+      *) die "kokoro --queue plays the queue; --queue list shows it; --queue skip drops the first; --queue clear empties it." ;;
+    esac
+    [ -s "$QUEUE" ] || { info "Your queue is empty." ; printf '  %sShare a link or file to Termux, or: kokoro --add -u URL%s\n' "$D" "$R" >&2; exit 0; }
+    while [ -s "$QUEUE" ]; do
+      IFS=$'\t' read -r id kind src title < "$QUEUE"
+      if [ "$kind" = url ]; then args=(-u "$src"); else args=(-f "$src"); fi
+      rc=0; KOKORO_QUEUE=1 "$0" -p "${args[@]}" || rc=$?
+      case "$rc" in
+        0) ;;                                              # heard to the end
+        10|130) break ;;                                   # stopped: it stays first in the queue
+        *) info "Couldn't read \"$title\", so the queue stopped there." \
+           ; printf '  %skokoro --queue skip drops it.%s\n' "$D" "$R" >&2; break ;;
+      esac
+      [ "$kind" = file ] && rm -f "$src"
+      sed -i "/^$id\t/d" "$QUEUE"
+    done
+    exit 0 ;;
   --continue)
     last="${2:-}"
     case "$last" in "$BOOKS"/*.mark) [ -f "$last" ] || last="" ;; *) last="" ;; esac
@@ -3441,6 +3773,28 @@ case "${1:-}" in
     done_msg "Server ready." "port $(server_port) · stops after ${KOKORO_IDLE_MINUTES} min unused"
     exit 0 ;;
   --stop-server) stop_server; exit 0 ;;
+  --benchmark)   # time each way of running Kokoro here, and keep the fastest
+    server_up && stop_server >/dev/null 2>&1           # (it would share the cores)
+    info "Timing Kokoro on this phone, a few ways (about a minute)."
+    best=""; rows=()
+    while read -r tag threads block secs speed; do
+      case "$tag" in
+        @@bench) if [ "$threads" = 0 ]; then label="its own choice"; else label="$threads threads"; fi
+                 [ "$block" = 0 ] || label+=", block $block"
+                 rows+=("$(printf '  %-26s %s× real time' "$label" "$speed")")
+                 status "Timing" "$label: ${speed}× real time" ;;
+        @@best) best="$threads $block $secs" ;;           # (secs is the speed here)
+      esac
+    done < <(proot-distro login "$DISTRO" -- "$PY" "$ENGINE" bench 2>/dev/null)
+    status_clear
+    [ -n "$best" ] || die "The benchmark didn't finish."
+    printf '%s\n' "${rows[@]}" >&2
+    read -r threads block speed <<< "$best"
+    conf_set KOKORO_THREADS "$threads"; conf_set KOKORO_BLOCK "$block"
+    if [ "$threads" = 0 ]; then label="threads chosen by onnxruntime"; else label="$threads threads"; fi
+    [ "$block" = 0 ] || label+=", block $block"
+    done_msg "Kokoro makes speech ${speed}× faster than it's spoken here." "Kept: $label"
+    exit 0 ;;
   --status)
     printf '%skokomux%s %sv%s%s\n\n' "$B" "$R" "$ACC" "$KOKOMUX_VERSION" "$R"
     if server_up; then
@@ -3502,7 +3856,7 @@ case "${1:-}" in
              "$HOME/.shortcuts/tasks/"Kokoro*; do
       if [ -f "$f" ] && grep -q '^# kokomux' "$f"; then rm -f "$f"; done_msg "Removed $(tilde "$f")"; fi
     done
-    rm -rf "$CONF_DIR" "$SRV_DIR" "$HOME/kokoro-test.wav" "$HOME/.cache/kokomux" "$HOME/.local/share/kokomux" "$PREFIX/share/kokomux"
+    rm -rf "$CONF_DIR" "$SRV_DIR" "$HOME/kokoro-test.wav" "$HOME/.cache/kokomux" "$HOME/.local/share/kokomux" "$PREFIX/share/kokomux" "$CACHE"
     done_msg "Settings removed"
     rm -f "$0"
     done_msg "kokomux is uninstalled." "Thanks for trying it!"
@@ -3556,11 +3910,14 @@ done
 ext=""
 if [ -n "$out" ]; then
   ext="$(printf '%s' "${out##*.}" | tr '[:upper:]' '[:lower:]')"
-  case "$ext" in wav|mp3|ogg|flac) ;; *) die "Can't save as \"$out\"." "End the name with .wav, .mp3, .ogg or .flac" ;; esac
+  case "$ext" in wav|mp3|ogg|flac|m4b) ;; *) die "Can't save as \"$out\"." "End the name with .wav, .mp3, .ogg, .flac or .m4b (an audiobook with chapters)" ;; esac
   [ -d "$(dirname "$out")" ] || die "The folder for \"$out\" doesn't exist."
 fi
-if [ "$play" = 1 ] && ! command -v play-audio >/dev/null; then
-  die "Playback needs play-audio." "Install it with: pkg install play-audio"
+if [ "$ext" = m4b ] && ! command -v ffmpeg >/dev/null; then
+  die "Audiobooks need ffmpeg." "Install it with: pkg install ffmpeg"
+fi
+if [ "$play" = 1 ] && ! { command -v mpv && command -v socat; } >/dev/null; then
+  die "Playback needs mpv and socat." "Install them with: pkg install mpv socat"
 fi
 
 # ------------------------------------------------------------ job folder
@@ -3579,7 +3936,8 @@ cleanup() {
     info "Stopped at part $(mark_get "$BOOKS/$book_id.mark" part) of $(mark_get "$BOOKS/$book_id.mark" parts). ${D}kokoro --continue picks up there.${R}"
   fi
   if [ "${play:-0}" = 1 ]; then declare -F notify_clear >/dev/null && notify_clear; rm -f "$PLAYER_STATE"; fi
-  [ -n "$play_pid" ] && kill "$play_pid" 2>/dev/null
+  declare -F mpv_quit >/dev/null && mpv_quit
+  [ "${WAKE:-0}" = 1 ] && termux-wake-unlock >/dev/null 2>&1
   [ -n "$gen_pid" ] && kill "$gen_pid" 2>/dev/null
   rm -rf "$tmpd"
   if [ "$play" = 1 ] && [ "$(cat "$PLAYER_PID" 2>/dev/null)" = "$$" ]; then rm -f "$PLAYER_PID"; fi
@@ -3643,9 +4001,11 @@ if [ -n "$url" ]; then kind=url source=$url name=$url
 elif [ -n "$infile" ]; then kind=file source="$(realpath "$infile")" name="$(basename "$infile")"
 else kind=text source="" name="$(head -c 60 "$text" | tr '\n' ' ')"; fi
 book_id=""; start=1; was_parts=0
-if [ "$play" = 1 ] && [ -z "$out" ]; then
+if { [ "$play" = 1 ] && [ -z "$out" ]; } || [ "$ext" = m4b ]; then   # (an audiobook reuses what listening made)
   if [ "$kind" = url ]; then book_id="$(printf '%s' "$url" | sha256sum | cut -c1-16)"
   else book_id="$(sha256sum < "$text" | cut -c1-16)"; fi
+fi
+if [ "$play" = 1 ] && [ -z "$out" ]; then
   mark="$BOOKS/$book_id.mark"
   if [ "$restart" = 1 ]; then rm -f "$mark" "$BOOKS/$book_id.txt"
   elif [ -f "$mark" ] && [ "$(mark_get "$mark" part)" -gt 1 ] 2>/dev/null; then
@@ -3677,14 +4037,31 @@ write_job() {    # the job, for the engine (where it starts and how fast can cha
     echo "name=$name"
     [ "$start" -gt 1 ] && echo "start=$start"
     [ "$was_parts" -gt 0 ] && echo "of=$was_parts"   # the bookmark's count: the engine maps it if its parts differ
-    echo "gap_ms=${KOKORO_WORDS_OFFSET_MS:-100}"     # play-audio's start-up gap, taken off each pause
-    [ -n "$out" ] && echo "out=out.$ext"
+    [ -n "$book_id" ] && echo "cache=$book_id"       # keep what's made, and reuse what was
+    if [ "$ext" = m4b ]; then echo "out=out.wav"; echo "meta=1"     # ffmpeg makes the .m4b from it
+    elif [ -n "$out" ]; then echo "out=out.$ext"; fi
     [ "$play" = 1 ] && echo "stream=1"
     [ "$show_words" = 1 ] && echo "words=1"
   } > "$tmpd/job"
   job="/tmp/$(basename "$tmpd")/job"   # the same file, as the container sees it
 }
 write_job
+
+# The book's made audio is kept; the cache stays under KOKORO_CACHE_GB by letting
+# go of the books heard least recently.
+cache_trim() {
+  [ -d "$CACHE" ] || return 0
+  local cap=$(( ${KOKORO_CACHE_GB:-50} * 1024 )) total d
+  total="$(du -sm "$CACHE" 2>/dev/null | cut -f1)"
+  while [ "${total:-0}" -gt "$cap" ]; do
+    d="$(find "$CACHE" -mindepth 1 -maxdepth 1 -type d ! -name "${book_id:-none}" -printf '%T@ %p\n' |
+         sort -n | head -n 1 | cut -d' ' -f2-)" || true
+    [ -n "$d" ] || break
+    rm -rf "$d"
+    total="$(du -sm "$CACHE" 2>/dev/null | cut -f1)"
+  done
+}
+if [ -n "$book_id" ]; then mkdir -p "$CACHE/$book_id"; touch "$CACHE/$book_id"; cache_trim; fi
 
 # Use the server if it's up (or start it); otherwise run the job directly.
 use_server=0
@@ -3699,7 +4076,7 @@ run_engine() {
     [ "$rc" = 0 ] || [ "$rc" = 22 ] || echo "Error: lost contact with the Kokoro server (curl error $rc)"
     [ "$rc" = 0 ] || return 1
   else
-    proot-distro login "$DISTRO" --shared-tmp -- "$PY" "$ENGINE" job "$job"
+    proot-distro login "$DISTRO" --shared-tmp -- "$PY" "$ENGINE" job "$job" --threads "$KOKORO_THREADS" --block "$KOKORO_BLOCK"
   fi
 }
 
@@ -3720,6 +4097,45 @@ waiting_label() {
   else echo "Getting ready"; fi
 }
 
+# ------------------------------------------------------------ audiobooks
+# -o book.m4b: the engine makes one WAV and says where each chapter starts;
+# ffmpeg turns it into AAC in an .m4b with chapter marks, title, author and cover.
+
+ffmeta() { sed 's/[=;#\\]/\\&/g' | tr '\n' ' ' | sed 's/ *$//'; }   # a value for ffmpeg's metadata file
+make_audiobook() { # make_audiobook WAV M4B
+  local wav=$1 m4b=$2 meta="$tmpd/ffmeta" total_ms title author line ms prev="" prev_t="" cover="" rc=1
+  title="$(cat "$tmpd/title" 2>/dev/null)"; [ -n "$title" ] || title=$name
+  author="$(cat "$tmpd/author" 2>/dev/null)" || author=""
+  total_ms=$(awk '{ printf "%d", $1 * 1000 }' "$tmpd/result")
+  {
+    echo ";FFMETADATA1"
+    echo "title=$(printf '%s' "$title" | ffmeta)"; echo "album=$(printf '%s' "$title" | ffmeta)"
+    [ -n "$author" ] && echo "artist=$(printf '%s' "$author" | ffmeta)"
+    echo "genre=Audiobook"
+    if [ -s "$tmpd/chapters_ms" ]; then
+      while IFS=$'\t' read -r ms line; do
+        [ -n "$prev" ] && printf '[CHAPTER]\nTIMEBASE=1/1000\nSTART=%s\nEND=%s\ntitle=%s\n' "$prev" "$ms" "$prev_t"
+        prev=$ms prev_t="$(printf '%s' "$line" | ffmeta)"
+      done < "$tmpd/chapters_ms"
+      printf '[CHAPTER]\nTIMEBASE=1/1000\nSTART=%s\nEND=%s\ntitle=%s\n' "$prev" "$total_ms" "$prev_t"
+    fi
+  } > "$meta"
+  for cover in "$tmpd"/cover.jpg "$tmpd"/cover.png ""; do [ -f "$cover" ] && break; done
+  local args=(-hide_banner -loglevel error -nostats -y -i "$wav" -i "$meta")
+  [ -n "$cover" ] && args+=(-i "$cover")
+  args+=(-map 0:a -map_metadata 1 -map_chapters 1)
+  [ -n "$cover" ] && args+=(-map 2:v -c:v copy -disposition:v:0 attached_pic)
+  args+=(-c:a aac -b:a 96k -ac 1 -movflags +faststart -f mp4 -progress pipe:1 "$m4b")
+  while IFS='=' read -r line ms; do         # ffmpeg reports how far it's got (out_time_us)
+    case "$line" in
+      out_time_us) [[ "$ms" =~ ^[0-9]+$ ]] && [ "$total_ms" -gt 0 ] && status "Making the audiobook" "$(( ms / 10 / total_ms ))%" ;;
+      rc) rc=$ms ;;
+    esac
+  done < <(ffmpeg "${args[@]}" 2>"$tmpd/ffmpeg.log"; echo "rc=$?")
+  status_clear
+  [ "$rc" = 0 ] || die "ffmpeg couldn't make the audiobook." "$(tail -n 2 "$tmpd/ffmpeg.log")"
+}
+
 # ------------------------------------------------------------ the player
 # play_line and everything it needs live in player.sh, beside tui.sh.
 
@@ -3735,6 +4151,8 @@ if [ "$play" = 1 ]; then
   rm -f "$CONTROL"                             # nothing left over from an earlier player
   echo "$$" > "$PLAYER_PID"
 fi
+WAKE=0                                          # an audiobook can take a while: keep the phone awake
+if [ "$ext" = m4b ] && command -v termux-wake-lock >/dev/null && termux-wake-lock >/dev/null 2>&1; then WAKE=1; fi
 run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
 if [ "$ui" = tui ]; then
   TUI_TITLE=$name; TUI_INFO="$(voice_label "$voice") · ${speed}×"; tui_open
@@ -3749,7 +4167,7 @@ while :; do
     play_line "$f" "$i"
     if [ -n "$JUMP" ]; then jump_to "$JUMP"; JUMP=""; continue; fi
     i=$((i + 1))
-    if sleep_due "$i"; then SLEPT=1; bookmark_save "$i"; exit 0; fi   # the sleep timer: stop between parts
+    if sleep_due "$i"; then SLEPT=1; bookmark_save "$i"; exit "$QUIT_RC"; fi   # the sleep timer: stop between parts
   elif [ "$play" = 1 ] && [ -f "$tmpd/stream/end" ]; then
     [ -f "$f" ] && continue   # a last chunk may have landed just now
     break
@@ -3761,7 +4179,7 @@ while :; do
     view_refresh
     tick 0.1
     if [ -n "$KEY" ]; then
-      key_cmd; [ "$CMD" = quit ] && exit 0
+      key_cmd; [ "$CMD" = quit ] && exit "$QUIT_RC"
       [ -n "$CMD" ] && listen_cmd "$CMD" "$i" && [ -n "$JUMP" ] && { jump_to "$JUMP"; JUMP=""; }
     fi
   fi
@@ -3784,9 +4202,16 @@ fi
 secs=""
 if [ -f "$tmpd/result" ] && read -r a _ < "$tmpd/result"; then secs="$(human_secs "$a") of audio"; fi
 
+if [ "$ext" = m4b ]; then
+  [ -f "$tmpd/out.wav" ] || die "No audio was made."
+  make_audiobook "$tmpd/out.wav" "$tmpd/book.m4b"
+  mv "$tmpd/book.m4b" "$out"
+  chapters=$(( $(wc -l < "$tmpd/chapters_ms" 2>/dev/null || echo 0) ))
+  [ "$chapters" -gt 1 ] && secs="${secs:+$secs · }$chapters chapters"
+  ext=saved
+fi
 if [ -n "$out" ]; then
-  [ -f "$tmpd/out.$ext" ] || die "No audio was made."
-  mv "$tmpd/out.$ext" "$out"
+  [ "$ext" = saved ] || { [ -f "$tmpd/out.$ext" ] || die "No audio was made."; mv "$tmpd/out.$ext" "$out"; }
   if [ "$LIVE" = 1 ]; then
     size="$(human_size "$(stat -c %s "$out" 2>/dev/null || wc -c < "$out")")"
     done_msg "Saved ${B}$out${R}" "${secs:+$secs · }$size"
@@ -3803,10 +4228,9 @@ __KOKOMUX_WRAPPER__
 termux_packages() {
   local apt_opts=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
   pkg update "${apt_opts[@]}"
-  pkg install "${apt_opts[@]}" proot-distro curl
-  # Nice to have: playback and the clipboard.
-  pkg install "${apt_opts[@]}" play-audio || echo "play-audio unavailable"
-  pkg install "${apt_opts[@]}" termux-api || echo "termux-api unavailable"
+  # mpv plays (gaplessly), socat talks to it, ffmpeg makes audiobooks.
+  pkg install "${apt_opts[@]}" proot-distro curl mpv socat ffmpeg termux-api
+  pkg uninstall -y play-audio >/dev/null 2>&1 || true     # (before 0.15)
 }
 
 debian_container() {
@@ -3872,7 +4296,7 @@ KOKORO_PORT=8880
 # timings. Raise the offset if the highlight runs ahead of the voice, lower it if
 # it lags.
 KOKORO_WORDS=1
-KOKORO_WORDS_OFFSET_MS=100
+KOKORO_WORDS_OFFSET_MS=0
 
 # While listening, a notification with pause / next / again buttons (needs the
 # Termux:API app). Swiping it away stops.
@@ -3893,13 +4317,15 @@ KOKORO_FOCUS=1
 CFG
   fi
   # Settings from 0.11-0.13 that no longer exist: the model is always full precision,
-  # and English always goes through misaki.
-  sed -i '/^KOKORO_QUALITY=/d; /^KOKORO_PRONUNCIATION=/d' "$conf"
+  # and English always goes through misaki. And play-audio's 100 ms start-up delay,
+  # which mpv's clock doesn't have.
+  sed -i '/^KOKORO_QUALITY=/d; /^KOKORO_PRONUNCIATION=/d; s/^KOKORO_WORDS_OFFSET_MS=100\b/KOKORO_WORDS_OFFSET_MS=0/' "$conf"
 
   # Share a link to Termux -> read the page. Share text or a file -> read it.
-  put "$HOME/bin/termux-url-opener" 'exec kokoro -p -u "$1"'
-  put "$HOME/bin/termux-file-editor" 'case "$(head -c 4 "$1")" in %PDF*|PK*) exec kokoro -p -f "$1" ;; esac   # PDF, EPUB
-if grep -Iq . "$1"; then exec kokoro -p -f "$1"; fi
+  # Shared links and files go to the queue (kokoro --queue plays it).
+  put "$HOME/bin/termux-url-opener" 'kokoro --add -u "$1"; sleep 1'
+  put "$HOME/bin/termux-file-editor" 'case "$(head -c 4 "$1")" in %PDF*|PK*) kokoro --add -f "$1"; sleep 1; exit ;; esac   # PDF, EPUB
+if grep -Iq . "$1"; then kokoro --add -f "$1"; sleep 1; exit; fi
 echo "kokoro: that file is not text, an EPUB or a PDF"; sleep 3'
   # Termux:Widget runs scripts in ~/.shortcuts/tasks in the background.
   put "$HOME/.shortcuts/tasks/Kokoro read clipboard" 'exec kokoro -p -c'
@@ -3907,6 +4333,7 @@ echo "kokoro: that file is not text, an EPUB or a PDF"; sleep 3'
   put "$HOME/.shortcuts/tasks/Kokoro pause" 'exec kokoro --pause'
   put "$HOME/.shortcuts/tasks/Kokoro next" 'exec kokoro --next'
   put "$HOME/.shortcuts/tasks/Kokoro continue" 'exec kokoro --continue'
+  put "$HOME/.shortcuts/tasks/Kokoro play queue" 'exec kokoro --queue'
 
   in_container tidy
 }
@@ -4014,8 +4441,8 @@ printf '  %s╰─%s %s%s in %s%s%s\n' "$ACC" "$R" "$D" "$( [ "$MODE" = install 
 blank
 
 [ "$FANCY" = 1 ] && printf '\a'
-if [ -f "$WORK/hello.wav" ] && command -v play-audio >/dev/null; then
+if [ -f "$WORK/hello.wav" ]; then
   printf '  %s♪%s %sSaying hello...%s' "$ACC" "$R" "$D" "$R"
-  play-audio "$WORK/hello.wav" >/dev/null 2>&1 || true
+  mpv --no-video --really-quiet "$WORK/hello.wav" </dev/null >/dev/null 2>&1 || true
   printf '\r\033[K'
 fi

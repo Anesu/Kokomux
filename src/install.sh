@@ -377,10 +377,9 @@ __KOKOMUX_WRAPPER__
 termux_packages() {
   local apt_opts=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
   pkg update "${apt_opts[@]}"
-  pkg install "${apt_opts[@]}" proot-distro curl
-  # Nice to have: playback and the clipboard.
-  pkg install "${apt_opts[@]}" play-audio || echo "play-audio unavailable"
-  pkg install "${apt_opts[@]}" termux-api || echo "termux-api unavailable"
+  # mpv plays (gaplessly), socat talks to it, ffmpeg makes audiobooks.
+  pkg install "${apt_opts[@]}" proot-distro curl mpv socat ffmpeg termux-api
+  pkg uninstall -y play-audio >/dev/null 2>&1 || true     # (before 0.15)
 }
 
 debian_container() {
@@ -446,7 +445,7 @@ KOKORO_PORT=8880
 # timings. Raise the offset if the highlight runs ahead of the voice, lower it if
 # it lags.
 KOKORO_WORDS=1
-KOKORO_WORDS_OFFSET_MS=100
+KOKORO_WORDS_OFFSET_MS=0
 
 # While listening, a notification with pause / next / again buttons (needs the
 # Termux:API app). Swiping it away stops.
@@ -467,13 +466,15 @@ KOKORO_FOCUS=1
 CFG
   fi
   # Settings from 0.11-0.13 that no longer exist: the model is always full precision,
-  # and English always goes through misaki.
-  sed -i '/^KOKORO_QUALITY=/d; /^KOKORO_PRONUNCIATION=/d' "$conf"
+  # and English always goes through misaki. And play-audio's 100 ms start-up delay,
+  # which mpv's clock doesn't have.
+  sed -i '/^KOKORO_QUALITY=/d; /^KOKORO_PRONUNCIATION=/d; s/^KOKORO_WORDS_OFFSET_MS=100\b/KOKORO_WORDS_OFFSET_MS=0/' "$conf"
 
   # Share a link to Termux -> read the page. Share text or a file -> read it.
-  put "$HOME/bin/termux-url-opener" 'exec kokoro -p -u "$1"'
-  put "$HOME/bin/termux-file-editor" 'case "$(head -c 4 "$1")" in %PDF*|PK*) exec kokoro -p -f "$1" ;; esac   # PDF, EPUB
-if grep -Iq . "$1"; then exec kokoro -p -f "$1"; fi
+  # Shared links and files go to the queue (kokoro --queue plays it).
+  put "$HOME/bin/termux-url-opener" 'kokoro --add -u "$1"; sleep 1'
+  put "$HOME/bin/termux-file-editor" 'case "$(head -c 4 "$1")" in %PDF*|PK*) kokoro --add -f "$1"; sleep 1; exit ;; esac   # PDF, EPUB
+if grep -Iq . "$1"; then kokoro --add -f "$1"; sleep 1; exit; fi
 echo "kokoro: that file is not text, an EPUB or a PDF"; sleep 3'
   # Termux:Widget runs scripts in ~/.shortcuts/tasks in the background.
   put "$HOME/.shortcuts/tasks/Kokoro read clipboard" 'exec kokoro -p -c'
@@ -481,6 +482,7 @@ echo "kokoro: that file is not text, an EPUB or a PDF"; sleep 3'
   put "$HOME/.shortcuts/tasks/Kokoro pause" 'exec kokoro --pause'
   put "$HOME/.shortcuts/tasks/Kokoro next" 'exec kokoro --next'
   put "$HOME/.shortcuts/tasks/Kokoro continue" 'exec kokoro --continue'
+  put "$HOME/.shortcuts/tasks/Kokoro play queue" 'exec kokoro --queue'
 
   in_container tidy
 }
@@ -588,8 +590,8 @@ printf '  %s╰─%s %s%s in %s%s%s\n' "$ACC" "$R" "$D" "$( [ "$MODE" = install 
 blank
 
 [ "$FANCY" = 1 ] && printf '\a'
-if [ -f "$WORK/hello.wav" ] && command -v play-audio >/dev/null; then
+if [ -f "$WORK/hello.wav" ]; then
   printf '  %s♪%s %sSaying hello...%s' "$ACC" "$R" "$D" "$R"
-  play-audio "$WORK/hello.wav" >/dev/null 2>&1 || true
+  mpv --no-video --really-quiet "$WORK/hello.wav" </dev/null >/dev/null 2>&1 || true
   printf '\r\033[K'
 fi

@@ -43,6 +43,21 @@ def make_epub(path, encrypted=False):
         z.writestr("OEBPS/text/chapter 2.xhtml", CHAPTER.format(t="Chapter Two", p="It ended in the hills."))
 
 
+def test_epub_author_and_cover_for_audiobooks():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "b.epub")
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr("META-INF/container.xml", CONTAINER)
+            z.writestr("OEBPS/content.opf", OPF.replace(
+                "<dc:title>The Long Road</dc:title>",
+                "<dc:title>The Long Road</dc:title><dc:creator> A. Walker </dc:creator><meta name=\"cover\" content=\"cov\"/>").replace(
+                "<manifest>", '<manifest><item id="cov" href="images/front%20cover.jpg" media-type="image/jpeg"/>'))
+            z.writestr("OEBPS/images/front cover.jpg", b"\xff\xd8jpeg")
+        assert engine.epub_meta(path) == ("A. Walker", b"\xff\xd8jpeg", "jpg")
+        make_epub(path)                                               # no author, no cover
+        assert engine.epub_meta(path) == ("", b"", "")
+
+
 def job_with(filename, data):
     jobdir = tempfile.mkdtemp()
     with open(os.path.join(jobdir, filename), "wb") as fh:

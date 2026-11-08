@@ -25,9 +25,10 @@ CFG
     mkdir -p "$APP"
     [ -x "$APP/venv/bin/python" ] || python3 -m venv "$APP/venv"
     "$APP/venv/bin/pip" install --upgrade pip
-    # pypdf reads PDFs. misaki turns English into sounds as Kokoro was trained, with
-    # spaCy's small English model (no PyTorch).
-    "$APP/venv/bin/pip" install --upgrade kokoro-onnx soundfile pypdf "misaki>=0.7.4,<0.8" num2words "spacy>=3.8,<3.9" \
+    # pypdf reads PDFs, trafilatura finds the article on a web page. misaki turns
+    # English into sounds as Kokoro was trained, with spaCy's small English model (no PyTorch).
+    "$APP/venv/bin/pip" install --upgrade kokoro-onnx soundfile pypdf "trafilatura>=2.0,<3" \
+      "misaki>=0.7.4,<0.8" num2words "spacy>=3.8,<3.9" \
       "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" \
       | tee /tmp/kokoro-setup/.pip
     # Before 0.8, Whistle (cactus-compute) timed the words; Kokoro does that itself now.

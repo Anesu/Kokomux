@@ -28,9 +28,12 @@ KOKORO_DEFAULTS=(
   KOKORO_IDLE_MINUTES=30        # ...until unused this long (0: never stop)
   KOKORO_PORT=8880
   KOKORO_WORDS=1                # light up each word as it's spoken (-p on a terminal)
-  KOKORO_WORDS_OFFSET_MS=100    # play-audio's start-up delay, so the highlight isn't early
+  KOKORO_WORDS_OFFSET_MS=0      # moves the highlight against mpv's clock (+: later, -: earlier)
   KOKORO_NOTIFY=1               # a notification with pause / next / again buttons (Termux:API)
   KOKORO_TUI=1                  # -p on a terminal opens the full-screen reader (0: inline)
+  KOKORO_CACHE_GB=50            # made audio kept for books in progress, at most this much
+  KOKORO_THREADS=0              # how Kokoro runs on this phone (kokoro --benchmark sets these)
+  KOKORO_BLOCK=0
   KOKORO_THEME=auto             # colours: auto (follow the terminal), dark or light
   KOKORO_FOCUS=1                # the reader fades text with its distance from the line being read
 )
@@ -49,6 +52,10 @@ PLAYER_PID="$PREFIX/tmp/kokoro-player.pid"
 CONTROL="$PREFIX/tmp/kokoro-control"      # kokoro --pause/--next/--again leave a word here
 PLAYER_STATE="$PREFIX/tmp/kokoro-state"   # "playing" or "paused", for --pause to report
 BOOKS="$HOME/.local/share/kokomux/bookmarks"
+QUEUE_DIR="$HOME/.local/share/kokomux/queue"   # shared links and files, to hear in order
+QUEUE="$QUEUE_DIR/list"                        # one per line: id, kind (url/file), source, title (tab-separated)
+QUIT_RC=0; [ "${KOKORO_QUEUE:-0}" = 1 ] && QUIT_RC=10   # stopped, not finished: the queue waits
+CACHE="$PREFIX/tmp/kokomux-cache"         # made parts, per book (the container sees /tmp/kokomux-cache)
 
 # ------------------------------------------------------------ look & feel
 
@@ -133,6 +140,11 @@ voice_label() {  # voice_label SPEC: "af_heart:70+af_bella:30" -> "af_heart + af
   while [[ "$s" =~ ^(.*):[0-9]+(.*)$ ]]; do s=${BASH_REMATCH[1]}${BASH_REMATCH[2]}; done
   printf '%s' "${s//+/ + }"
 }
+conf_set() {     # conf_set NAME VALUE: keep a setting in the settings file
+  mkdir -p "$CONF_DIR"; [ -f "$CONF" ] || : > "$CONF"
+  if grep -q "^$1=" "$CONF"; then sed -i "s|^$1=[^ #]*|$1=$2|" "$CONF"; else echo "$1=$2" >> "$CONF"; fi
+  printf -v "$1" '%s' "$2"
+}
 human_size() {
   local b=$1
   if [ "$b" -ge 1048576 ]; then awk "BEGIN { printf \"%.1f MB\", $b / 1048576 }"
@@ -180,6 +192,8 @@ Space ← → q|keys while it plays: pause, again, next, stop
 --again|hear this part again
 --stop|stop
 --continue|carry on with the last long text
+--add -u URL / -f FILE|add to the queue (Share to Termux does this)
+--queue [list|skip|clear]|play the queue in order
 --restart|with -p: start from the top, not the bookmark
 ROWS
   printf '\n%sMore%s\n' "$B" "$R"
@@ -189,6 +203,7 @@ ROWS
 --settings|voice, speed, highlighting and more
 --config|edit the settings file directly
 --serve / --stop-server|start or stop the server
+--benchmark|time Kokoro on this phone and keep the fastest way
 --update [BRANCH]|update kokomux and Kokoro (from main, or a branch)
 --uninstall|remove kokomux
 ROWS
@@ -216,7 +231,8 @@ start_server() {
   # Ignore Ctrl+C and hang-ups so the server outlives the command that started it.
   ( trap '' INT HUP
     exec nohup proot-distro login "$DISTRO" --shared-tmp -- \
-      "$PY" "$ENGINE" serve --port "$KOKORO_PORT" --idle "$((KOKORO_IDLE_MINUTES * 60))"
+      "$PY" "$ENGINE" serve --port "$KOKORO_PORT" --idle "$((KOKORO_IDLE_MINUTES * 60))" \
+        --threads "$KOKORO_THREADS" --block "$KOKORO_BLOCK"
   ) > "$SRV_DIR/log" 2>&1 < /dev/null &
   local pid=$! n=0
   [ "$LIVE" = 1 ] || echo "Starting the Kokoro server..." >&2
@@ -347,6 +363,61 @@ case "${1:-}" in
     exit 0 ;;
   --next) control next "Skipping to the next part."; exit 0 ;;
   --again) control again "Playing this part again."; exit 0 ;;
+  --add)         # kokoro --add [-u URL | -f FILE | -c | TEXT]: to the queue, to hear later
+    shift
+    mkdir -p "$QUEUE_DIR"
+    id="$(date +%s%N | sha256sum | cut -c1-12)"; kind="file"
+    case "${1:-}" in
+      -u|--url) [[ "${2:-}" =~ ^https?:// ]] || die "That doesn't look like a web address."
+                kind=url src=$2 title=$2 ;;
+      -f|--file) [ -f "${2:-}" ] || die "There's no file called \"${2:-}\"."
+                 ext="${2##*.}"; [ "$ext" = "$2" ] && ext=txt
+                 src="$QUEUE_DIR/$id.${ext,,}"; cp "$2" "$src"; title="$(basename "$2")" ;;
+      -c|--clipboard) command -v termux-clipboard-get >/dev/null || die "Reading the clipboard needs Termux:API."
+                 src="$QUEUE_DIR/$id.txt"; timeout 6 termux-clipboard-get > "$src" || die "Couldn't read the clipboard."
+                 title="$(head -c 60 "$src" | tr '\n\t' '  ')" ;;
+      "") die "What should go in the queue?" "kokoro --add -u URL, -f FILE, -c, or some text" ;;
+      *) src="$QUEUE_DIR/$id.txt"; printf '%s\n' "$*" > "$src"; title="$(head -c 60 "$src" | tr '\n\t' '  ')" ;;
+    esac
+    # A copied link on its own is that page.
+    if [ "$kind" = file ] && [ "${src##*.}" = txt ] && [ "$(wc -l < "$src")" -le 1 ] &&
+       grep -qE '^[[:space:]]*https?://[^[:space:]]+[[:space:]]*$' "$src"; then
+      kind=url title="$(tr -d '[:space:]' < "$src")"; rm -f "$src"; src=$title
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$id" "$kind" "$src" "${title//$'\t'/ }" >> "$QUEUE"
+    n=$(wc -l < "$QUEUE")
+    done_msg "Added to your queue" "$n waiting · kokoro --queue plays it"
+    command -v termux-toast >/dev/null && { timeout 5 termux-toast "kokoro: added to your queue ($n)" >/dev/null 2>&1 & }
+    exit 0 ;;
+  --queue)       # kokoro --queue [list|clear]: play the queue in order
+    case "${2:-}" in
+      list) [ -s "$QUEUE" ] || { info "Your queue is empty."; exit 0; }
+            n=0; while IFS=$'\t' read -r _ _ _ title; do n=$((n + 1)); printf '  %s%2d%s  %s\n' "$ACC2" "$n" "$R" "$title"; done < "$QUEUE"
+            exit 0 ;;
+      clear) while IFS=$'\t' read -r _ kind src _; do [ "$kind" = file ] && rm -f "$src"; done < "$QUEUE" 2>/dev/null
+             rm -f "$QUEUE"; done_msg "Queue cleared."; exit 0 ;;
+      skip) [ -s "$QUEUE" ] || { info "Your queue is empty."; exit 0; }
+            IFS=$'\t' read -r id kind src title < "$QUEUE"
+            [ "$kind" = file ] && rm -f "$src"
+            sed -i "/^$id\t/d" "$QUEUE"; done_msg "Dropped \"$title\"."; exit 0 ;;
+      "") ;;
+      *) die "kokoro --queue plays the queue; --queue list shows it; --queue skip drops the first; --queue clear empties it." ;;
+    esac
+    [ -s "$QUEUE" ] || { info "Your queue is empty." ; printf '  %sShare a link or file to Termux, or: kokoro --add -u URL%s\n' "$D" "$R" >&2; exit 0; }
+    while [ -s "$QUEUE" ]; do
+      IFS=$'\t' read -r id kind src title < "$QUEUE"
+      if [ "$kind" = url ]; then args=(-u "$src"); else args=(-f "$src"); fi
+      rc=0; KOKORO_QUEUE=1 "$0" -p "${args[@]}" || rc=$?
+      case "$rc" in
+        0) ;;                                              # heard to the end
+        10|130) break ;;                                   # stopped: it stays first in the queue
+        *) info "Couldn't read \"$title\", so the queue stopped there." \
+           ; printf '  %skokoro --queue skip drops it.%s\n' "$D" "$R" >&2; break ;;
+      esac
+      [ "$kind" = file ] && rm -f "$src"
+      sed -i "/^$id\t/d" "$QUEUE"
+    done
+    exit 0 ;;
   --continue)
     last="${2:-}"
     case "$last" in "$BOOKS"/*.mark) [ -f "$last" ] || last="" ;; *) last="" ;; esac
@@ -365,6 +436,28 @@ case "${1:-}" in
     done_msg "Server ready." "port $(server_port) · stops after ${KOKORO_IDLE_MINUTES} min unused"
     exit 0 ;;
   --stop-server) stop_server; exit 0 ;;
+  --benchmark)   # time each way of running Kokoro here, and keep the fastest
+    server_up && stop_server >/dev/null 2>&1           # (it would share the cores)
+    info "Timing Kokoro on this phone, a few ways (about a minute)."
+    best=""; rows=()
+    while read -r tag threads block secs speed; do
+      case "$tag" in
+        @@bench) if [ "$threads" = 0 ]; then label="its own choice"; else label="$threads threads"; fi
+                 [ "$block" = 0 ] || label+=", block $block"
+                 rows+=("$(printf '  %-26s %s× real time' "$label" "$speed")")
+                 status "Timing" "$label: ${speed}× real time" ;;
+        @@best) best="$threads $block $secs" ;;           # (secs is the speed here)
+      esac
+    done < <(proot-distro login "$DISTRO" -- "$PY" "$ENGINE" bench 2>/dev/null)
+    status_clear
+    [ -n "$best" ] || die "The benchmark didn't finish."
+    printf '%s\n' "${rows[@]}" >&2
+    read -r threads block speed <<< "$best"
+    conf_set KOKORO_THREADS "$threads"; conf_set KOKORO_BLOCK "$block"
+    if [ "$threads" = 0 ]; then label="threads chosen by onnxruntime"; else label="$threads threads"; fi
+    [ "$block" = 0 ] || label+=", block $block"
+    done_msg "Kokoro makes speech ${speed}× faster than it's spoken here." "Kept: $label"
+    exit 0 ;;
   --status)
     printf '%skokomux%s %sv%s%s\n\n' "$B" "$R" "$ACC" "$KOKOMUX_VERSION" "$R"
     if server_up; then
@@ -426,7 +519,7 @@ case "${1:-}" in
              "$HOME/.shortcuts/tasks/"Kokoro*; do
       if [ -f "$f" ] && grep -q '^# kokomux' "$f"; then rm -f "$f"; done_msg "Removed $(tilde "$f")"; fi
     done
-    rm -rf "$CONF_DIR" "$SRV_DIR" "$HOME/kokoro-test.wav" "$HOME/.cache/kokomux" "$HOME/.local/share/kokomux" "$PREFIX/share/kokomux"
+    rm -rf "$CONF_DIR" "$SRV_DIR" "$HOME/kokoro-test.wav" "$HOME/.cache/kokomux" "$HOME/.local/share/kokomux" "$PREFIX/share/kokomux" "$CACHE"
     done_msg "Settings removed"
     rm -f "$0"
     done_msg "kokomux is uninstalled." "Thanks for trying it!"
@@ -480,11 +573,14 @@ done
 ext=""
 if [ -n "$out" ]; then
   ext="$(printf '%s' "${out##*.}" | tr '[:upper:]' '[:lower:]')"
-  case "$ext" in wav|mp3|ogg|flac) ;; *) die "Can't save as \"$out\"." "End the name with .wav, .mp3, .ogg or .flac" ;; esac
+  case "$ext" in wav|mp3|ogg|flac|m4b) ;; *) die "Can't save as \"$out\"." "End the name with .wav, .mp3, .ogg, .flac or .m4b (an audiobook with chapters)" ;; esac
   [ -d "$(dirname "$out")" ] || die "The folder for \"$out\" doesn't exist."
 fi
-if [ "$play" = 1 ] && ! command -v play-audio >/dev/null; then
-  die "Playback needs play-audio." "Install it with: pkg install play-audio"
+if [ "$ext" = m4b ] && ! command -v ffmpeg >/dev/null; then
+  die "Audiobooks need ffmpeg." "Install it with: pkg install ffmpeg"
+fi
+if [ "$play" = 1 ] && ! { command -v mpv && command -v socat; } >/dev/null; then
+  die "Playback needs mpv and socat." "Install them with: pkg install mpv socat"
 fi
 
 # ------------------------------------------------------------ job folder
@@ -503,7 +599,8 @@ cleanup() {
     info "Stopped at part $(mark_get "$BOOKS/$book_id.mark" part) of $(mark_get "$BOOKS/$book_id.mark" parts). ${D}kokoro --continue picks up there.${R}"
   fi
   if [ "${play:-0}" = 1 ]; then declare -F notify_clear >/dev/null && notify_clear; rm -f "$PLAYER_STATE"; fi
-  [ -n "$play_pid" ] && kill "$play_pid" 2>/dev/null
+  declare -F mpv_quit >/dev/null && mpv_quit
+  [ "${WAKE:-0}" = 1 ] && termux-wake-unlock >/dev/null 2>&1
   [ -n "$gen_pid" ] && kill "$gen_pid" 2>/dev/null
   rm -rf "$tmpd"
   if [ "$play" = 1 ] && [ "$(cat "$PLAYER_PID" 2>/dev/null)" = "$$" ]; then rm -f "$PLAYER_PID"; fi
@@ -567,9 +664,11 @@ if [ -n "$url" ]; then kind=url source=$url name=$url
 elif [ -n "$infile" ]; then kind=file source="$(realpath "$infile")" name="$(basename "$infile")"
 else kind=text source="" name="$(head -c 60 "$text" | tr '\n' ' ')"; fi
 book_id=""; start=1; was_parts=0
-if [ "$play" = 1 ] && [ -z "$out" ]; then
+if { [ "$play" = 1 ] && [ -z "$out" ]; } || [ "$ext" = m4b ]; then   # (an audiobook reuses what listening made)
   if [ "$kind" = url ]; then book_id="$(printf '%s' "$url" | sha256sum | cut -c1-16)"
   else book_id="$(sha256sum < "$text" | cut -c1-16)"; fi
+fi
+if [ "$play" = 1 ] && [ -z "$out" ]; then
   mark="$BOOKS/$book_id.mark"
   if [ "$restart" = 1 ]; then rm -f "$mark" "$BOOKS/$book_id.txt"
   elif [ -f "$mark" ] && [ "$(mark_get "$mark" part)" -gt 1 ] 2>/dev/null; then
@@ -601,14 +700,31 @@ write_job() {    # the job, for the engine (where it starts and how fast can cha
     echo "name=$name"
     [ "$start" -gt 1 ] && echo "start=$start"
     [ "$was_parts" -gt 0 ] && echo "of=$was_parts"   # the bookmark's count: the engine maps it if its parts differ
-    echo "gap_ms=${KOKORO_WORDS_OFFSET_MS:-100}"     # play-audio's start-up gap, taken off each pause
-    [ -n "$out" ] && echo "out=out.$ext"
+    [ -n "$book_id" ] && echo "cache=$book_id"       # keep what's made, and reuse what was
+    if [ "$ext" = m4b ]; then echo "out=out.wav"; echo "meta=1"     # ffmpeg makes the .m4b from it
+    elif [ -n "$out" ]; then echo "out=out.$ext"; fi
     [ "$play" = 1 ] && echo "stream=1"
     [ "$show_words" = 1 ] && echo "words=1"
   } > "$tmpd/job"
   job="/tmp/$(basename "$tmpd")/job"   # the same file, as the container sees it
 }
 write_job
+
+# The book's made audio is kept; the cache stays under KOKORO_CACHE_GB by letting
+# go of the books heard least recently.
+cache_trim() {
+  [ -d "$CACHE" ] || return 0
+  local cap=$(( ${KOKORO_CACHE_GB:-50} * 1024 )) total d
+  total="$(du -sm "$CACHE" 2>/dev/null | cut -f1)"
+  while [ "${total:-0}" -gt "$cap" ]; do
+    d="$(find "$CACHE" -mindepth 1 -maxdepth 1 -type d ! -name "${book_id:-none}" -printf '%T@ %p\n' |
+         sort -n | head -n 1 | cut -d' ' -f2-)" || true
+    [ -n "$d" ] || break
+    rm -rf "$d"
+    total="$(du -sm "$CACHE" 2>/dev/null | cut -f1)"
+  done
+}
+if [ -n "$book_id" ]; then mkdir -p "$CACHE/$book_id"; touch "$CACHE/$book_id"; cache_trim; fi
 
 # Use the server if it's up (or start it); otherwise run the job directly.
 use_server=0
@@ -623,7 +739,7 @@ run_engine() {
     [ "$rc" = 0 ] || [ "$rc" = 22 ] || echo "Error: lost contact with the Kokoro server (curl error $rc)"
     [ "$rc" = 0 ] || return 1
   else
-    proot-distro login "$DISTRO" --shared-tmp -- "$PY" "$ENGINE" job "$job"
+    proot-distro login "$DISTRO" --shared-tmp -- "$PY" "$ENGINE" job "$job" --threads "$KOKORO_THREADS" --block "$KOKORO_BLOCK"
   fi
 }
 
@@ -644,6 +760,45 @@ waiting_label() {
   else echo "Getting ready"; fi
 }
 
+# ------------------------------------------------------------ audiobooks
+# -o book.m4b: the engine makes one WAV and says where each chapter starts;
+# ffmpeg turns it into AAC in an .m4b with chapter marks, title, author and cover.
+
+ffmeta() { sed 's/[=;#\\]/\\&/g' | tr '\n' ' ' | sed 's/ *$//'; }   # a value for ffmpeg's metadata file
+make_audiobook() { # make_audiobook WAV M4B
+  local wav=$1 m4b=$2 meta="$tmpd/ffmeta" total_ms title author line ms prev="" prev_t="" cover="" rc=1
+  title="$(cat "$tmpd/title" 2>/dev/null)"; [ -n "$title" ] || title=$name
+  author="$(cat "$tmpd/author" 2>/dev/null)" || author=""
+  total_ms=$(awk '{ printf "%d", $1 * 1000 }' "$tmpd/result")
+  {
+    echo ";FFMETADATA1"
+    echo "title=$(printf '%s' "$title" | ffmeta)"; echo "album=$(printf '%s' "$title" | ffmeta)"
+    [ -n "$author" ] && echo "artist=$(printf '%s' "$author" | ffmeta)"
+    echo "genre=Audiobook"
+    if [ -s "$tmpd/chapters_ms" ]; then
+      while IFS=$'\t' read -r ms line; do
+        [ -n "$prev" ] && printf '[CHAPTER]\nTIMEBASE=1/1000\nSTART=%s\nEND=%s\ntitle=%s\n' "$prev" "$ms" "$prev_t"
+        prev=$ms prev_t="$(printf '%s' "$line" | ffmeta)"
+      done < "$tmpd/chapters_ms"
+      printf '[CHAPTER]\nTIMEBASE=1/1000\nSTART=%s\nEND=%s\ntitle=%s\n' "$prev" "$total_ms" "$prev_t"
+    fi
+  } > "$meta"
+  for cover in "$tmpd"/cover.jpg "$tmpd"/cover.png ""; do [ -f "$cover" ] && break; done
+  local args=(-hide_banner -loglevel error -nostats -y -i "$wav" -i "$meta")
+  [ -n "$cover" ] && args+=(-i "$cover")
+  args+=(-map 0:a -map_metadata 1 -map_chapters 1)
+  [ -n "$cover" ] && args+=(-map 2:v -c:v copy -disposition:v:0 attached_pic)
+  args+=(-c:a aac -b:a 96k -ac 1 -movflags +faststart -f mp4 -progress pipe:1 "$m4b")
+  while IFS='=' read -r line ms; do         # ffmpeg reports how far it's got (out_time_us)
+    case "$line" in
+      out_time_us) [[ "$ms" =~ ^[0-9]+$ ]] && [ "$total_ms" -gt 0 ] && status "Making the audiobook" "$(( ms / 10 / total_ms ))%" ;;
+      rc) rc=$ms ;;
+    esac
+  done < <(ffmpeg "${args[@]}" 2>"$tmpd/ffmpeg.log"; echo "rc=$?")
+  status_clear
+  [ "$rc" = 0 ] || die "ffmpeg couldn't make the audiobook." "$(tail -n 2 "$tmpd/ffmpeg.log")"
+}
+
 # ------------------------------------------------------------ the player
 # play_line and everything it needs live in player.sh, beside tui.sh.
 
@@ -659,6 +814,8 @@ if [ "$play" = 1 ]; then
   rm -f "$CONTROL"                             # nothing left over from an earlier player
   echo "$$" > "$PLAYER_PID"
 fi
+WAKE=0                                          # an audiobook can take a while: keep the phone awake
+if [ "$ext" = m4b ] && command -v termux-wake-lock >/dev/null && termux-wake-lock >/dev/null 2>&1; then WAKE=1; fi
 run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
 if [ "$ui" = tui ]; then
   TUI_TITLE=$name; TUI_INFO="$(voice_label "$voice") · ${speed}×"; tui_open
@@ -673,7 +830,7 @@ while :; do
     play_line "$f" "$i"
     if [ -n "$JUMP" ]; then jump_to "$JUMP"; JUMP=""; continue; fi
     i=$((i + 1))
-    if sleep_due "$i"; then SLEPT=1; bookmark_save "$i"; exit 0; fi   # the sleep timer: stop between parts
+    if sleep_due "$i"; then SLEPT=1; bookmark_save "$i"; exit "$QUIT_RC"; fi   # the sleep timer: stop between parts
   elif [ "$play" = 1 ] && [ -f "$tmpd/stream/end" ]; then
     [ -f "$f" ] && continue   # a last chunk may have landed just now
     break
@@ -685,7 +842,7 @@ while :; do
     view_refresh
     tick 0.1
     if [ -n "$KEY" ]; then
-      key_cmd; [ "$CMD" = quit ] && exit 0
+      key_cmd; [ "$CMD" = quit ] && exit "$QUIT_RC"
       [ -n "$CMD" ] && listen_cmd "$CMD" "$i" && [ -n "$JUMP" ] && { jump_to "$JUMP"; JUMP=""; }
     fi
   fi
@@ -708,9 +865,16 @@ fi
 secs=""
 if [ -f "$tmpd/result" ] && read -r a _ < "$tmpd/result"; then secs="$(human_secs "$a") of audio"; fi
 
+if [ "$ext" = m4b ]; then
+  [ -f "$tmpd/out.wav" ] || die "No audio was made."
+  make_audiobook "$tmpd/out.wav" "$tmpd/book.m4b"
+  mv "$tmpd/book.m4b" "$out"
+  chapters=$(( $(wc -l < "$tmpd/chapters_ms" 2>/dev/null || echo 0) ))
+  [ "$chapters" -gt 1 ] && secs="${secs:+$secs · }$chapters chapters"
+  ext=saved
+fi
 if [ -n "$out" ]; then
-  [ -f "$tmpd/out.$ext" ] || die "No audio was made."
-  mv "$tmpd/out.$ext" "$out"
+  [ "$ext" = saved ] || { [ -f "$tmpd/out.$ext" ] || die "No audio was made."; mv "$tmpd/out.$ext" "$out"; }
   if [ "$LIVE" = 1 ]; then
     size="$(human_size "$(stat -c %s "$out" 2>/dev/null || wc -c < "$out")")"
     done_msg "Saved ${B}$out${R}" "${secs:+$secs · }$size"

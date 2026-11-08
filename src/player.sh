@@ -15,8 +15,7 @@
 # Each line is printed wrapped to the screen while it plays, and a soft
 # highlight moves from word to word. Times come from Kokoro itself via the engine
 # (stream/NNNN.words: "confidence", then "start end a b" per word, with a/b the
-# word's byte range in NNNN.txt). play-audio has no clock to read, so the time
-# is how long it has been playing, less its start-up delay.
+# word's byte range in NNNN.txt). The time is mpv's own playback clock.
 # A line taller than the screen is shown as a window of rows that follows the
 # lit word, then printed in full when it ends.
 
@@ -26,10 +25,11 @@ w_s=(); w_e=(); w_a=(); w_b=(); w_state=none
 TERM_ROWS=24
 in_line=0
 
-part_of() {      # PART="part I of N · " while a job has more than one part
-  local parts=1
-  [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
+part_of() {      # PART="part I of N · " while a job has more than one part; MADE="made 40%" until all is
+  local parts=1 made=0
+  [ -f "$tmpd/progress" ] && { read -r made parts < "$tmpd/progress" || parts=1; }
   PART=""; [ "${parts:-1}" -gt 1 ] && PART="part $1 of $parts · "
+  MADE=""; [ "${parts:-1}" -gt 1 ] && [ ! -f "$tmpd/stream/end" ] && MADE="made $(( made * 100 / parts ))%"
   return 0
 }
 
@@ -134,7 +134,10 @@ bookmark_save() {   # bookmark_save PART: so the same command, or kokoro --conti
   printf 'part=%s\nparts=%s\ntitle=%s\nkind=%s\nsource=%s\nvoice=%s\nspeed=%s\nlang=%s\n' \
     "$1" "$parts" "${book_title:-$name}" "$kind" "$source" "$voice" "$speed" "$lang" > "$BOOKS/$book_id.mark"
 }
-bookmark_done() { [ -n "$book_id" ] && rm -f "$BOOKS/$book_id.mark" "$BOOKS/$book_id.txt"; return 0; }
+bookmark_done() {  # read to the end: the bookmark and the book's kept audio go
+  [ -n "$book_id" ] && rm -rf "$BOOKS/$book_id.mark" "$BOOKS/$book_id.txt" "${CACHE:?}/${book_id:?}"
+  return 0
+}
 
 # The notification: what's playing, with pause / next / again buttons that run
 # kokoro --pause / --next / --again. Swiping it away stops. In the background,
@@ -201,7 +204,7 @@ sleep_due() {    # sleep_due NEXT_PART: is it time to stop, before NEXT_PART sta
 JUMP=""
 jump_to() {      # jump_to PART
   local old=$tmpd target=$1 f
-  if [ -n "$play_pid" ]; then kill "$play_pid" 2>/dev/null || true; wait "$play_pid" 2>/dev/null || true; play_pid=""; fi
+  mpv_stop
   if [ -n "$gen_pid" ]; then kill "$gen_pid" 2>/dev/null || true; wait "$gen_pid" 2>/dev/null || true; gen_pid=""; fi
   tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
   for f in in.txt title chapters; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
@@ -238,39 +241,117 @@ listen_cmd() {   # listen_cmd CMD PART
   return 0
 }
 
-play_line() {    # play_line WAV IDX: play one part; light its words; obey pause / next / again
-  local wav=$1 i=$2 base="${1%.wav}" cur=-1 lit=-2 lit_now t t0 label last="" cmd paused=0 restart=1
+# ------------------------------------------------------------ mpv
+# One mpv for the whole listen, playing the parts as a gapless playlist: each
+# part is queued as soon as it's made, so one runs straight into the next.
+# kokomux talks to it over its IPC socket through one socat connection, and
+# follows its clock (playback-time) and place in the playlist (playlist-pos).
+
+MPV_PID=""; MPV_SOCK=""; MPV_IN=""; MPV_OUT=""; MPV_CARRY=""
+MPV_T=0; MPV_POS=-1; MPV_N=0       # seconds into the current part; playlist index; entries queued
+declare -A MPV_IDX=()              # part -> its playlist index
+MPV_PART=()                        # playlist index -> part
+
+mpv_start() {
+  [ -n "$MPV_PID" ] && kill -0 "$MPV_PID" 2>/dev/null && return 0
+  MPV_SOCK="$(realpath "$PREFIX/tmp")/kokomux-mpv.$$"   # (a socket's path can't be longer than 107 bytes)
+  rm -f "$MPV_SOCK"
+  # shellcheck disable=SC2086  # KOKORO_MPV_ARGS: extra mpv options, word by word
+  mpv --idle=yes --no-video --no-terminal --really-quiet --gapless-audio=yes --audio-display=no \
+      --input-ipc-server="$MPV_SOCK" ${KOKORO_MPV_ARGS:-} </dev/null >/dev/null 2>&1 & MPV_PID=$!
+  play_pid=$MPV_PID                # (cleanup stops it)
+  local n=0
+  while [ ! -S "$MPV_SOCK" ]; do
+    n=$(( n + 1 )); [ "$n" -lt 250 ] || die "mpv didn't start." "Try: mpv --version"
+    sleep 0.02
+  done
+  coproc MPVC { exec socat - UNIX-CONNECT:"$MPV_SOCK" 2>/dev/null; }
+  MPV_IN=${MPVC[0]} MPV_OUT=${MPVC[1]}
+  mpv_send '"observe_property",1,"playback-time"'
+  mpv_send '"observe_property",2,"playlist-pos"'
+}
+mpv_send() { printf '{"command":[%s]}\n' "$1" >&"$MPV_OUT"; }
+mpv_pump() {     # take in what mpv has reported since last time
+  local line
+  while :; do
+    if IFS= read -r -t 0.001 -u "$MPV_IN" line; then
+      line=$MPV_CARRY$line; MPV_CARRY=""
+      case "$line" in
+        *'"name":"playback-time"'*) if [[ "$line" =~ \"data\":([0-9.]+) ]]; then MPV_T=${BASH_REMATCH[1]}; fi ;;
+        *'"name":"playlist-pos"'*) if [[ "$line" =~ \"data\":(-?[0-9]+) ]]; then MPV_POS=${BASH_REMATCH[1]}; fi ;;
+      esac
+    else
+      MPV_CARRY+=$line             # half a line: the rest comes next time
+      break
+    fi
+  done
+}
+mpv_ms() {       # MPV_T as whole milliseconds, in MS
+  local s=${MPV_T%%.*} f=0
+  [[ "$MPV_T" == *.* ]] && f=${MPV_T#*.}
+  f="${f}000"; MS=$(( 10#${s:-0} * 1000 + 10#${f:0:3} ))
+}
+mpv_queue() {    # mpv_queue PART WAV: add a part to the playlist (it plays at once if nothing is)
+  mpv_send "\"loadfile\",\"$2\",\"append-play\""
+  MPV_IDX[$1]=$MPV_N; MPV_PART[MPV_N]=$1; MPV_N=$(( MPV_N + 1 ))
+}
+mpv_stop() {     # empty the playlist (a jump starts again from a new part)
+  [ -n "$MPV_PID" ] && mpv_send '"stop"'
+  MPV_IDX=(); MPV_PART=(); MPV_N=0; MPV_POS=-1; MPV_T=0
+  return 0
+}
+mpv_quit() {
+  [ -n "$MPV_PID" ] && { kill "$MPV_PID" 2>/dev/null; wait "$MPV_PID" 2>/dev/null; }
+  [ -n "$MPV_SOCK" ] && rm -f "$MPV_SOCK"
+  MPV_PID=""
+  return 0
+}
+
+play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause / next / again
+  local wav=$1 i=$2 base="${1%.wav}" cur=-1 lit=-2 lit_now t label last="" cmd paused=0 started=0 idx k f waited=0
   w_state=pending
   { [ -f "$tmpd/stream/words-off" ] || [ "$show_words" = 0 ]; } && w_state=off
-  echo "$i" > "$tmpd/stream/playing"          # the engine and aligner work from the part being heard
   title_get; part_of "$i"
   bookmark_save "$i"; notify "${PART% · }"
+  mpv_start
+  [ -n "${MPV_IDX[$i]+x}" ] || mpv_queue "$i" "$wav"
+  idx=${MPV_IDX[$i]}
   view_part "$i" "$base"
   in_line=1
-  # Nothing in this loop starts a process except when something changes: it
-  # runs ~30 times a second on a phone.
+  echo playing > "$PLAYER_STATE"
+  # Nothing in this loop starts a process: it runs ~30 times a second on a phone.
   while :; do
-    if [ "$restart" = 1 ]; then               # (re)start this part from its beginning
-      play-audio "$wav" >/dev/null 2>&1 & play_pid=$!
-      now_ms; t0=$NOW; cur=-1; lit=-2; restart=0
-      echo playing > "$PLAYER_STATE"
+    mpv_pump
+    # The next part goes in the playlist as soon as it's made, so there's no gap
+    # (unless the sleep timer stops before it).
+    k=$(( i + 1 ))
+    if [ -z "${MPV_IDX[$k]+x}" ]; then
+      printf -v f '%s/stream/%04d.wav' "$tmpd" "$k"
+      [ -f "$f" ] && ! sleep_due "$k" && mpv_queue "$k" "$f"
     fi
+    if [ "$MPV_POS" = "$idx" ]; then started=1
+    elif [ "$started" = 1 ] || { [ "$MPV_POS" -gt "$idx" ] 2>/dev/null; }; then break   # on to the next, or done
+    else waited=$(( waited + 1 )); [ "$waited" -lt 300 ] || break; fi                  # (mpv never got to it)
     cmd=""                                    # kokoro --pause / --next / --again, or a key or click
     if [ -f "$CONTROL" ]; then read -r cmd < "$CONTROL" || cmd=""; rm -f "$CONTROL"; fi
     if [ -z "$cmd" ] && [ -n "$KEY" ]; then key_cmd; cmd=$CMD; fi
     if [ -n "$cmd" ]; then
       case "$cmd" in
         toggle)
-          if [ "$paused" = 1 ]; then paused=0; restart=1; notify "${PART% · }"   # carry on from the part's start
-          else { kill "$play_pid" 2>/dev/null || true; }; wait "$play_pid" || true
-               paused=1; last=""; echo paused > "$PLAYER_STATE"; notify "Paused · ${PART% · }"; fi
-          continue ;;
-        next)  { kill "$play_pid" 2>/dev/null || true; }; wait "$play_pid" || true; break ;;
-        again) { kill "$play_pid" 2>/dev/null || true; }; wait "$play_pid" || true; restart=1; continue ;;
-        quit)  exit 0 ;;                          # the bookmark is kept; cleanup says where
+          if [ "$paused" = 1 ]; then mpv_send '"set_property","pause",false'; paused=0; last=""
+               echo playing > "$PLAYER_STATE"; notify "${PART% · }"
+          else mpv_send '"set_property","pause",true'; paused=1; last=""
+               echo paused > "$PLAYER_STATE"; notify "Paused · ${PART% · }"; fi ;;
+        next)  if [ -n "${MPV_IDX[$k]+x}" ]; then mpv_send '"playlist-next"'
+               else mpv_send '"playlist-next","force"'; fi
+               mpv_send '"set_property","pause",false'
+               break ;;
+        again) mpv_send '"seek",0,"absolute"'; mpv_send '"set_property","pause",false'
+               paused=0; cur=-1; lit=-2; last=""; continue ;;
+        quit)  exit "$QUIT_RC" ;;                 # the bookmark is kept; cleanup says where
         *)     if listen_cmd "$cmd" "$i"; then
                  last=""
-                 if [ -n "$JUMP" ]; then { kill "$play_pid" 2>/dev/null || true; }; wait "$play_pid" || true; break; fi
+                 [ -n "$JUMP" ] && break      # jump_to empties the playlist
                fi ;;
       esac
     fi
@@ -283,11 +364,11 @@ play_line() {    # play_line WAV IDX: play one part; light its words; obey pause
       tick 0.1
       continue
     fi
-    kill -0 "$play_pid" 2>/dev/null || break  # the part has finished
-    if [ "$show_words" = 1 ]; then
+    if [ "$show_words" = 1 ] && [ "$started" = 1 ]; then
       if [ "$w_state" = pending ]; then words_load "$base.words" || true; fi   # not landed yet
       if [ "$w_state" = ready ]; then
-        now_ms; t=$(( NOW - t0 - KOKORO_WORDS_OFFSET_MS ))
+        mpv_ms; t=$(( MS - KOKORO_WORDS_OFFSET_MS ))
+        if [ "$t" -lt "${w_s[$(( cur < 0 ? 0 : cur ))]:-0}" ]; then cur=-1; fi      # (after a seek back)
         while [ $(( cur + 1 )) -lt "${#w_s[@]}" ] && [ "${w_s[cur + 1]}" -le "$t" ]; do cur=$(( cur + 1 )); done
         # Keep the word lit through the pause after it; the last one goes out when it ends.
         lit_now=$cur
@@ -301,15 +382,11 @@ play_line() {    # play_line WAV IDX: play one part; light its words; obey pause
       fi
     fi
     part_of "$i"; sleep_label
-    if [ "$ui" = tui ]; then label="$SLEEP_LABEL"
-    else label="${PART}${SLEEP_LABEL:+$SLEEP_LABEL · }␣ pause · → next · q stop"; fi
+    if [ "$ui" = tui ]; then label="$SLEEP_LABEL${SLEEP_LABEL:+${MADE:+ · }}$MADE"
+    else label="${PART}${SLEEP_LABEL:+$SLEEP_LABEL · }${MADE:+$MADE · }␣ pause · → next · q stop"; fi
     if [ "$label|playing" != "$last" ]; then view_state "Playing" "$label" "▶"; last="$label|playing"; fi
     tick 0.03
   done
-  wait "$play_pid" || true
-  play_pid=""; in_line=0
-  echo $(( i + 1 )) > "$tmpd/stream/playing"  # heard: the aligner can drop this part
+  in_line=0
   view_part_end
-  rm -f "$wav"
 }
-

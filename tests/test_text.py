@@ -36,6 +36,7 @@ def test_marks_for_the_eye():
     assert normalise("See https://www.example.com/a/b?x=1. Or www.kokomux.org.") == "See example.com. Or kokomux.org."
     assert normalise("## A heading\n- one\n* two\n> said") == "A heading\none\ntwo\nsaid"
     assert normalise("It was **very** _quiet_, 2*3 is 6.") == "It was very quiet, 2*3 is 6."
+    assert normalise("***Kokoro*** is a novel.") == "Kokoro is a novel."
     assert normalise("Wait — no -- yes – fine") == "Wait, no, yes, fine"
     assert normalise("From 1990–1995!!!") == "From 1990 to 1995!"
     assert normalise("soft­hyphen and zero​width") == "softhyphen and zerowidth"
