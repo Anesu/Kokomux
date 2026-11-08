@@ -54,11 +54,12 @@ def test_epub_chapters_in_spine_order():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "book.epub")
         make_epub(path)
-        title, text = engine.read_epub(path, "book.epub")
+        title, chapters = engine.read_epub(path, "book.epub")
     assert title == "The Long Road"
-    assert text.index("Chapter One") < text.index("The road began") < text.index("Chapter Two")
-    assert "It ended in the hills." in text            # href with an escaped space
-    assert "Contents" not in text                      # non-linear nav is skipped
+    assert [h for h, _ in chapters] == ["Chapter One", "Chapter Two"]   # titled by their headings
+    assert "The road began" in chapters[0][1]
+    assert "It ended in the hills." in chapters[1][1]  # href with an escaped space
+    assert all("Contents" not in text for _, text in chapters)   # non-linear nav is skipped
 
 
 def test_drm_epub_is_refused():
@@ -77,8 +78,9 @@ def test_pdf_title_and_joined_lines():
     if importlib.util.find_spec("pypdf") is None:
         print("  (pypdf not installed: skipped)")
         return
-    title, text = engine.read_pdf(os.path.join(HERE, "fixtures", "caravan.pdf"), "caravan.pdf")
-    assert title == "The Caravan"
+    title, chapters = engine.read_pdf(os.path.join(HERE, "fixtures", "caravan.pdf"), "caravan.pdf")
+    text = chapters[0][1]
+    assert title == "The Caravan" and len(chapters) == 1
     assert "every traveller kept one eye on the" in text      # a wrapped line, rejoined
     assert "\n1\n" not in f"\n{text}\n" and "\n2\n" not in f"\n{text}\n"   # page numbers gone
     assert "By noon the camels refused to walk." in text
@@ -89,10 +91,10 @@ def test_read_source_detects_the_kind_of_file():
         epub = os.path.join(d, "b.epub")
         make_epub(epub)
         data = open(epub, "rb").read()
-    title, text = engine.read_source(job_with("in.bin", data), {"file": "in.bin", "name": "b.epub"})
-    assert title == "The Long Road" and "road began" in text
-    title, text = engine.read_source(job_with("in.txt", "Plain words.".encode()), {"name": "notes.txt"})
-    assert (title, text) == ("notes.txt", "Plain words.")
+    title, chapters = engine.read_source(job_with("in.bin", data), {"file": "in.bin", "name": "b.epub"})
+    assert title == "The Long Road" and len(chapters) == 2 and "road began" in chapters[0][1]
+    title, chapters = engine.read_source(job_with("in.txt", "Plain words.".encode()), {"name": "notes.txt"})
+    assert (title, chapters) == ("notes.txt", [("notes.txt", "Plain words.")])
 
 
 def test_binary_junk_is_refused():

@@ -21,7 +21,8 @@ declare -A TUI_WRAP=() TUI_OFFS=()    # each part's text wrapped to the column, 
 tui_hist=()                           # parts already heard, oldest first
 TUI_PART=0; TUI_PARTS=0; TUI_A=0; TUI_B=0
 TUI_STATE=""; TUI_EXTRA=""; TUI_SYM=""; TUI_PAUSED=0; TUI_TITLE=""; TUI_INFO=""
-TUI_BTN=()                            # clickable buttons: "x0 x1 command"
+TUI_BTN=()                            # clickable buttons: "row x0 x1 command"
+TUI_CHAPTER=""; TUI_HAS_CHAPTERS=0; TUI_BAR=(3 10)   # the progress bar's first column and width
 SYNC_ON=$'\033[?2026h'; SYNC_OFF=$'\033[?2026l'
 
 tui_size() {
@@ -97,7 +98,7 @@ tui_wrap() {     # tui_wrap K: part K's text wrapped to the column, once
 }
 
 tui_text() {     # the reading column: what's been heard above, this part, what's next below
-  local top=4 bottom=$(( TH - 4 )) h k j n r idx a hl=0 LC_ALL=C
+  local top=4 bottom=$(( TH - 5 )) h k j n r idx a hl=0 LC_ALL=C
   local -a past=() now_rows=() offs=() next=() rows=()
   h=$(( bottom - top + 1 ))
   if [ "$TUI_PART" = 0 ] || ! tui_wrap "$TUI_PART"; then   # nothing to show yet
@@ -158,37 +159,52 @@ tui_row() {      # tui_row TEXT OFFSET: one row of this part, the lit word in th
 }
 
 tui_progress() {
-  local label bar bw filled
-  if [ "$TUI_PARTS" -gt 1 ]; then label="part $TUI_PART of $TUI_PARTS"; else label=""; fi
+  local label bar bw filled ch=$TUI_CHAPTER room
+  if [ "$TUI_PARTS" -gt 1 ]; then label="$TUI_PART/$TUI_PARTS"; else label=""; fi
+  if [ -n "$ch" ]; then                       # the chapter, as long as the bar keeps some room
+    room=$(( TW / 3 )); [ "${#ch}" -gt "$room" ] && ch="${ch:0:$(( room - 1 ))}…"
+    label="$ch · $label"
+  fi
   bw=$(( TW - 6 - ${#label} )); [ "$bw" -ge 4 ] || bw=4
+  TUI_BAR=(3 "$bw")
   filled=0; [ "$TUI_PARTS" -gt 0 ] && filled=$(( TUI_PART * bw / TUI_PARTS ))
   printf -v bar '%*s' "$filled" ''; bar=${bar// /━}
-  printf '\033[%d;1H\033[2K  %s%s%s' $(( TH - 2 )) "$ACC" "$bar" "$R" >&2
+  printf '\033[%d;1H\033[2K  %s%s%s' $(( TH - 3 )) "$ACC" "$bar" "$R" >&2
   printf -v bar '%*s' $(( bw - filled )) ''
   printf '%s%s%s  %s' "$D" "${bar// /─}" "$R" "$label" >&2
 }
 
+tui_button() {   # tui_button ROW X KEY LABEL COMMAND: draw one, remember where it is; X advances
+  local text=" k $4 "                         # (the key glyph is one column, whatever its bytes)
+  printf '\033[%d;%dH\033[48;5;236m %s%s%s\033[48;5;236m %s \033[0m' "$1" "$BX" "$ACC2" "$3" "$R" "$4" >&2
+  TUI_BTN+=("$1 $BX $(( BX + ${#text} - 1 )) $5")
+  BX=$(( BX + ${#text} + 2 ))
+}
+
 tui_footer() {   # the buttons (keys and clicks), and what's happening on the right
-  local x=3 key label cmd text state room
+  local state room
   TUI_BTN=()
   printf '\033[%d;1H\033[2K\033[%d;1H\033[2K' $(( TH - 1 )) "$TH" >&2
-  for spec in "␣|$( [ "$TUI_PAUSED" = 1 ] && echo Play || echo Pause)|toggle" "←|Again|again" "→|Next|next" "q|Stop|quit"; do
-    IFS='|' read -r key label cmd <<< "$spec"
-    text=" k $label "                 # (the key glyph is one column, whatever its bytes)
-    printf '\033[%d;%dH\033[48;5;236m %s%s%s\033[48;5;236m %s \033[0m' "$TH" "$x" "$ACC2" "$key" "$R" "$label" >&2
-    TUI_BTN+=("$x $(( x + ${#text} - 1 )) $cmd")
-    x=$(( x + ${#text} + 2 ))
-  done
+  BX=3
+  tui_button "$TH" "$BX" "␣" "$( [ "$TUI_PAUSED" = 1 ] && echo Play || echo Pause)" toggle
+  tui_button "$TH" "$BX" "←" Again again
+  tui_button "$TH" "$BX" "→" Next next
+  tui_button "$TH" "$BX" q Stop quit
   state="${TUI_SYM:+$TUI_SYM }$TUI_STATE${TUI_EXTRA:+ · $TUI_EXTRA}"
-  room=$(( TW - x - 2 ))
+  room=$(( TW - BX - 2 ))
   if [ "$room" -gt 6 ]; then
     [ "${#state}" -gt "$room" ] && state="${state:0:$(( room - 1 ))}…"
     printf '\033[%d;%dH%s%s%s' "$TH" $(( TW - ${#state} - 1 )) "$D" "$state" "$R" >&2
   fi
+  BX=3                                        # the second row: the rest
+  [ "$TUI_HAS_CHAPTERS" = 1 ] && tui_button $(( TH - 1 )) "$BX" c Chapters chapters
+  tui_button $(( TH - 1 )) "$BX" "−" Slower slower
+  tui_button $(( TH - 1 )) "$BX" "+" Faster faster
+  tui_button $(( TH - 1 )) "$BX" t Sleep sleep
 }
 
 tui_draw() {
-  printf '%s' "$SYNC_ON" >&2
+  printf '%s\033[2J' "$SYNC_ON" >&2         # a full redraw clears what overlays left behind
   tui_header; tui_text; tui_progress; tui_footer
   printf '%s' "$SYNC_OFF" >&2
 }
@@ -209,15 +225,59 @@ tui_state() {    # tui_state TEXT EXTRA SYMBOL PAUSED: only the footer is redraw
   tui_footer
 }
 
-tui_click() {    # tui_click REPORT: a left click or tap on a button sets CMD
-  local b x y spec x0 x1 cmd
+tui_click() {    # tui_click REPORT: a left click or tap on a button or the progress bar sets CMD
+  local b x y spec row x0 x1 cmd
   [[ "$1" =~ ^$'\033'\[\<([0-9]+)\;([0-9]+)\;([0-9]+)M$ ]] || return 0
   b=${BASH_REMATCH[1]} x=${BASH_REMATCH[2]} y=${BASH_REMATCH[3]}
-  [ "$b" = 0 ] && [ "$y" = "$TH" ] || return 0
+  [ "$b" = 0 ] || return 0
   for spec in "${TUI_BTN[@]}"; do
-    read -r x0 x1 cmd <<< "$spec"
-    if [ "$x" -ge "$x0" ] && [ "$x" -le "$x1" ]; then CMD=$cmd; return 0; fi
+    read -r row x0 x1 cmd <<< "$spec"
+    if [ "$y" = "$row" ] && [ "$x" -ge "$x0" ] && [ "$x" -le "$x1" ]; then CMD=$cmd; return 0; fi
   done
+  # the progress bar: jump to that point (by part)
+  if [ "$y" = $(( TH - 3 )) ] && [ "$TUI_PARTS" -gt 1 ] && [ "$x" -ge "${TUI_BAR[0]}" ] && [ "$x" -lt $(( TUI_BAR[0] + TUI_BAR[1] )) ]; then
+    CMD="seek:$(( 1 + (x - TUI_BAR[0]) * TUI_PARTS / TUI_BAR[1] ))"
+  fi
+}
+
+tui_chapters() { # tui_chapters CURRENT: pick a chapter over the reading area; CHOSEN = its index or ""
+  local sel=${1:-0} top=0 i y view w x0 key title
+  CHOSEN=""
+  [ "$sel" -ge 0 ] || sel=0
+  local -A rowsel=()
+  while :; do
+    tui_size
+    w=$(( CW < 60 ? CW : 60 )); x0=$(( (TW - w) / 2 )); view=$(( TH - 10 ))
+    [ "${#CH_TITLE[@]}" -lt "$view" ] && view=${#CH_TITLE[@]}          # as tall as it needs to be
+    [ "$sel" -lt "$top" ] && top=$sel
+    [ "$sel" -ge $(( top + view )) ] && top=$(( sel - view + 1 ))
+    printf '%s' "$SYNC_ON" >&2
+    printf '\033[3;%dH\033[48;5;235m%*s\033[3;%dH %sChapters%s\033[48;5;235m' "$x0" "$w" "" "$x0" "$B" "$R" >&2
+    rowsel=()
+    for (( i = top, y = 4; y < 4 + view; i++, y++ )); do
+      printf '\033[%d;%dH\033[48;5;235m%*s' "$y" "$x0" "$w" "" >&2
+      [ "$i" -lt "${#CH_TITLE[@]}" ] || continue
+      title=${CH_TITLE[i]}; [ "${#title}" -gt $(( w - 12 )) ] && title="${title:0:$(( w - 13 ))}…"
+      if [ "$i" = "$sel" ]; then
+        printf '\033[%d;%dH\033[48;5;238m%*s\033[%d;%dH%s›%s\033[48;5;238m %-*s %spart %s\033[0m' "$y" "$x0" "$w" "" "$y" "$x0" \
+          "$ACC" "$R" $(( w - 12 )) "$title" "$D" "${CH_START[i]}" >&2
+      else
+        printf '\033[%d;%dH\033[48;5;235m  %-*s %spart %s\033[0m' "$y" "$x0" $(( w - 12 )) "$title" "$D" "${CH_START[i]}" >&2
+      fi
+      rowsel[$y]=$i
+    done
+    printf '\033[%d;%dH\033[48;5;235m%*s\033[%d;%dH %s↑↓ Enter jump · Esc close%s\033[0m' $(( 4 + view )) "$x0" "$w" "" $(( 4 + view )) "$x0" "$D" "$R" >&2
+    printf '%s' "$SYNC_OFF" >&2
+    KEY=""; tick 0.5; [ -n "$KEY" ] || continue
+    case "$KEY" in
+      $'\033[A'|$'\033OA'|k|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
+      $'\033[B'|$'\033OB'|j|$'\033[<65;'*M) [ "$sel" -lt $(( ${#CH_TITLE[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
+      $'\n'|$'\r') CHOSEN=$sel; break ;;
+      $'\033[<0;'*M) [[ "$KEY" =~ \;([0-9]+)M$ ]] && i=${rowsel[${BASH_REMATCH[1]}]:-} && [ -n "$i" ] && { CHOSEN=$i; break; } ;;
+      $'\033'|q|c) break ;;
+    esac
+  done
+  tui_draw
 }
 
 # ---------------------------------------------------------------- the home screen
@@ -369,7 +429,7 @@ TUI_SETTINGS=(
   "out|Save files as|The file name used when you save without -o. The ending picks the format: .wav .mp3 .ogg or .flac."
   "#Reading"
   "KOKORO_TUI|Full-screen reader|Open the full-screen reader when you listen on a terminal. Off: show the text below the command instead."
-  "KOKORO_WORDS|Light up words|Highlight each word as it's spoken (uses Whistle). Off saves a little battery."
+  "KOKORO_WORDS|Light up words|Highlight each word as it's spoken, using the timings Kokoro reports as it speaks, in every language."
   "offset|Highlight timing|Moves the highlight relative to the voice. Raise it if the highlight runs ahead, lower it if it lags."
   "#While listening"
   "KOKORO_NOTIFY|Notification controls|Show a notification with pause, next and again buttons, also on the lock screen. Needs the Termux:API app."

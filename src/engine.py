@@ -32,9 +32,14 @@ APP = os.path.dirname(os.path.abspath(__file__))
 if APP not in sys.path:
     sys.path.insert(0, APP)   # words.py lives beside this file
 MODELS = os.path.join(APP, "models")
-MODEL = os.path.join(MODELS, "kokoro-v1.0.int8.onnx")
+# Kokoro 82M v1.0, 8-bit, exported with a "durations" output: it reports when each
+# sound is spoken, which is what lights up each word. Pinned to a commit.
+MODEL = os.path.join(MODELS, "kokoro-v1.0-timestamped.int8.onnx")
+MODEL_SRC = ("https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX-timestamped/resolve/"
+             "dd4401a9add81ac692d20e240d22ec9dda82cc29/onnx/model_quantized.onnx")
+OLD_MODEL = os.path.join(MODELS, "kokoro-v1.0.int8.onnx")   # before 0.8: no timings
 VOICES = os.path.join(MODELS, "voices-v1.0.bin")
-MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
+VOICES_SRC = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
 SERVER_DIR = "/tmp/kokoro-server"
 JOB_DIR_RE = re.compile(r"^/tmp/kokoro\.[A-Za-z0-9]+$")
 FORMATS = ("wav", "mp3", "ogg", "flac")
@@ -67,8 +72,22 @@ def tts():
     with _tts_lock:
         if _tts is None:
             from kokoro_onnx import Kokoro
-            _tts = Kokoro(MODEL, VOICES)
+            model = MODEL if os.path.exists(MODEL) else OLD_MODEL
+            _tts = Kokoro(model, VOICES)
+            # kokoro-onnx looks for an output called "duration"; this export calls it
+            # "durations". It's the second output either way, which is what it reads.
+            _tts.has_timings = len(_tts.sess.get_outputs()) > 1
     return _tts
+
+
+def phonemize_many(words, lang):
+    """Each word's phonemes on its own, the way Kokoro phonemises (call under SYNTH_LOCK)."""
+    import phonemizer
+    from kokoro_onnx.tokenizer import Tokenizer
+    vocab = tts().tokenizer.vocab
+    out = phonemizer.phonemize([Tokenizer.normalize_text(w) for w in words], lang,
+                               preserve_punctuation=True, with_stress=True)
+    return ["".join(ch for ch in p if ch in vocab) for p in out]
 
 
 # ------------------------------------------------------------------ text
@@ -122,6 +141,7 @@ class _Extractor(HTMLParser):
         self.block = None
         self.buf = []
         self.blocks = []  # (in_article, text)
+        self.heading = ""  # the first heading: an EPUB chapter's title
         self.title = ""
         self.in_title = False
         self.done = False
@@ -176,6 +196,8 @@ class _Extractor(HTMLParser):
                 self.done = True
             else:
                 self.blocks.append((self.article > 0, t))
+                if self.block in self.HEADINGS and not self.heading:
+                    self.heading = t
         self.buf = []
         self.block = None
 
@@ -222,7 +244,7 @@ def fetch_url(url):
 # ------------------------------------------------------------------ books
 
 def read_epub(path, name):
-    """An EPUB's (title, text): its chapters in reading order, as the reader sees them."""
+    """An EPUB's (title, [(chapter title, text)]): its chapters in reading order."""
     import posixpath
     import xml.etree.ElementTree as ET
 
@@ -254,14 +276,14 @@ def read_epub(path, name):
                 ex.feed(z.read(inner).decode("utf-8", "replace"))
                 chapter = ex.text(with_title=False)
                 if chapter.strip():
-                    parts.append(chapter)
+                    parts.append((ex.heading or f"Part {len(parts) + 1}", chapter))
     except JobError:
         raise
     except (KeyError, StopIteration, zipfile.BadZipFile, ET.ParseError) as e:
         raise JobError(f"Couldn't read that EPUB ({type(e).__name__})") from None
     if not parts:
         raise JobError("That EPUB has no readable text")
-    return (title or "").strip() or name, "\n\n".join(parts)
+    return (title or "").strip() or name, parts
 
 
 def read_pdf(path, name):
@@ -293,16 +315,18 @@ def read_pdf(path, name):
         sentences.append(buf)
     if not sentences:
         raise JobError("That PDF has no text to read (is it a scan?)")
-    return str(title).strip() or name, "\n".join(sentences)
+    title = str(title).strip() or name
+    return title, [(title, "\n".join(sentences))]
 
 
 def read_source(jobdir, job):
-    """What a job reads, as (title, text): a web page, or a file that is an EPUB,
-    a PDF or plain text."""
+    """What a job reads, as (title, [(chapter title, text)]): a web page, or a file
+    that is an EPUB, a PDF or plain text. Only an EPUB has more than one chapter."""
     name = job.get("name", "")
     if job.get("url"):
         log(f"Fetching {job['url']}")
-        return fetch_url(job["url"])
+        title, text = fetch_url(job["url"])
+        return title, [(title, text)]
     file = job.get("file", "in.txt")
     if "/" in file:
         raise JobError(f"Bad input file name: {file}")
@@ -312,13 +336,13 @@ def read_source(jobdir, job):
     if head.startswith(b"%PDF"):
         return read_pdf(path, name)
     if head.startswith(b"PK") and zipfile.is_zipfile(path):
-        return read_epub(path, name)
+        return read_epub(path, name)   # already chapters
     with open(path, encoding="utf-8", errors="replace") as fh:
         text = fh.read()
     bad = text.count("\ufffd") + text.count("\x00")
     if text and bad > max(3, len(text) // 100):
         raise JobError("That doesn't look like text, an EPUB or a PDF")
-    return name, text
+    return name, [(name, text)]
 
 
 # ------------------------------------------------------------------ jobs
@@ -363,21 +387,32 @@ def run_job(path):
         out = os.path.join(jobdir, out)
 
     stream = None
-    aligner = None
+    timed = False
     if job.get("stream") == "1":
         stream = os.path.join(jobdir, "stream")
         os.makedirs(stream, exist_ok=True)
-        if job.get("words") == "1":
-            aligner = WordAligner(stream, lang)
+        # Word timings come from Kokoro itself, with the audio.
+        timed = job.get("words") == "1" and engine.has_timings
+        if job.get("words") == "1" and not timed:
+            _write_atomic(os.path.join(stream, "words-off"), "this model reports no timings (kokoro --update)\n")
 
     writer = None
     total = 0.0
     try:
-        title, text = read_source(jobdir, job)
+        title, chapters = read_source(jobdir, job)
         _write_atomic(os.path.join(jobdir, "title"), (title or "").replace("\n", " ")[:120] + "\n")
-        chunks = split_text(text)
+        # Each chapter is split on its own, so a part never runs across chapters, and
+        # where each chapter starts is written down for the player's chapter list.
+        chunks, starts = [], []
+        for heading, text in chapters:
+            parts = split_text(text)
+            if parts:
+                starts.append(f"{len(chunks) + 1}\t{heading.replace(chr(9), ' ').replace(chr(10), ' ')[:80]}")
+                chunks += parts
         if not chunks:
             raise JobError("No text to read")
+        if len(starts) > 1:
+            _write_atomic(os.path.join(jobdir, "chapters"), "\n".join(starts) + "\n")
         try:
             first = int(job.get("start", "1"))
         except ValueError:
@@ -397,16 +432,22 @@ def run_job(path):
                 raise JobError("Cancelled")
             _write_atomic(os.path.join(jobdir, "progress"), f"{i} {len(chunks)}\n")
             with SYNTH_LOCK:
-                samples, rate = engine.create(chunk, voice=voice, speed=speed, lang=lang)
+                if timed:
+                    import words
+                    samples, rate, timings = engine.create_timed(chunk, voice=voice, speed=speed, lang=lang)
+                    marks = words.words_from_timings(chunk, timings, lambda ws: phonemize_many(ws, lang))
+                else:
+                    samples, rate = engine.create(chunk, voice=voice, speed=speed, lang=lang)
             total += len(samples) / rate
             if stream:
-                # The text first, so the player can show the line the moment its audio lands.
+                # The text and its word timings first, so the player has them the
+                # moment the audio lands.
                 _write_atomic(os.path.join(stream, f"{i:04d}.txt"), chunk)
+                if timed:
+                    _write_atomic(os.path.join(stream, f"{i:04d}.words"), words.player_rows(chunk, marks))
                 tmp = os.path.join(stream, f"{i:04d}.tmp.wav")
                 sf.write(tmp, samples, rate)
                 os.replace(tmp, os.path.join(stream, f"{i:04d}.wav"))
-                if aligner:
-                    aligner.add(i, chunk, samples, rate)
             if out:
                 # Written as it's made, so a whole book never has to fit in memory.
                 if writer is None:
@@ -419,8 +460,6 @@ def run_job(path):
             writer.close()
         if stream and os.path.isdir(stream):
             open(os.path.join(stream, "end"), "w").close()
-        if aligner:
-            aligner.finish()   # timings for any line not yet heard
 
     elapsed = time.time() - t0
     _write_atomic(os.path.join(jobdir, "result"), f"{total:.1f} {elapsed:.1f} {len(chunks)}\n")
@@ -448,86 +487,6 @@ def _write_atomic(path, text):
         os.replace(path + ".tmp", path)
     except OSError:
         pass  # the job folder vanished (cancelled); the loop will notice
-
-
-# ------------------------------------------------------------------ word timings
-
-class WordAligner(threading.Thread):
-    """Times the words of a job's lines with Whistle, on the CPU beside speech, and
-    publishes each line as stream/NNNN.words the moment it lands; the player lights
-    the spoken word from those files. It works from the line being heard (the
-    player keeps stream/playing up to date) and drops lines already heard, so a
-    job never waits on timings nobody will see."""
-
-    def __init__(self, stream, lang):
-        super().__init__(daemon=True)
-        self.stream, self.lang = stream, lang
-        self.pending, self.done = {}, False
-        self.cond = threading.Condition()
-        self.off = None
-        try:
-            import words
-            self.words = words
-            if not words.available():
-                self.off = "Whistle isn't installed (run kokoro --update)"
-            elif not words.supported(lang):
-                self.off = f"Whistle doesn't transcribe {lang}"
-        except ImportError:
-            self.off = "word timings aren't installed (run kokoro --update)"
-        if self.off:
-            _write_atomic(os.path.join(stream, "words-off"), self.off + "\n")
-        else:
-            self.start()
-
-    def add(self, i, text, samples, rate):
-        if self.off:
-            return
-        with self.cond:
-            self.pending[i] = (text, samples, rate)
-            self.cond.notify()
-
-    def finish(self):
-        if self.off:
-            return
-        with self.cond:
-            self.done = True
-            self.cond.notify()
-        self.join()
-
-    def _playing(self):
-        try:
-            with open(os.path.join(self.stream, "playing")) as fh:
-                return int(fh.read().strip() or 1)
-        except (OSError, ValueError):
-            return 1
-
-    def _next(self):
-        """The line being heard, or the next one after it; None once every line
-        left has already been heard."""
-        playing = self._playing()
-        for i in [i for i in self.pending if i < playing]:
-            del self.pending[i]
-        return min(self.pending) if self.pending else None
-
-    def run(self):
-        while True:
-            with self.cond:
-                while not self.pending and not self.done:
-                    self.cond.wait()
-                i = self._next()
-                if i is None:
-                    if self.done:
-                        return
-                    continue
-                text, samples, rate = self.pending.pop(i)
-            if not os.path.isdir(self.stream):
-                return   # cancelled
-            try:
-                data = self.words.line_words(text, samples, rate, self.lang)
-            except Exception as e:  # noqa: BLE001 - one bad line must not stop the others
-                log(f"Word timings, line {i}: {type(e).__name__}: {e}")
-                data = self.words.empty_result("error")
-            _write_atomic(os.path.join(self.stream, f"{i:04d}.words"), self.words.player_rows(text, data))
 
 
 # ------------------------------------------------------------------ server
@@ -629,8 +588,8 @@ def serve(port, idle):
 
 def download():
     os.makedirs(MODELS, exist_ok=True)
-    for name, label in (("kokoro-v1.0.int8.onnx", "model"), ("voices-v1.0.bin", "voices")):
-        dest = os.path.join(MODELS, name)
+    for dest, src, label in ((MODEL, MODEL_SRC, "model"), (VOICES, VOICES_SRC, "voices")):
+        name = os.path.basename(dest)
         if os.path.exists(dest) and os.path.getsize(dest) > 0:
             print(f"@@progress {label} 100 0 0")
             print(f"{name}: already downloaded", flush=True)
@@ -638,7 +597,7 @@ def download():
         part = dest + ".part"
         for attempt in range(1, 6):
             have = os.path.getsize(part) if os.path.exists(part) else 0
-            req = urllib.request.Request(MODEL_URL + name, headers={"User-Agent": USER_AGENT})
+            req = urllib.request.Request(src, headers={"User-Agent": USER_AGENT})
             if have:
                 req.add_header("Range", f"bytes={have}-")
             try:
@@ -663,6 +622,8 @@ def download():
                 time.sleep(2 * attempt)
         else:
             sys.exit(f"Couldn't download {name}. Run the installer again to resume.")
+    if os.path.exists(OLD_MODEL):
+        os.remove(OLD_MODEL)   # the timestamped model replaces it (saves 88 MB)
 
 
 # ------------------------------------------------------------------ voices
@@ -725,7 +686,6 @@ def main():
     v.add_argument("--default", default="")
     v.add_argument("--color", action="store_true", help="colour even when piped")
     sub.add_parser("download")
-    sub.add_parser("whistle", help="fetch and load Whistle once (word timings)")
     a = p.parse_args()
 
     if a.cmd == "job":
@@ -743,11 +703,6 @@ def main():
             print_voices(names, a.width, a.default)
     elif a.cmd == "download":
         download()
-    elif a.cmd == "whistle":
-        import words
-        t0 = time.time()
-        words.load()
-        print(f"Whistle ready ({words.engine_name()}, {time.time() - t0:.1f}s)")
 
 
 if __name__ == "__main__":

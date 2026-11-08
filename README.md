@@ -18,7 +18,7 @@ While it reads aloud, kokomux shows the text and lights up each word as it's spo
 
 ## Install
 
-You need **Termux from F-Droid or GitHub** (the Play Store version is outdated), a 64-bit phone, and about **700 MB** of free space. Then run this in Termux:
+You need **Termux from F-Droid or GitHub** (the Play Store version is outdated), a 64-bit phone, and about **600 MB** of free space. Then run this in Termux:
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/Anesu/kokomux/main/install.sh && bash install.sh
@@ -79,6 +79,13 @@ On a terminal, `kokoro -p` opens a full-screen reader. Across the top are the ti
 | → | **Next** | skip to the next part |
 | ← | **Again** | hear this part again |
 | q or Esc | **Stop** | stop, keeping your place |
+| c | **Chapters** | the book's chapters: pick one to jump there (EPUBs) |
+| [ and ] | | the previous or next chapter |
+| − and + | **Slower** / **Faster** | change the speed while it plays, in steps of 0.1× |
+| t | **Sleep** | sleep timer: 15, 30 or 60 minutes, or the end of the chapter |
+| | the progress bar | click or tap it to jump to that point |
+
+When the sleep timer runs out, the part being read finishes and playback stops, keeping your place. The reader shows the chapter you're in beside the progress bar.
 
 With a keyboard and mouse (DeX, a tablet, or a Bluetooth keyboard), the keys and clicks both work. On a phone, tap the buttons. When you stop, kokoro says where you stopped and how to carry on.
 
@@ -122,12 +129,13 @@ With `-p` on a terminal, each line appears as it starts playing. A soft highligh
 
 How it works:
 
-1. **Recognise.** [Whistle](https://cactuscompute.com/blog/whistle), a small speech recogniser from Cactus Compute, listens to each line Kokoro renders and returns the words it heard, with start and end times. It runs on the CPU inside the Debian container, beside Kokoro. It starts with the line you're hearing and skips lines you've already heard. A line longer than a minute is cut at a pause and transcribed in pieces, because one pass of Whistle stops partway through very long audio.
-2. **Match.** Whistle isn't a forced aligner, so its transcript won't exactly match the text. An edit-distance alignment pairs its words with the text's words in order. It handles numbers ("60" ↔ "sixty"), hyphenated words ("worn-out" ↔ "wornout"), and names it hears as several words ("Igdrasil" ↔ "Igg Dressel").
-3. **Store.** Each line's result is cached as `<audio_hash>.words.json` in `/opt/kokoro/cache/words/` inside the container. Each entry holds `s`/`e` (start and end in ms), `a`/`b` (the character range in the line's text) and `p` (Whistle's confidence). The same line in the same voice is never transcribed twice.
-4. **Highlight.** The player lights the word that matches the time since the line started playing. A line whose match scores below 0.35 gets no highlight rather than a wrong one, and is shown in plain text.
+1. **Kokoro times itself.** kokomux uses an export of the Kokoro model that also reports how long it spends on every sound it makes. Those timings come with the audio, at no extra cost.
+2. **Sounds become words.** Each word of the line is turned into its sounds on its own, and those are lined up against the sounds Kokoro actually spoke. So "1999" covers the three words it's spoken as, and two short words run together in speech ("in the") each still get their own moment.
+3. **Highlight.** The player lights the word that matches the time since the line started playing. A line where too few sounds lined up gets no highlight rather than a wrong one, and is shown in plain text.
 
-After the installer has fetched Whistle, highlighting works offline. Whistle transcribes English, Spanish, French and Italian among Kokoro's languages; lines in other languages (Hindi, Portuguese, Japanese, Mandarin) are shown without a highlight. To turn it off, set `KOKORO_WORDS=0`. If the highlight runs ahead of the voice on your phone, raise `KOKORO_WORDS_OFFSET_MS` (default 100); if it lags, lower it. `play-audio` doesn't report its position, so this offset covers its start-up delay.
+It works in every language Kokoro speaks, offline, and needs no extra download. To turn it off, set `KOKORO_WORDS=0`. If the highlight runs ahead of the voice on your phone, raise `KOKORO_WORDS_OFFSET_MS` (default 100); if it lags, lower it. `play-audio` doesn't report its position, so this offset covers its start-up delay.
+
+Before 0.8, a separate speech recogniser (Whistle) listened to each line to find the words. Kokoro's own timings are more accurate, cover all nine languages instead of four, use no extra processing, and take about 70 MB less space. Updating removes Whistle.
 
 ## Use it from other apps
 
@@ -191,12 +199,15 @@ kokoro --uninstall   # remove the container, the command, settings and helper sc
 
 Kokoro's Python packages (`onnxruntime`, `espeakng-loader`, `soundfile`) only ship builds for standard Linux (glibc). Termux uses Android's own C library, so they can't run there directly. The installer therefore creates a small Debian container called `kokoro` with `proot-distro`, and runs Kokoro inside it. The parts:
 
-- **`kokoro`** (Termux side): reads your text, starts or uses the server, and plays the audio with `play-audio`.
+- **`kokoro`** (Termux side): reads your text, starts or uses the server, and hands each run to the player.
+- **`player.sh` and `tui.sh`** (Termux side): play the audio with `play-audio`, and draw the reader, home screen and settings.
 - **`engine.py`** (inside Debian): splits the text into sentences and runs Kokoro. With `-p` it hands back audio one chunk at a time, so playback starts after the first sentence.
-- **`words.py`** (inside Debian): runs Whistle on each chunk in a separate thread and matches its words to the text, for the highlight.
+- **`words.py`** (inside Debian): turns Kokoro's per-sound timings into word timings, for the highlight.
 - **Sharing files:** the two sides exchange text and audio through `$PREFIX/tmp`, which the container sees as `/tmp`.
 
-The installer only keeps what's needed in the container. It skips documentation and man pages, and clears the apt and pip download caches after installing. The model is the 8-bit (int8) version, about 92 MB, plus about 28 MB of voices.
+The installer only keeps what's needed in the container. It skips documentation and man pages, and clears the apt and pip download caches after installing. The model is the 8-bit timestamped export from onnx-community (92 MB, pinned to one version), plus about 28 MB of voices.
+
+**Why not run natively in Termux?** Termux now packages onnxruntime, numpy, espeak and libsndfile, but kokoro-onnx's own dependencies still can't be installed there. `espeakng-loader` ships only glibc builds. `phonemizer` needs `segments`, which needs the `regex` C extension, and `soundfile` needs `cffi`; Termux packages neither, so both would have to be compiled on the phone. Until that's simpler, and can be tested on a real device, the container stays.
 
 ## Troubleshooting
 
@@ -214,10 +225,11 @@ The files in `src/` are the source. `./build.sh` bundles them into the single `i
 | File | What it is |
 |---|---|
 | `src/kokoro` | the `kokoro` command (Termux side) |
-| `src/tui.sh` | the full-screen reader and home screen, installed to `$PREFIX/share/kokomux/` |
+| `src/player.sh` | playing a text: highlights, controls, bookmarks, chapters, sleep timer (Termux side) |
+| `src/tui.sh` | the full-screen reader, home screen and settings (Termux side) |
 | `src/engine.py` | Kokoro engine, server, web-page reader and model downloader (container side) |
-| `src/words.py` | word timings: Whistle, the matching, and the cache (container side) |
-| `tests/test_words.py` | tests for the matching: `python3 tests/test_words.py` |
+| `src/words.py` | word timings from Kokoro's per-sound timings (container side) |
+| `tests/test_words.py` | tests for word timings, on recorded Kokoro output: `python3 tests/test_words.py` |
 | `tests/test_books.py` | tests for reading EPUB, PDF and text: `python3 tests/test_books.py` |
 | `src/setup-container.sh` | installs everything inside the container |
 | `src/install.sh` | installer template (UI, checks, steps) |

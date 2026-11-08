@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.7.0"
+KOKOMUX_VERSION="0.8.0"
 DISTRO=kokoro
 
 ASSUME_YES=0; VERBOSE=0
@@ -275,7 +275,7 @@ else
 fi
 
 free_kb="$(df -Pk "$HOME" 2>/dev/null | awk 'NR == 2 { print $4 }')" || true
-need_mb=700; [ "$MODE" = update ] && need_mb=200
+need_mb=600; [ "$MODE" = update ] && need_mb=200
 if [[ "${free_kb:-}" =~ ^[0-9]+$ ]]; then
   free_mb=$(( free_kb / 1024 ))
   if [ "$free_mb" -ge 1024 ]; then free_h="$(awk "BEGIN { printf \"%.1f GB\", $free_mb / 1024 }")"; else free_h="$free_mb MB"; fi
@@ -305,11 +305,10 @@ fi
 if [ "$MODE" = install ]; then
   heading "Here's the plan"
   bullet "A small Debian system to run Kokoro in"
-  bullet "Python, Kokoro and 54 voices (a 250 MB download)"
-  bullet "Whistle, which lights up each word as it's read"
+  bullet "Python, Kokoro and 54 voices (a 200 MB download)"
   bullet "The kokoro command, plus Share and widget shortcuts"
   blank
-  wrap "  " "${D}Takes 5–15 minutes and about 700 MB. You can use your phone meanwhile; it stays awake until done.${R}"
+  wrap "  " "${D}Takes 5–15 minutes and about 600 MB. You can use your phone meanwhile; it stays awake until done.${R}"
 else
   if [ "$OLD_VERSION" = "$KOKOMUX_VERSION" ]; then
     heading "Reinstalling kokomux v$KOKOMUX_VERSION"
@@ -369,9 +368,14 @@ APP = os.path.dirname(os.path.abspath(__file__))
 if APP not in sys.path:
     sys.path.insert(0, APP)   # words.py lives beside this file
 MODELS = os.path.join(APP, "models")
-MODEL = os.path.join(MODELS, "kokoro-v1.0.int8.onnx")
+# Kokoro 82M v1.0, 8-bit, exported with a "durations" output: it reports when each
+# sound is spoken, which is what lights up each word. Pinned to a commit.
+MODEL = os.path.join(MODELS, "kokoro-v1.0-timestamped.int8.onnx")
+MODEL_SRC = ("https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX-timestamped/resolve/"
+             "dd4401a9add81ac692d20e240d22ec9dda82cc29/onnx/model_quantized.onnx")
+OLD_MODEL = os.path.join(MODELS, "kokoro-v1.0.int8.onnx")   # before 0.8: no timings
 VOICES = os.path.join(MODELS, "voices-v1.0.bin")
-MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
+VOICES_SRC = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
 SERVER_DIR = "/tmp/kokoro-server"
 JOB_DIR_RE = re.compile(r"^/tmp/kokoro\.[A-Za-z0-9]+$")
 FORMATS = ("wav", "mp3", "ogg", "flac")
@@ -404,8 +408,22 @@ def tts():
     with _tts_lock:
         if _tts is None:
             from kokoro_onnx import Kokoro
-            _tts = Kokoro(MODEL, VOICES)
+            model = MODEL if os.path.exists(MODEL) else OLD_MODEL
+            _tts = Kokoro(model, VOICES)
+            # kokoro-onnx looks for an output called "duration"; this export calls it
+            # "durations". It's the second output either way, which is what it reads.
+            _tts.has_timings = len(_tts.sess.get_outputs()) > 1
     return _tts
+
+
+def phonemize_many(words, lang):
+    """Each word's phonemes on its own, the way Kokoro phonemises (call under SYNTH_LOCK)."""
+    import phonemizer
+    from kokoro_onnx.tokenizer import Tokenizer
+    vocab = tts().tokenizer.vocab
+    out = phonemizer.phonemize([Tokenizer.normalize_text(w) for w in words], lang,
+                               preserve_punctuation=True, with_stress=True)
+    return ["".join(ch for ch in p if ch in vocab) for p in out]
 
 
 # ------------------------------------------------------------------ text
@@ -459,6 +477,7 @@ class _Extractor(HTMLParser):
         self.block = None
         self.buf = []
         self.blocks = []  # (in_article, text)
+        self.heading = ""  # the first heading: an EPUB chapter's title
         self.title = ""
         self.in_title = False
         self.done = False
@@ -513,6 +532,8 @@ class _Extractor(HTMLParser):
                 self.done = True
             else:
                 self.blocks.append((self.article > 0, t))
+                if self.block in self.HEADINGS and not self.heading:
+                    self.heading = t
         self.buf = []
         self.block = None
 
@@ -559,7 +580,7 @@ def fetch_url(url):
 # ------------------------------------------------------------------ books
 
 def read_epub(path, name):
-    """An EPUB's (title, text): its chapters in reading order, as the reader sees them."""
+    """An EPUB's (title, [(chapter title, text)]): its chapters in reading order."""
     import posixpath
     import xml.etree.ElementTree as ET
 
@@ -591,14 +612,14 @@ def read_epub(path, name):
                 ex.feed(z.read(inner).decode("utf-8", "replace"))
                 chapter = ex.text(with_title=False)
                 if chapter.strip():
-                    parts.append(chapter)
+                    parts.append((ex.heading or f"Part {len(parts) + 1}", chapter))
     except JobError:
         raise
     except (KeyError, StopIteration, zipfile.BadZipFile, ET.ParseError) as e:
         raise JobError(f"Couldn't read that EPUB ({type(e).__name__})") from None
     if not parts:
         raise JobError("That EPUB has no readable text")
-    return (title or "").strip() or name, "\n\n".join(parts)
+    return (title or "").strip() or name, parts
 
 
 def read_pdf(path, name):
@@ -630,16 +651,18 @@ def read_pdf(path, name):
         sentences.append(buf)
     if not sentences:
         raise JobError("That PDF has no text to read (is it a scan?)")
-    return str(title).strip() or name, "\n".join(sentences)
+    title = str(title).strip() or name
+    return title, [(title, "\n".join(sentences))]
 
 
 def read_source(jobdir, job):
-    """What a job reads, as (title, text): a web page, or a file that is an EPUB,
-    a PDF or plain text."""
+    """What a job reads, as (title, [(chapter title, text)]): a web page, or a file
+    that is an EPUB, a PDF or plain text. Only an EPUB has more than one chapter."""
     name = job.get("name", "")
     if job.get("url"):
         log(f"Fetching {job['url']}")
-        return fetch_url(job["url"])
+        title, text = fetch_url(job["url"])
+        return title, [(title, text)]
     file = job.get("file", "in.txt")
     if "/" in file:
         raise JobError(f"Bad input file name: {file}")
@@ -649,13 +672,13 @@ def read_source(jobdir, job):
     if head.startswith(b"%PDF"):
         return read_pdf(path, name)
     if head.startswith(b"PK") and zipfile.is_zipfile(path):
-        return read_epub(path, name)
+        return read_epub(path, name)   # already chapters
     with open(path, encoding="utf-8", errors="replace") as fh:
         text = fh.read()
     bad = text.count("\ufffd") + text.count("\x00")
     if text and bad > max(3, len(text) // 100):
         raise JobError("That doesn't look like text, an EPUB or a PDF")
-    return name, text
+    return name, [(name, text)]
 
 
 # ------------------------------------------------------------------ jobs
@@ -700,21 +723,32 @@ def run_job(path):
         out = os.path.join(jobdir, out)
 
     stream = None
-    aligner = None
+    timed = False
     if job.get("stream") == "1":
         stream = os.path.join(jobdir, "stream")
         os.makedirs(stream, exist_ok=True)
-        if job.get("words") == "1":
-            aligner = WordAligner(stream, lang)
+        # Word timings come from Kokoro itself, with the audio.
+        timed = job.get("words") == "1" and engine.has_timings
+        if job.get("words") == "1" and not timed:
+            _write_atomic(os.path.join(stream, "words-off"), "this model reports no timings (kokoro --update)\n")
 
     writer = None
     total = 0.0
     try:
-        title, text = read_source(jobdir, job)
+        title, chapters = read_source(jobdir, job)
         _write_atomic(os.path.join(jobdir, "title"), (title or "").replace("\n", " ")[:120] + "\n")
-        chunks = split_text(text)
+        # Each chapter is split on its own, so a part never runs across chapters, and
+        # where each chapter starts is written down for the player's chapter list.
+        chunks, starts = [], []
+        for heading, text in chapters:
+            parts = split_text(text)
+            if parts:
+                starts.append(f"{len(chunks) + 1}\t{heading.replace(chr(9), ' ').replace(chr(10), ' ')[:80]}")
+                chunks += parts
         if not chunks:
             raise JobError("No text to read")
+        if len(starts) > 1:
+            _write_atomic(os.path.join(jobdir, "chapters"), "\n".join(starts) + "\n")
         try:
             first = int(job.get("start", "1"))
         except ValueError:
@@ -734,16 +768,22 @@ def run_job(path):
                 raise JobError("Cancelled")
             _write_atomic(os.path.join(jobdir, "progress"), f"{i} {len(chunks)}\n")
             with SYNTH_LOCK:
-                samples, rate = engine.create(chunk, voice=voice, speed=speed, lang=lang)
+                if timed:
+                    import words
+                    samples, rate, timings = engine.create_timed(chunk, voice=voice, speed=speed, lang=lang)
+                    marks = words.words_from_timings(chunk, timings, lambda ws: phonemize_many(ws, lang))
+                else:
+                    samples, rate = engine.create(chunk, voice=voice, speed=speed, lang=lang)
             total += len(samples) / rate
             if stream:
-                # The text first, so the player can show the line the moment its audio lands.
+                # The text and its word timings first, so the player has them the
+                # moment the audio lands.
                 _write_atomic(os.path.join(stream, f"{i:04d}.txt"), chunk)
+                if timed:
+                    _write_atomic(os.path.join(stream, f"{i:04d}.words"), words.player_rows(chunk, marks))
                 tmp = os.path.join(stream, f"{i:04d}.tmp.wav")
                 sf.write(tmp, samples, rate)
                 os.replace(tmp, os.path.join(stream, f"{i:04d}.wav"))
-                if aligner:
-                    aligner.add(i, chunk, samples, rate)
             if out:
                 # Written as it's made, so a whole book never has to fit in memory.
                 if writer is None:
@@ -756,8 +796,6 @@ def run_job(path):
             writer.close()
         if stream and os.path.isdir(stream):
             open(os.path.join(stream, "end"), "w").close()
-        if aligner:
-            aligner.finish()   # timings for any line not yet heard
 
     elapsed = time.time() - t0
     _write_atomic(os.path.join(jobdir, "result"), f"{total:.1f} {elapsed:.1f} {len(chunks)}\n")
@@ -785,86 +823,6 @@ def _write_atomic(path, text):
         os.replace(path + ".tmp", path)
     except OSError:
         pass  # the job folder vanished (cancelled); the loop will notice
-
-
-# ------------------------------------------------------------------ word timings
-
-class WordAligner(threading.Thread):
-    """Times the words of a job's lines with Whistle, on the CPU beside speech, and
-    publishes each line as stream/NNNN.words the moment it lands; the player lights
-    the spoken word from those files. It works from the line being heard (the
-    player keeps stream/playing up to date) and drops lines already heard, so a
-    job never waits on timings nobody will see."""
-
-    def __init__(self, stream, lang):
-        super().__init__(daemon=True)
-        self.stream, self.lang = stream, lang
-        self.pending, self.done = {}, False
-        self.cond = threading.Condition()
-        self.off = None
-        try:
-            import words
-            self.words = words
-            if not words.available():
-                self.off = "Whistle isn't installed (run kokoro --update)"
-            elif not words.supported(lang):
-                self.off = f"Whistle doesn't transcribe {lang}"
-        except ImportError:
-            self.off = "word timings aren't installed (run kokoro --update)"
-        if self.off:
-            _write_atomic(os.path.join(stream, "words-off"), self.off + "\n")
-        else:
-            self.start()
-
-    def add(self, i, text, samples, rate):
-        if self.off:
-            return
-        with self.cond:
-            self.pending[i] = (text, samples, rate)
-            self.cond.notify()
-
-    def finish(self):
-        if self.off:
-            return
-        with self.cond:
-            self.done = True
-            self.cond.notify()
-        self.join()
-
-    def _playing(self):
-        try:
-            with open(os.path.join(self.stream, "playing")) as fh:
-                return int(fh.read().strip() or 1)
-        except (OSError, ValueError):
-            return 1
-
-    def _next(self):
-        """The line being heard, or the next one after it; None once every line
-        left has already been heard."""
-        playing = self._playing()
-        for i in [i for i in self.pending if i < playing]:
-            del self.pending[i]
-        return min(self.pending) if self.pending else None
-
-    def run(self):
-        while True:
-            with self.cond:
-                while not self.pending and not self.done:
-                    self.cond.wait()
-                i = self._next()
-                if i is None:
-                    if self.done:
-                        return
-                    continue
-                text, samples, rate = self.pending.pop(i)
-            if not os.path.isdir(self.stream):
-                return   # cancelled
-            try:
-                data = self.words.line_words(text, samples, rate, self.lang)
-            except Exception as e:  # noqa: BLE001 - one bad line must not stop the others
-                log(f"Word timings, line {i}: {type(e).__name__}: {e}")
-                data = self.words.empty_result("error")
-            _write_atomic(os.path.join(self.stream, f"{i:04d}.words"), self.words.player_rows(text, data))
 
 
 # ------------------------------------------------------------------ server
@@ -966,8 +924,8 @@ def serve(port, idle):
 
 def download():
     os.makedirs(MODELS, exist_ok=True)
-    for name, label in (("kokoro-v1.0.int8.onnx", "model"), ("voices-v1.0.bin", "voices")):
-        dest = os.path.join(MODELS, name)
+    for dest, src, label in ((MODEL, MODEL_SRC, "model"), (VOICES, VOICES_SRC, "voices")):
+        name = os.path.basename(dest)
         if os.path.exists(dest) and os.path.getsize(dest) > 0:
             print(f"@@progress {label} 100 0 0")
             print(f"{name}: already downloaded", flush=True)
@@ -975,7 +933,7 @@ def download():
         part = dest + ".part"
         for attempt in range(1, 6):
             have = os.path.getsize(part) if os.path.exists(part) else 0
-            req = urllib.request.Request(MODEL_URL + name, headers={"User-Agent": USER_AGENT})
+            req = urllib.request.Request(src, headers={"User-Agent": USER_AGENT})
             if have:
                 req.add_header("Range", f"bytes={have}-")
             try:
@@ -1000,6 +958,8 @@ def download():
                 time.sleep(2 * attempt)
         else:
             sys.exit(f"Couldn't download {name}. Run the installer again to resume.")
+    if os.path.exists(OLD_MODEL):
+        os.remove(OLD_MODEL)   # the timestamped model replaces it (saves 88 MB)
 
 
 # ------------------------------------------------------------------ voices
@@ -1062,7 +1022,6 @@ def main():
     v.add_argument("--default", default="")
     v.add_argument("--color", action="store_true", help="colour even when piped")
     sub.add_parser("download")
-    sub.add_parser("whistle", help="fetch and load Whistle once (word timings)")
     a = p.parse_args()
 
     if a.cmd == "job":
@@ -1080,11 +1039,6 @@ def main():
             print_voices(names, a.width, a.default)
     elif a.cmd == "download":
         download()
-    elif a.cmd == "whistle":
-        import words
-        t0 = time.time()
-        words.load()
-        print(f"Whistle ready ({words.engine_name()}, {time.time() - t0:.1f}s)")
 
 
 if __name__ == "__main__":
@@ -1092,358 +1046,32 @@ if __name__ == "__main__":
 __KOKOMUX_ENGINE__
 
 cat > "$WORK/words.py" <<'__KOKOMUX_WORDS__'
-"""Word timings for spoken lines, from Whistle (Cactus Compute).
+"""Word timings for spoken lines: which word is being said, and when.
 
 Runs inside the "kokoro" Debian container, next to engine.py.
 
-  Recognise  Whistle transcribes a rendered line and returns each word it heard
-             with start and end times.
-  Match      Whistle is not a forced aligner, so its words are paired with the
-             line's own words by an edit-distance alignment. Numbers match their
-             spoken form ("60" <-> "sixty"), hyphenated words are matched as one
-             ("worn-out" <-> "wornout"), and a respelled name takes the run of
-             words the voice said for it ("Igdrasil" <-> "Igg Dressel").
-  Store      Each line's result is cached as <audio_hash>.words.json:
-             {v, engine, confidence, words: [{s, e, a, b, p}]} where s/e are the
-             start and end in ms, a/b the character range in the line's text,
-             and p the recogniser's confidence in that word.
+Kokoro reports how long it spends on every sound it makes (the timestamped
+model's "durations" output, read by kokoro-onnx as per-phoneme timings). Each
+word of the line is phonemised on its own, and its sounds are lined up against
+the sounds Kokoro actually spoke, so a word takes exactly the times of the
+phonemes it became. No speech recogniser is needed, and it works in every
+language Kokoro speaks.
 
-The matching is a port of light-novel-studio's apps/server/src/words.ts.
+A line's result has the shape {v, engine, confidence, words: [{s, e, a, b, p}]}:
+s/e are the start and end in ms, a/b the character range in the line's text,
+and p the confidence (the share of the word's sounds that lined up).
 """
-import hashlib
-import json
-import os
 import re
-import threading
 
-LINE_WORDS_VERSION = 1
-# Below this, a line's transcript disagrees with its text too much to trust:
-# it gets no highlight rather than a wrong one.
+LINE_WORDS_VERSION = 2
+# Below this, too few of a line's sounds lined up to trust: it gets no highlight
+# rather than a wrong one.
 WORDS_MIN_CONFIDENCE = 0.35
-# Languages Whistle transcribes. Anything else would come back as a detected,
-# useless transcript, so it isn't attempted.
-SUPPORTED = {"en", "de", "fr", "es", "it", "nl", "pl"}
-CACHE_DIR = "/opt/kokoro/cache/words"
-# The longest audio given to Whistle in one pass. Measured with cactus-compute 4.1:
-# one pass transcribes 90 s of speech completely, but 120 s comes back cut off at
-# ~96 s. Longer lines are cut at their quietest moment into pieces no longer than
-# this (one pass is ~10x faster than Whistle's streaming API).
-ONE_PASS_MAX_S = 60.0
-RATE = 16000     # Whistle listens at 16 kHz
-
-os.environ.setdefault("CACTUS_TELEMETRY", "0")   # kokomux talks to nobody it doesn't have to
-os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-
-
-# ---------------------------------------------------------------- the words of a line
-
-_TOKEN = re.compile(r"<[^>\n]*>|[^\W\d_][\w'’]*|\d+")
-
-
-def supported(language):
-    """Whistle's code for a language ("en-us" -> "en"), or None if it can't transcribe it."""
-    code = (language or "")[:2].lower()
-    return code if code in SUPPORTED else None
 
 
 def empty_result(engine):
-    """Timings for a line that has none usable: never lit, and never transcribed again."""
+    """Timings for a line that has none usable: nothing is lit."""
     return {"v": LINE_WORDS_VERSION, "engine": engine, "confidence": 0, "words": []}
-
-
-def word_tokens(text):
-    """The line's words as (start, end, word), by character. Inline tags are not words,
-    and neither is a hyphen: "worn-out" is two words, as it is to a recogniser."""
-    return [(m.start(), m.end(), m.group()) for m in _TOKEN.finditer(text) if not m.group().startswith("<")]
-
-
-_NUMBERS = {
-    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
-    "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
-    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20, "thirty": 30,
-    "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90, "hundred": 100,
-    "thousand": 1000,
-}
-_ORDINALS = {
-    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7, "eighth": 8,
-    "ninth": 9, "tenth": 10, "eleventh": 11, "twelfth": 12, "thirteenth": 13, "fourteenth": 14,
-    "fifteenth": 15, "sixteenth": 16, "seventeenth": 17, "eighteenth": 18, "nineteenth": 19,
-    "twentieth": 20, "thirtieth": 30, "fortieth": 40, "fiftieth": 50, "sixtieth": 60, "seventieth": 70,
-    "eightieth": 80, "ninetieth": 90,
-}
-
-
-def word_key(word):
-    """What a word means for matching: "60", "60." and "sixty" are all #60."""
-    t = re.sub(r"[^a-z0-9]", "", word.lower())
-    m = re.fullmatch(r"(\d{1,6})(?:st|nd|rd|th)?", t)
-    if m:
-        return f"#{int(m.group(1))}"
-    if t in _NUMBERS:
-        return f"#{_NUMBERS[t]}"
-    if t in _ORDINALS:
-        return f"#{_ORDINALS[t]}"
-    return re.sub(r"[^\w']|_", "", word.lower().replace("’", "'"))
-
-
-def align_pairs(written, spoken):
-    """For each written word, the index of the spoken word it is, or None.
-
-    Edit-distance alignment (match 0, substitute 1, skip 1) that prefers pairing
-    over skipping, so one dropped or inserted word resyncs the rest of the line
-    instead of sliding every later word."""
-    n, m = len(written), len(spoken)
-    dp = [[0] * (m + 1) for _ in range(n + 1)]
-    for i in range(1, n + 1):
-        dp[i][0] = i
-    for j in range(1, m + 1):
-        dp[0][j] = j
-    for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            pair = dp[i - 1][j - 1] + (0 if written[i - 1] == spoken[j - 1] else 1)
-            dp[i][j] = min(pair, dp[i - 1][j] + 1, dp[i][j - 1] + 1)
-    pairs = [None] * n
-    i, j = n, m
-    while i > 0 and j > 0:
-        same = written[i - 1] == spoken[j - 1]
-        if dp[i][j] == dp[i - 1][j - 1] + (0 if same else 1):
-            pairs[i - 1] = j - 1   # keep a substituted word pinned to its own moment
-            i, j = i - 1, j - 1
-        elif dp[i][j] == dp[i - 1][j] + 1:
-            i -= 1                 # a written word the recogniser never returned
-        else:
-            j -= 1                 # a spoken word with nothing written for it
-    return pairs
-
-
-def _units(written, text):
-    """Hyphen-joined words matched as one unit ("worn-out" is "wornout" to a recogniser)."""
-    out = []
-    for i, (s, _e, _w) in enumerate(written):
-        if out and text[written[i - 1][1]:s] == "-":
-            out[-1].append(i)
-        else:
-            out.append([i])
-    return out
-
-
-def map_words(display, asr, engine):
-    """A line's recogniser output as timings for the words in its text, or None.
-
-    asr is Whistle's word list: [{"word", "start", "end", "probability"}], seconds.
-    A recognised word takes its own times; the rest share out the time between the
-    words around them, by length, with p = 0. Windows stay in order, never overlap
-    and are never empty, so exactly one word is lit at a time."""
-    written = word_tokens(display)
-    if not written or not asr:
-        return None
-    groups = _units(written, display)
-
-    def key(group):
-        return "".join(word_key(written[i][2]) for i in group)
-
-    spoken = [word_key(w["word"]) for w in asr]
-    pairs = align_pairs([key(g) for g in groups], spoken)
-    times = [None] * len(written)   # (from_ms, to_ms, p)
-
-    def put(group, start, end, p):
-        """Shares one window across the written words it covers, by length."""
-        weight = sum(len(written[i][2]) for i in group) or 1
-        cursor = start
-        for i in group:
-            share = (end - start) * len(written[i][2]) / weight
-            times[i] = (cursor, cursor + share, p)
-            cursor += share
-
-    claimed = {j for j in pairs if j is not None}
-    exact = matched = 0
-    sure = 0.0
-    for g, j in enumerate(pairs):
-        if j is None:
-            continue
-        w = asr[j]
-        first = last = j
-        same = key(groups[g]) == spoken[j]
-        # A word the recogniser didn't quite agree with has usually swallowed its
-        # neighbours ("Igdrasil" heard as "Igg Dressel"): it takes any spoken words
-        # beside it that nothing else claimed.
-        if not same:
-            while first > 0 and first - 1 not in claimed:
-                first -= 1
-                claimed.add(first)
-            while last + 1 < len(asr) and last + 1 not in claimed:
-                last += 1
-                claimed.add(last)
-        prob = float(w.get("probability", 0))
-        put(groups[g], asr[first]["start"] * 1000, asr[last]["end"] * 1000, prob)
-        matched += 1
-        sure += prob
-        exact += same
-    if not matched:
-        return None
-
-    mean = sum(max(0.0, w["end"] - w["start"]) for w in asr) / len(asr) * 1000
-
-    def spread(run, at, until):
-        """Words between two recognised ones share the time between them."""
-        weight = sum(len(key(g)) + 1 for g in run)
-        room = max(0.0, until - at)
-        cursor = at
-        for g in run:
-            share = room * (len(key(g)) + 1) / weight if room > 0 else mean
-            put(g, cursor, cursor + max(40.0, share), 0.0)
-            cursor += max(40.0, share)
-
-    anchors = [g for g, j in enumerate(pairs) if j is not None]
-    first, last = anchors[0], anchors[-1]
-    if first > 0:
-        spread(groups[:first], 0.0, times[groups[first][0]][0])
-    for k in range(len(anchors) - 1):
-        a, b = groups[anchors[k]], groups[anchors[k + 1]]
-        spread(groups[anchors[k] + 1:anchors[k + 1]], times[a[0]][1], times[b[0]][0])
-    if last < len(groups) - 1:
-        start = times[groups[last][-1]][1]
-        spread(groups[last + 1:], start, start + mean * (len(groups) - 1 - last))
-
-    words = []
-    floor = 0
-    for i, (a, b, _w) in enumerate(written):
-        t = times[i] or (floor, floor + mean, 0.0)
-        s = max(floor, round(max(0.0, t[0])))
-        nxt = times[i + 1][0] if i + 1 < len(written) and times[i + 1] else None
-        ceiling = float("inf") if nxt is None else max(s + 1, round(nxt))
-        e = min(max(s + 1, round(t[1])), ceiling)
-        words.append({"s": int(s), "e": int(e), "a": a, "b": b, "p": round(t[2], 3)})
-        floor = e
-
-    return {
-        "v": LINE_WORDS_VERSION,
-        "engine": engine,
-        "confidence": round(exact / len(groups) * (sure / matched), 3),
-        "words": words,
-    }
-
-
-# ---------------------------------------------------------------- recognising
-
-_model = None
-_model_lock = threading.Lock()
-
-
-def engine_name():
-    try:
-        import importlib.metadata
-        return "whistle-" + importlib.metadata.version("cactus-compute")
-    except Exception:
-        return "whistle"
-
-
-def available():
-    import importlib.util
-    return importlib.util.find_spec("cactus") is not None
-
-
-def load():
-    """Whistle, loaded once. Offline first: once its engine and weights are cached
-    (the installer fetches them), it needs no network, which a phone often lacks.
-    Only if something isn't cached yet does it go online to fetch it."""
-    global _model
-    with _model_lock:
-        if _model is None:
-            import huggingface_hub.constants as hub
-            from cactus.agent.whistle import Whistle
-            online = hub.HF_HUB_OFFLINE
-            hub.HF_HUB_OFFLINE = True
-            try:
-                _model = Whistle()
-            except Exception:
-                hub.HF_HUB_OFFLINE = online
-                _model = Whistle()
-            finally:
-                hub.HF_HUB_OFFLINE = online
-    return _model
-
-
-def to_16k(samples, rate):
-    """Kokoro renders 24 kHz; Whistle listens at 16 kHz."""
-    import numpy as np
-    x = np.asarray(samples, dtype=np.float32).reshape(-1)
-    if rate == RATE or not len(x):
-        return x
-    n = int(len(x) * RATE / rate)
-    return np.interp(np.linspace(0, len(x) - 1, n), np.arange(len(x)), x).astype(np.float32)
-
-
-def quiet_cuts(x, longest=ONE_PASS_MAX_S, search=10.0, frame=0.05):
-    """Where to cut 16 kHz audio so no piece is longer than `longest` seconds: at the
-    quietest 50 ms in the last `search` seconds before each limit, which is almost
-    always a pause between words. Returns the piece boundaries in samples."""
-    import numpy as np
-    step, cuts, start = int(RATE * frame), [0], 0
-    while len(x) - start > longest * RATE:
-        lo, hi = start + int((longest - search) * RATE), start + int(longest * RATE)
-        frames = x[lo:hi][: (hi - lo) // step * step].reshape(-1, step)
-        start = lo + int(np.argmin((frames ** 2).mean(axis=1))) * step + step // 2
-        cuts.append(start)
-    return cuts + [len(x)]
-
-
-def recognise(samples, rate, language):
-    """Whistle's words for one line: [{"word", "start", "end", "probability"}],
-    seconds from the start of the line."""
-    model = load()
-    x = to_16k(samples, rate)
-    cuts = quiet_cuts(x)
-    words = []
-    for a, b in zip(cuts, cuts[1:]):
-        out = model.transcribe(x[a:b], language=supported(language), word_timestamps=True)
-        for w in out.get("words") or []:
-            words.append({**w, "start": w["start"] + a / RATE, "end": w["end"] + a / RATE})
-    return words
-
-
-# ---------------------------------------------------------------- the cache
-
-def audio_hash(samples):
-    import numpy as np
-    return hashlib.sha256(np.asarray(samples, dtype=np.float32).tobytes()).hexdigest()[:20]
-
-
-def cache_path(h):
-    return os.path.join(CACHE_DIR, f"{h}.words.json")
-
-
-def read_cached(h):
-    try:
-        with open(cache_path(h), encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if data.get("v") == LINE_WORDS_VERSION else None   # an old mapping is redone
-    except (OSError, ValueError):
-        return None
-
-
-def write_cached(h, data):
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    tmp = cache_path(h) + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, separators=(",", ":"))
-    os.replace(tmp, cache_path(h))
-
-
-def line_words(text, samples, rate, language):
-    """The cached or freshly made timings for one rendered line. A line whose
-    transcript doesn't match is cached too (confidence 0), so it is never
-    transcribed twice for the same answer."""
-    h = audio_hash(samples)
-    cached = read_cached(h)
-    if cached is not None:
-        return cached
-    if supported(language):
-        data = map_words(text, recognise(samples, rate, language), engine_name()) or empty_result(engine_name())
-    else:
-        data = empty_result("none")
-    write_cached(h, data)
-    return data
 
 
 def player_rows(text, data):
@@ -1468,6 +1096,74 @@ def byte_ranges(text, words):
         pos = w["b"]
         out.append((a, byte))
     return out
+
+
+# ---------------------------------------------------------------- Kokoro's own timings
+
+# Not sounds: spaces, stress marks and the punctuation espeak passes through.
+_SILENT = set(" ˈˌ;:,.!?¡¿—…\"«»“”()'-")
+# Stripped from the ends of a token to find the word to highlight (any script).
+_EDGE_PUNCT = "\"'“”‘’«»()[]{}<>.,;:!?¡¿…—–-、。，！？：；（）「」『』।॥"
+# Split points inside a token for scripts written without spaces.
+_CJK_BREAK = re.compile(r"(?<=[、。，！？：；])")
+
+
+def _tokens(text):
+    """The words to highlight: whitespace-separated tokens (also split after CJK
+    punctuation), with punctuation trimmed from their ends, as (start, end)."""
+    out = []
+    for m in re.finditer(r"\S+", text):
+        pos = m.start()
+        for part in _CJK_BREAK.split(m.group()):
+            core = part.strip(_EDGE_PUNCT)
+            if core:
+                a = pos + part.index(core)
+                out.append((a, a + len(core)))
+            pos += len(part)
+    return out
+
+
+def words_from_timings(text, timings, phonemize_many):
+    """Word timings for a line from Kokoro's own per-phoneme timings.
+
+    Each word is phonemised on its own, and its sounds are lined up against the
+    sounds Kokoro actually spoke (stress marks, spaces and punctuation aside), so
+    a word takes the times of exactly the phonemes it became. This survives
+    espeak running words together in a sentence ("in the" -> one spoken word)
+    and expanding numbers ("1999" -> three). Confidence is the share of sounds
+    that lined up. Returns the same shape as the cache: {v, engine, confidence, words}."""
+    import difflib
+
+    tokens = _tokens(text)
+    spoken = [t for t in timings if t.phoneme not in _SILENT]
+    if not tokens or not spoken:
+        return empty_result("kokoro")
+    per = phonemize_many([text[a:b] for a, b in tokens])
+    mine, owner = [], []                       # each token's sounds, end to end
+    for i, p in enumerate(per):
+        for ch in p:
+            if ch not in _SILENT:
+                mine.append(ch)
+                owner.append(i)
+    said = [t.phoneme for t in spoken]
+    match = [None] * len(mine)                 # the spoken sound each of mine lined up with
+    blocks = difflib.SequenceMatcher(None, mine, said, autojunk=False).get_matching_blocks()
+    for blk in blocks:
+        for k in range(blk.size):
+            match[blk.a + k] = blk.b + k
+    matched = sum(m is not None for m in match)
+    confidence = round(matched / max(len(mine), len(said)), 3) if mine else 0.0
+    words, floor = [], 0
+    for i, (a, b) in enumerate(tokens):
+        hits = [match[k] for k in range(len(mine)) if owner[k] == i and match[k] is not None]
+        if not hits:
+            continue                           # nothing of it lined up: leave it unlit
+        start, end = spoken[min(hits)].start, spoken[max(hits)].end
+        s_ms = max(floor, round(start * 1000))
+        e_ms = max(s_ms + 1, round(end * 1000))
+        words.append({"s": s_ms, "e": e_ms, "a": a, "b": b, "p": confidence})
+        floor = e_ms
+    return {"v": LINE_WORDS_VERSION, "engine": "kokoro", "confidence": confidence, "words": words}
 __KOKOMUX_WORDS__
 
 cat > "$WORK/tui.sh" <<'__KOKOMUX_TUI__'
@@ -1494,7 +1190,8 @@ declare -A TUI_WRAP=() TUI_OFFS=()    # each part's text wrapped to the column, 
 tui_hist=()                           # parts already heard, oldest first
 TUI_PART=0; TUI_PARTS=0; TUI_A=0; TUI_B=0
 TUI_STATE=""; TUI_EXTRA=""; TUI_SYM=""; TUI_PAUSED=0; TUI_TITLE=""; TUI_INFO=""
-TUI_BTN=()                            # clickable buttons: "x0 x1 command"
+TUI_BTN=()                            # clickable buttons: "row x0 x1 command"
+TUI_CHAPTER=""; TUI_HAS_CHAPTERS=0; TUI_BAR=(3 10)   # the progress bar's first column and width
 SYNC_ON=$'\033[?2026h'; SYNC_OFF=$'\033[?2026l'
 
 tui_size() {
@@ -1570,7 +1267,7 @@ tui_wrap() {     # tui_wrap K: part K's text wrapped to the column, once
 }
 
 tui_text() {     # the reading column: what's been heard above, this part, what's next below
-  local top=4 bottom=$(( TH - 4 )) h k j n r idx a hl=0 LC_ALL=C
+  local top=4 bottom=$(( TH - 5 )) h k j n r idx a hl=0 LC_ALL=C
   local -a past=() now_rows=() offs=() next=() rows=()
   h=$(( bottom - top + 1 ))
   if [ "$TUI_PART" = 0 ] || ! tui_wrap "$TUI_PART"; then   # nothing to show yet
@@ -1631,37 +1328,52 @@ tui_row() {      # tui_row TEXT OFFSET: one row of this part, the lit word in th
 }
 
 tui_progress() {
-  local label bar bw filled
-  if [ "$TUI_PARTS" -gt 1 ]; then label="part $TUI_PART of $TUI_PARTS"; else label=""; fi
+  local label bar bw filled ch=$TUI_CHAPTER room
+  if [ "$TUI_PARTS" -gt 1 ]; then label="$TUI_PART/$TUI_PARTS"; else label=""; fi
+  if [ -n "$ch" ]; then                       # the chapter, as long as the bar keeps some room
+    room=$(( TW / 3 )); [ "${#ch}" -gt "$room" ] && ch="${ch:0:$(( room - 1 ))}…"
+    label="$ch · $label"
+  fi
   bw=$(( TW - 6 - ${#label} )); [ "$bw" -ge 4 ] || bw=4
+  TUI_BAR=(3 "$bw")
   filled=0; [ "$TUI_PARTS" -gt 0 ] && filled=$(( TUI_PART * bw / TUI_PARTS ))
   printf -v bar '%*s' "$filled" ''; bar=${bar// /━}
-  printf '\033[%d;1H\033[2K  %s%s%s' $(( TH - 2 )) "$ACC" "$bar" "$R" >&2
+  printf '\033[%d;1H\033[2K  %s%s%s' $(( TH - 3 )) "$ACC" "$bar" "$R" >&2
   printf -v bar '%*s' $(( bw - filled )) ''
   printf '%s%s%s  %s' "$D" "${bar// /─}" "$R" "$label" >&2
 }
 
+tui_button() {   # tui_button ROW X KEY LABEL COMMAND: draw one, remember where it is; X advances
+  local text=" k $4 "                         # (the key glyph is one column, whatever its bytes)
+  printf '\033[%d;%dH\033[48;5;236m %s%s%s\033[48;5;236m %s \033[0m' "$1" "$BX" "$ACC2" "$3" "$R" "$4" >&2
+  TUI_BTN+=("$1 $BX $(( BX + ${#text} - 1 )) $5")
+  BX=$(( BX + ${#text} + 2 ))
+}
+
 tui_footer() {   # the buttons (keys and clicks), and what's happening on the right
-  local x=3 key label cmd text state room
+  local state room
   TUI_BTN=()
   printf '\033[%d;1H\033[2K\033[%d;1H\033[2K' $(( TH - 1 )) "$TH" >&2
-  for spec in "␣|$( [ "$TUI_PAUSED" = 1 ] && echo Play || echo Pause)|toggle" "←|Again|again" "→|Next|next" "q|Stop|quit"; do
-    IFS='|' read -r key label cmd <<< "$spec"
-    text=" k $label "                 # (the key glyph is one column, whatever its bytes)
-    printf '\033[%d;%dH\033[48;5;236m %s%s%s\033[48;5;236m %s \033[0m' "$TH" "$x" "$ACC2" "$key" "$R" "$label" >&2
-    TUI_BTN+=("$x $(( x + ${#text} - 1 )) $cmd")
-    x=$(( x + ${#text} + 2 ))
-  done
+  BX=3
+  tui_button "$TH" "$BX" "␣" "$( [ "$TUI_PAUSED" = 1 ] && echo Play || echo Pause)" toggle
+  tui_button "$TH" "$BX" "←" Again again
+  tui_button "$TH" "$BX" "→" Next next
+  tui_button "$TH" "$BX" q Stop quit
   state="${TUI_SYM:+$TUI_SYM }$TUI_STATE${TUI_EXTRA:+ · $TUI_EXTRA}"
-  room=$(( TW - x - 2 ))
+  room=$(( TW - BX - 2 ))
   if [ "$room" -gt 6 ]; then
     [ "${#state}" -gt "$room" ] && state="${state:0:$(( room - 1 ))}…"
     printf '\033[%d;%dH%s%s%s' "$TH" $(( TW - ${#state} - 1 )) "$D" "$state" "$R" >&2
   fi
+  BX=3                                        # the second row: the rest
+  [ "$TUI_HAS_CHAPTERS" = 1 ] && tui_button $(( TH - 1 )) "$BX" c Chapters chapters
+  tui_button $(( TH - 1 )) "$BX" "−" Slower slower
+  tui_button $(( TH - 1 )) "$BX" "+" Faster faster
+  tui_button $(( TH - 1 )) "$BX" t Sleep sleep
 }
 
 tui_draw() {
-  printf '%s' "$SYNC_ON" >&2
+  printf '%s\033[2J' "$SYNC_ON" >&2         # a full redraw clears what overlays left behind
   tui_header; tui_text; tui_progress; tui_footer
   printf '%s' "$SYNC_OFF" >&2
 }
@@ -1682,15 +1394,59 @@ tui_state() {    # tui_state TEXT EXTRA SYMBOL PAUSED: only the footer is redraw
   tui_footer
 }
 
-tui_click() {    # tui_click REPORT: a left click or tap on a button sets CMD
-  local b x y spec x0 x1 cmd
+tui_click() {    # tui_click REPORT: a left click or tap on a button or the progress bar sets CMD
+  local b x y spec row x0 x1 cmd
   [[ "$1" =~ ^$'\033'\[\<([0-9]+)\;([0-9]+)\;([0-9]+)M$ ]] || return 0
   b=${BASH_REMATCH[1]} x=${BASH_REMATCH[2]} y=${BASH_REMATCH[3]}
-  [ "$b" = 0 ] && [ "$y" = "$TH" ] || return 0
+  [ "$b" = 0 ] || return 0
   for spec in "${TUI_BTN[@]}"; do
-    read -r x0 x1 cmd <<< "$spec"
-    if [ "$x" -ge "$x0" ] && [ "$x" -le "$x1" ]; then CMD=$cmd; return 0; fi
+    read -r row x0 x1 cmd <<< "$spec"
+    if [ "$y" = "$row" ] && [ "$x" -ge "$x0" ] && [ "$x" -le "$x1" ]; then CMD=$cmd; return 0; fi
   done
+  # the progress bar: jump to that point (by part)
+  if [ "$y" = $(( TH - 3 )) ] && [ "$TUI_PARTS" -gt 1 ] && [ "$x" -ge "${TUI_BAR[0]}" ] && [ "$x" -lt $(( TUI_BAR[0] + TUI_BAR[1] )) ]; then
+    CMD="seek:$(( 1 + (x - TUI_BAR[0]) * TUI_PARTS / TUI_BAR[1] ))"
+  fi
+}
+
+tui_chapters() { # tui_chapters CURRENT: pick a chapter over the reading area; CHOSEN = its index or ""
+  local sel=${1:-0} top=0 i y view w x0 key title
+  CHOSEN=""
+  [ "$sel" -ge 0 ] || sel=0
+  local -A rowsel=()
+  while :; do
+    tui_size
+    w=$(( CW < 60 ? CW : 60 )); x0=$(( (TW - w) / 2 )); view=$(( TH - 10 ))
+    [ "${#CH_TITLE[@]}" -lt "$view" ] && view=${#CH_TITLE[@]}          # as tall as it needs to be
+    [ "$sel" -lt "$top" ] && top=$sel
+    [ "$sel" -ge $(( top + view )) ] && top=$(( sel - view + 1 ))
+    printf '%s' "$SYNC_ON" >&2
+    printf '\033[3;%dH\033[48;5;235m%*s\033[3;%dH %sChapters%s\033[48;5;235m' "$x0" "$w" "" "$x0" "$B" "$R" >&2
+    rowsel=()
+    for (( i = top, y = 4; y < 4 + view; i++, y++ )); do
+      printf '\033[%d;%dH\033[48;5;235m%*s' "$y" "$x0" "$w" "" >&2
+      [ "$i" -lt "${#CH_TITLE[@]}" ] || continue
+      title=${CH_TITLE[i]}; [ "${#title}" -gt $(( w - 12 )) ] && title="${title:0:$(( w - 13 ))}…"
+      if [ "$i" = "$sel" ]; then
+        printf '\033[%d;%dH\033[48;5;238m%*s\033[%d;%dH%s›%s\033[48;5;238m %-*s %spart %s\033[0m' "$y" "$x0" "$w" "" "$y" "$x0" \
+          "$ACC" "$R" $(( w - 12 )) "$title" "$D" "${CH_START[i]}" >&2
+      else
+        printf '\033[%d;%dH\033[48;5;235m  %-*s %spart %s\033[0m' "$y" "$x0" $(( w - 12 )) "$title" "$D" "${CH_START[i]}" >&2
+      fi
+      rowsel[$y]=$i
+    done
+    printf '\033[%d;%dH\033[48;5;235m%*s\033[%d;%dH %s↑↓ Enter jump · Esc close%s\033[0m' $(( 4 + view )) "$x0" "$w" "" $(( 4 + view )) "$x0" "$D" "$R" >&2
+    printf '%s' "$SYNC_OFF" >&2
+    KEY=""; tick 0.5; [ -n "$KEY" ] || continue
+    case "$KEY" in
+      $'\033[A'|$'\033OA'|k|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
+      $'\033[B'|$'\033OB'|j|$'\033[<65;'*M) [ "$sel" -lt $(( ${#CH_TITLE[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
+      $'\n'|$'\r') CHOSEN=$sel; break ;;
+      $'\033[<0;'*M) [[ "$KEY" =~ \;([0-9]+)M$ ]] && i=${rowsel[${BASH_REMATCH[1]}]:-} && [ -n "$i" ] && { CHOSEN=$i; break; } ;;
+      $'\033'|q|c) break ;;
+    esac
+  done
+  tui_draw
 }
 
 # ---------------------------------------------------------------- the home screen
@@ -1842,7 +1598,7 @@ TUI_SETTINGS=(
   "out|Save files as|The file name used when you save without -o. The ending picks the format: .wav .mp3 .ogg or .flac."
   "#Reading"
   "KOKORO_TUI|Full-screen reader|Open the full-screen reader when you listen on a terminal. Off: show the text below the command instead."
-  "KOKORO_WORDS|Light up words|Highlight each word as it's spoken (uses Whistle). Off saves a little battery."
+  "KOKORO_WORDS|Light up words|Highlight each word as it's spoken, using the timings Kokoro reports as it speaks, in every language."
   "offset|Highlight timing|Moves the highlight relative to the voice. Raise it if the highlight runs ahead, lower it if it lags."
   "#While listening"
   "KOKORO_NOTIFY|Notification controls|Show a notification with pause, next and again buttons, also on the lock screen. Needs the Termux:API app."
@@ -2072,6 +1828,324 @@ tui_voices() {   # the voice picker: type to filter, Space to hear, Enter to cho
 }
 __KOKOMUX_TUI__
 
+cat > "$WORK/player.sh" <<'__KOKOMUX_PLAYER__'
+# kokomux: the player. Sourced by `kokoro` (bash) once a listening run is set up.
+# shellcheck shell=bash disable=SC2034,SC2154  # shares its globals with kokoro
+#
+#   play_line WAV IDX     plays one part: the inline view or the full-screen
+#                         reader (via the view API below), word highlights,
+#                         pause / next / again, bookmarks and the notification
+#   listen_cmd CMD PART   chapters, speed, the sleep timer and seeking, which
+#                         restart the reading at a part (jump_to)
+#
+# Expects from kokoro: the run's globals (tmpd, play, ui, show_words, voice,
+# speed, lang, name, kind, source, text, book_id, start, i), the colours,
+# status/status_clear, tick, now_ms, write_job and run_engine.
+
+# ------------------------------------------------------------ the line being heard
+# Each line is printed wrapped to the screen while it plays, and a soft
+# highlight moves from word to word. Times come from Kokoro itself via the engine
+# (stream/NNNN.words: "confidence", then "start end a b" per word, with a/b the
+# word's byte range in NNNN.txt). play-audio has no clock to read, so the time
+# is how long it has been playing, less its start-up delay.
+# A line taller than the screen is shown as a window of rows that follows the
+# lit word, then printed in full when it ends.
+
+HL=$'\033[48;5;61m\033[38;5;231m'   # the soft highlight
+blk_lines=(); blk_offs=(); view_top=0; view_h=0
+w_s=(); w_e=(); w_a=(); w_b=(); w_state=none
+TERM_ROWS=24
+in_line=0
+
+part_of() {      # PART="part I of N · " while a job has more than one part
+  local parts=1
+  [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
+  PART=""; [ "${parts:-1}" -gt 1 ] && PART="part $1 of $parts · "
+  return 0
+}
+
+block_load() {   # wrap a line to the screen as it is now, remembering each row's byte offset
+  local LC_ALL=C row off=0 size
+  size="$(stty size 2>/dev/null </dev/tty)" || size=""
+  if [[ "$size" =~ ^([0-9]+)\ ([0-9]+)$ ]]; then TERM_ROWS=${BASH_REMATCH[1]} TERM_COLS=${BASH_REMATCH[2]}; fi
+  blk_lines=(); blk_offs=()
+  while IFS= read -r row; do
+    blk_lines+=("$row"); blk_offs+=("$off"); off=$(( off + ${#row} ))
+  done < <(fold -s -w $(( TERM_COLS - 3 )) "$1"; echo)
+  view_top=0
+  view_h=$(( ${#blk_lines[@]} < TERM_ROWS - 2 ? ${#blk_lines[@]} : TERM_ROWS - 2 ))
+  [ "$view_h" -ge 1 ] || view_h=1
+}
+
+block_draw() {   # block_draw A B: draw the visible rows with bytes A..B lit (A = -1: none lit)
+  local LC_ALL=C a=$1 b=$2 k o row len x y
+  for (( k = view_top; k < view_top + view_h; k++ )); do
+    o=${blk_offs[k]} row=${blk_lines[k]} len=${#blk_lines[k]}
+    printf '\r\033[K  ' >&2
+    if [ "$a" -lt 0 ] || [ $(( o + len )) -le "$a" ]; then
+      printf '%s' "$row" >&2                                  # already spoken
+    elif [ "$o" -ge "$b" ]; then
+      printf '%s%s%s' "$D" "$row" "$R" >&2                    # still to come
+    else
+      x=$(( a > o ? a - o : 0 )); y=$(( b - o < len ? b - o : len ))
+      printf '%s%s%s%s%s%s' "${row:0:x}" "$HL" "${row:x:y-x}" "$R$D" "${row:y}" "$R" >&2
+    fi
+    printf '\n' >&2
+  done
+}
+
+block_redraw() { # back up over the visible rows and draw them again, moving the window to the lit word
+  local a=$1 k=0
+  if [ "$a" -ge 0 ]; then
+    while [ $(( k + 1 )) -lt "${#blk_lines[@]}" ] && [ "${blk_offs[k + 1]}" -le "$a" ]; do k=$(( k + 1 )); done
+    if [ "$k" -lt "$view_top" ] || [ "$k" -ge $(( view_top + view_h )) ]; then
+      view_top=$(( k + view_h > ${#blk_lines[@]} ? ${#blk_lines[@]} - view_h : k ))
+    fi
+  fi
+  printf '\r\033[K\033[%dA' "$view_h" >&2
+  block_draw "$@"
+}
+
+block_finish() { # the whole line as read, nothing lit (it stays on screen as a transcript)
+  printf '\r\033[K\033[%dA' "$view_h" >&2
+  view_top=0; view_h=${#blk_lines[@]}
+  block_draw -1 -1
+}
+
+# The view the player draws through: the full-screen reader or the inline block.
+view_part() {    # view_part IDX BASE: a part starts playing
+  local parts=1
+  if [ "$ui" = tui ]; then
+    [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
+    TUI_TITLE=${book_title:-$name}
+    chapters_load; chapter_of "$1"
+    TUI_CHAPTER=""; [ "$CH" -ge 0 ] && TUI_CHAPTER=${CH_TITLE[CH]}
+    TUI_HAS_CHAPTERS=$(( ${#CH_START[@]} > 1 ))
+    tui_part "$1" "$parts"
+    [ "$w_state" = off ] && tui_light -1 -1
+  elif [ "$show_words" = 1 ]; then
+    block_load "$2.txt"; status_clear
+    if [ "$w_state" = off ]; then block_draw -1 -1; else block_draw 0 0; fi   # dim until words light
+  fi
+  return 0
+}
+view_light() { if [ "$ui" = tui ]; then tui_light "$@"; elif [ "$show_words" = 1 ]; then block_redraw "$@"; fi; }
+view_state() {   # view_state TEXT EXTRA [SYMBOL] [PAUSED]: what's happening (a spinner if no symbol)
+  local sym=${3:-${SPIN[frame % 10]}}
+  frame=$(( frame + 1 ))
+  if [ "$ui" = tui ]; then tui_state "$1" "$2" "$sym" "${4:-0}"; else status "$1" "$2" "$sym"; fi
+}
+view_part_end() { if [ "$ui" = tui ]; then tui_light -1 -1; elif [ "$show_words" = 1 ]; then block_finish; fi; }
+view_refresh() { [ "$ui" = tui ] && tui_refresh; return 0; }
+
+words_load() {   # read NNNN.words once it lands
+  local f=$1 s e a b
+  [ -f "$f" ] || return 1
+  w_s=(); w_e=(); w_a=(); w_b=()
+  { read -r _                                 # the "confidence" line
+    while read -r s e a b; do w_s+=("$s"); w_e+=("$e"); w_a+=("$a"); w_b+=("$b"); done
+  } < "$f"
+  if [ "${#w_s[@]}" -gt 0 ]; then w_state=ready
+  else w_state=none; view_light -1 -1; fi    # below the bar: the line plain, nothing lit
+}
+
+# ------------------------------------------------------------ listening
+# Bookmarks, the notification and the controls that work while a text plays.
+
+book_title=""
+title_get() { [ -n "$book_title" ] || { [ -f "$tmpd/title" ] && read -r book_title < "$tmpd/title"; } || true; }
+
+bookmark_save() {   # bookmark_save PART: so the same command, or kokoro --continue, picks up here
+  local parts=1
+  [ -n "$book_id" ] || return 0
+  [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
+  [ "${parts:-1}" -gt 1 ] || return 0                     # nothing to come back to
+  [ -d "$BOOKS" ] || mkdir -p "$BOOKS"
+  [ "$kind" = text ] && [ ! -f "$BOOKS/$book_id.txt" ] && cp "$text" "$BOOKS/$book_id.txt"
+  printf 'part=%s\nparts=%s\ntitle=%s\nkind=%s\nsource=%s\nvoice=%s\nspeed=%s\nlang=%s\n' \
+    "$1" "$parts" "${book_title:-$name}" "$kind" "$source" "$voice" "$speed" "$lang" > "$BOOKS/$book_id.mark"
+}
+bookmark_done() { [ -n "$book_id" ] && rm -f "$BOOKS/$book_id.mark" "$BOOKS/$book_id.txt"; return 0; }
+
+# The notification: what's playing, with pause / next / again buttons that run
+# kokoro --pause / --next / --again. Swiping it away stops. In the background,
+# with a timeout, because termux-* commands hang without the Termux:API app.
+notify() {
+  [ "$KOKORO_NOTIFY" = 1 ] && command -v termux-notification >/dev/null || return 0
+  local k="$PREFIX/bin/kokoro"
+  ( timeout 15 termux-notification --id kokomux --type media --alert-once \
+      --title "${book_title:-$name}" --content "$1" --icon record_voice_over \
+      --media-previous "$k --again" --media-pause "$k --pause" --media-play "$k --pause" \
+      --media-next "$k --next" --on-delete "$k --stop" >/dev/null 2>&1 & )
+  return 0
+}
+notify_clear() {
+  [ "$KOKORO_NOTIFY" = 1 ] && command -v termux-notification-remove >/dev/null || return 0
+  ( timeout 10 termux-notification-remove kokomux >/dev/null 2>&1 & )
+  return 0
+}
+
+# Chapters (EPUBs): where each starts, read once the engine writes them.
+CH_START=(); CH_TITLE=()
+chapters_load() {
+  [ "${#CH_START[@]}" -gt 0 ] || [ ! -f "$tmpd/chapters" ] && return 0
+  local n t
+  while IFS=$'\t' read -r n t; do CH_START+=("$n"); CH_TITLE+=("$t"); done < "$tmpd/chapters"
+}
+chapter_of() {   # chapter_of PART: CH = the index of the chapter PART is in (-1: none)
+  local k; CH=-1
+  for k in "${!CH_START[@]}"; do [ "${CH_START[k]}" -le "$1" ] && CH=$k; done
+  return 0
+}
+
+# The sleep timer: off, a number of minutes, or the end of the chapter. When it's
+# up, the part being read is finished and then it stops (keeping the bookmark).
+SLEEP=off; SLEEP_AT=0
+sleep_cycle() {
+  case "$SLEEP" in
+    off) SLEEP=15 ;; 15) SLEEP=30 ;; 30) SLEEP=60 ;;
+    60) if [ "${#CH_START[@]}" -gt 1 ]; then SLEEP=chapter; else SLEEP=off; fi ;;
+    *) SLEEP=off ;;
+  esac
+  now_ms
+  case "$SLEEP" in off|chapter) SLEEP_AT=0 ;; *) SLEEP_AT=$(( NOW + SLEEP * 60000 )) ;; esac
+}
+sleep_label() {  # SLEEP_LABEL: what the timer shows ("" when off)
+  SLEEP_LABEL=""
+  case "$SLEEP" in
+    off) ;;
+    chapter) SLEEP_LABEL="☾ end of chapter" ;;
+    *) now_ms; SLEEP_LABEL="☾ $(( (SLEEP_AT - NOW + 59999) / 60000 ))m" ;;
+  esac
+}
+sleep_due() {    # sleep_due NEXT_PART: is it time to stop, before NEXT_PART starts?
+  case "$SLEEP" in
+    off) return 1 ;;
+    chapter) chapter_of $(( $1 - 1 )); local was=$CH; chapter_of "$1"; [ "$CH" != "$was" ] ;;
+    *) now_ms; [ "$NOW" -ge "$SLEEP_AT" ] ;;
+  esac
+}
+
+# Jumping (a chapter, a click on the progress bar, a new speed) starts the
+# reading again at a part: a fresh job folder, so the old job sees its folder
+# go and stops, and the engine picks up from there.
+JUMP=""
+jump_to() {      # jump_to PART
+  local old=$tmpd target=$1 f
+  if [ -n "$play_pid" ]; then kill "$play_pid" 2>/dev/null || true; wait "$play_pid" 2>/dev/null || true; play_pid=""; fi
+  if [ -n "$gen_pid" ]; then kill "$gen_pid" 2>/dev/null || true; wait "$gen_pid" 2>/dev/null || true; gen_pid=""; fi
+  tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
+  for f in in.txt title chapters; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
+  rm -rf "$old"
+  start=$target; i=$target
+  write_job
+  run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
+  if [ "$ui" = tui ]; then tui_hist=(); TUI_PART=0; TUI_WRAP=(); TUI_OFFS=(); TUI_INFO="$voice · ${speed}×"; tui_draw; fi
+}
+
+# Commands that change where or how it reads (from a key, a click or the menu).
+# Sets JUMP to restart at a part; returns 1 if CMD isn't one of these.
+listen_cmd() {   # listen_cmd CMD PART
+  local cmd=$1 at=$2 t
+  chapters_load
+  case "$cmd" in
+    faster|slower)
+      t=$(printf '%s' "$speed" | awk '{ printf "%d", $1 * 10 + 0.5 }')
+      if [ "$cmd" = faster ]; then t=$(( t + 1 )); else t=$(( t - 1 )); fi
+      [ "$t" -ge 5 ] && [ "$t" -le 20 ] || return 0
+      speed="$(( t / 10 )).$(( t % 10 ))"; JUMP=$at ;;              # this part again, at the new speed
+    sleep) sleep_cycle ;;
+    chapters)
+      [ "${#CH_START[@]}" -gt 1 ] && [ "$ui" = tui ] || return 0
+      chapter_of "$at"; tui_chapters "$CH"
+      [ -n "$CHOSEN" ] && JUMP=${CH_START[CHOSEN]} ;;
+    next_chapter) chapter_of "$at"; [ $(( CH + 1 )) -lt "${#CH_START[@]}" ] && JUMP=${CH_START[CH + 1]} ;;
+    prev_chapter) chapter_of "$at"
+                  if [ "$CH" -ge 0 ] && [ "$at" -gt "${CH_START[CH]}" ]; then JUMP=${CH_START[CH]}   # start of this one
+                  elif [ "$CH" -gt 0 ]; then JUMP=${CH_START[CH - 1]}; fi ;;
+    seek:*) JUMP=${cmd#seek:} ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+play_line() {    # play_line WAV IDX: play one part; light its words; obey pause / next / again
+  local wav=$1 i=$2 base="${1%.wav}" cur=-1 lit=-2 lit_now t t0 label last="" cmd paused=0 restart=1
+  w_state=pending
+  { [ -f "$tmpd/stream/words-off" ] || [ "$show_words" = 0 ]; } && w_state=off
+  echo "$i" > "$tmpd/stream/playing"          # the engine and aligner work from the part being heard
+  title_get; part_of "$i"
+  bookmark_save "$i"; notify "${PART% · }"
+  view_part "$i" "$base"
+  in_line=1
+  # Nothing in this loop starts a process except when something changes: it
+  # runs ~30 times a second on a phone.
+  while :; do
+    if [ "$restart" = 1 ]; then               # (re)start this part from its beginning
+      play-audio "$wav" >/dev/null 2>&1 & play_pid=$!
+      now_ms; t0=$NOW; cur=-1; lit=-2; restart=0
+      echo playing > "$PLAYER_STATE"
+    fi
+    cmd=""                                    # kokoro --pause / --next / --again, or a key or click
+    if [ -f "$CONTROL" ]; then read -r cmd < "$CONTROL" || cmd=""; rm -f "$CONTROL"; fi
+    if [ -z "$cmd" ] && [ -n "$KEY" ]; then key_cmd; cmd=$CMD; fi
+    if [ -n "$cmd" ]; then
+      case "$cmd" in
+        toggle)
+          if [ "$paused" = 1 ]; then paused=0; restart=1; notify "${PART% · }"   # carry on from the part's start
+          else { kill "$play_pid" 2>/dev/null || true; }; wait "$play_pid" || true
+               paused=1; last=""; echo paused > "$PLAYER_STATE"; notify "Paused · ${PART% · }"; fi
+          continue ;;
+        next)  { kill "$play_pid" 2>/dev/null || true; }; wait "$play_pid" || true; break ;;
+        again) { kill "$play_pid" 2>/dev/null || true; }; wait "$play_pid" || true; restart=1; continue ;;
+        quit)  exit 0 ;;                          # the bookmark is kept; cleanup says where
+        *)     if listen_cmd "$cmd" "$i"; then
+                 last=""
+                 if [ -n "$JUMP" ]; then { kill "$play_pid" 2>/dev/null || true; }; wait "$play_pid" || true; break; fi
+               fi ;;
+      esac
+    fi
+    view_refresh
+    if [ "$paused" = 1 ]; then
+      if [ -z "$last" ]; then
+        if [ "$ui" = tui ]; then view_state "Paused" "" "‖" 1; else view_state "Paused" "${PART}space to carry on" "‖"; fi
+        last=paused
+      fi
+      tick 0.1
+      continue
+    fi
+    kill -0 "$play_pid" 2>/dev/null || break  # the part has finished
+    if [ "$show_words" = 1 ]; then
+      if [ "$w_state" = pending ]; then words_load "$base.words" || true; fi   # not landed yet
+      if [ "$w_state" = ready ]; then
+        now_ms; t=$(( NOW - t0 - KOKORO_WORDS_OFFSET_MS ))
+        while [ $(( cur + 1 )) -lt "${#w_s[@]}" ] && [ "${w_s[cur + 1]}" -le "$t" ]; do cur=$(( cur + 1 )); done
+        # Keep the word lit through the pause after it; the last one goes out when it ends.
+        lit_now=$cur
+        if [ "$cur" -eq $(( ${#w_s[@]} - 1 )) ] && [ "$t" -gt "${w_e[cur]}" ]; then lit_now=-1; fi
+        if [ "$lit_now" -ne "$lit" ]; then
+          if [ "$lit_now" -ge 0 ]; then view_light "${w_a[lit_now]}" "${w_b[lit_now]}"
+          elif [ "$cur" -ge 0 ]; then view_light -1 -1      # past the last word
+          else view_light 0 0; fi                            # before the first
+          lit=$lit_now; last=""
+        fi
+      fi
+    fi
+    part_of "$i"; sleep_label
+    if [ "$ui" = tui ]; then label="$SLEEP_LABEL"
+    else label="${PART}${SLEEP_LABEL:+$SLEEP_LABEL · }␣ pause · → next · q stop"; fi
+    if [ "$label|playing" != "$last" ]; then view_state "Playing" "$label" "▶"; last="$label|playing"; fi
+    tick 0.03
+  done
+  wait "$play_pid" || true
+  play_pid=""; in_line=0
+  echo $(( i + 1 )) > "$tmpd/stream/playing"  # heard: the aligner can drop this part
+  view_part_end
+  rm -f "$wav"
+}
+
+__KOKOMUX_PLAYER__
+
 cat > "$WORK/setup.sh" <<'__KOKOMUX_SETUP__'
 # kokomux: runs inside the "kokoro" Debian container (as root), one phase
 # per call, from install.sh:  bash setup.sh apt|pip|models|tidy
@@ -2100,29 +2174,26 @@ CFG
     mkdir -p "$APP"
     [ -x "$APP/venv/bin/python" ] || python3 -m venv "$APP/venv"
     "$APP/venv/bin/pip" install --upgrade pip
-    # cactus-compute is Whistle, the recogniser behind word highlighting; pypdf reads PDFs.
-    "$APP/venv/bin/pip" install --upgrade kokoro-onnx soundfile cactus-compute pypdf | tee /tmp/kokoro-setup/.pip
+    # pypdf reads PDFs.
+    "$APP/venv/bin/pip" install --upgrade kokoro-onnx soundfile pypdf | tee /tmp/kokoro-setup/.pip
+    # Before 0.8, Whistle (cactus-compute) timed the words; Kokoro does that itself now.
+    # It and the packages only it needed are removed (about 54 MB).
+    "$APP/venv/bin/pip" uninstall -y cactus-compute pillow huggingface-hub hf-xet fsspec filelock \
+      tqdm pyyaml click anyio h11 httpcore2 httpx2 truststore 2>/dev/null || true
     grep -q '^Successfully installed' /tmp/kokoro-setup/.pip || printf 'up to date' > "$SRC/.note"
     cp "$SRC/engine.py" "$SRC/words.py" "$APP/"
     rm -f "$APP/speak.py"   # from older versions
     ;;
   models)
-    if [ -s "$APP/models/kokoro-v1.0.int8.onnx" ] && [ -s "$APP/models/voices-v1.0.bin" ]; then
+    if [ -s "$APP/models/kokoro-v1.0-timestamped.int8.onnx" ] && [ -s "$APP/models/voices-v1.0.bin" ]; then
       printf 'already downloaded' > "$SRC/.note"
     fi
     "$APP/venv/bin/python" -u "$APP/engine.py" download
-    # Whistle's engine and weights (~17 MB), fetched now so the first -p doesn't
-    # wait, and so highlighting works offline. Optional: kokomux reads without it.
-    echo "@@progress whistle 0 0 17"
-    if "$APP/venv/bin/python" -u "$APP/engine.py" whistle; then
-      echo "@@progress whistle 100 17 17"
-    else
-      echo "Whistle couldn't be fetched; words won't be highlighted until it can." >&2
-    fi
     ;;
   tidy)
     apt-get clean
     rm -rf /var/lib/apt/lists/* /root/.cache/pip /usr/share/man/* /usr/share/info/*
+    rm -rf /root/.cache/cactus /root/.cache/cactus-needle /root/.cache/huggingface/hub/models--Cactus-Compute--*   # old Whistle files
     find /usr/share/doc -mindepth 2 ! -name copyright -delete 2>/dev/null || true
     ;;
   *)
@@ -2140,7 +2211,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
 # localhost (fast); otherwise each call starts the container (slower).
 set -euo pipefail
 
-KOKOMUX_VERSION="0.7.0"
+KOKOMUX_VERSION="0.8.0"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -2405,13 +2476,19 @@ tick() {
   IN_TICK=0
   [ -z "$STOP" ] || exit 130
 }
-key_cmd() {      # what KEY asks for: toggle, next, again or quit (or a clicked button)
+key_cmd() {      # what KEY asks for (or a clicked button): see the player for each
   CMD=""
   case "$KEY" in
     " "|p|P|k) CMD=toggle ;;
     n|N|l|$'\033[C'|$'\033OC') CMD=next ;;
     b|B|h|$'\033[D'|$'\033OD') CMD=again ;;
     q|Q|$'\033') CMD=quit ;;
+    +|=) CMD=faster ;;
+    -|_) CMD=slower ;;
+    t|T) CMD="sleep" ;;
+    c|C) CMD=chapters ;;
+    ']') CMD=next_chapter ;;
+    '[') CMD=prev_chapter ;;
     $'\033[<'*M) [ "${ui:-}" = tui ] && tui_click "$KEY" ;;
   esac
   KEY=""
@@ -2591,6 +2668,7 @@ cleanup() {
   declare -F tui_close >/dev/null && tui_close
   keys_off
   if [ "${ui:-none}" != none ] && [ -n "${book_id:-}" ] && [ -f "$BOOKS/$book_id.mark" ]; then
+    [ "${SLEPT:-0}" = 1 ] && info "Sleep timer: good night."
     info "Stopped at part $(mark_get "$BOOKS/$book_id.mark" part) of $(mark_get "$BOOKS/$book_id.mark" parts). ${D}kokoro --continue picks up there.${R}"
   fi
   if [ "${play:-0}" = 1 ]; then notify_clear; rm -f "$PLAYER_STATE"; fi
@@ -2668,18 +2746,21 @@ if [ "$play" = 1 ] && [ "$LIVE" = 1 ]; then
   if [ "$KOKORO_TUI" = 1 ] && [ -n "$KBD" ] && declare -F tui_open >/dev/null && tui_fits; then ui=tui; fi
 fi
 
-{
-  echo "voice=$voice"
-  echo "speed=$speed"
-  echo "lang=$lang"
-  [ -n "$url" ] && echo "url=$url"
-  echo "name=$name"
-  [ "$start" -gt 1 ] && echo "start=$start"
-  [ -n "$out" ] && echo "out=out.$ext"
-  [ "$play" = 1 ] && echo "stream=1"
-  [ "$show_words" = 1 ] && echo "words=1"
-} > "$tmpd/job"
-job="/tmp/$(basename "$tmpd")/job"   # the same file, as the container sees it
+write_job() {    # the job, for the engine (where it starts and how fast can change mid-listen)
+  {
+    echo "voice=$voice"
+    echo "speed=$speed"
+    echo "lang=$lang"
+    [ -n "$url" ] && echo "url=$url"
+    echo "name=$name"
+    [ "$start" -gt 1 ] && echo "start=$start"
+    [ -n "$out" ] && echo "out=out.$ext"
+    [ "$play" = 1 ] && echo "stream=1"
+    [ "$show_words" = 1 ] && echo "words=1"
+  } > "$tmpd/job"
+  job="/tmp/$(basename "$tmpd")/job"   # the same file, as the container sees it
+}
+write_job
 
 # Use the server if it's up (or start it); otherwise run the job directly.
 use_server=0
@@ -2715,216 +2796,13 @@ waiting_label() {
   else echo "Getting ready"; fi
 }
 
-# ------------------------------------------------------------ the line being heard
-# Each line is printed wrapped to the screen while it plays, and a soft
-# highlight moves from word to word. Times come from Whistle via the engine
-# (stream/NNNN.words: "confidence", then "start end a b" per word, with a/b the
-# word's byte range in NNNN.txt). play-audio has no clock to read, so the time
-# is how long it has been playing, less its start-up delay.
-# A line taller than the screen is shown as a window of rows that follows the
-# lit word, then printed in full when it ends.
+# ------------------------------------------------------------ the player
+# play_line and everything it needs live in player.sh, beside tui.sh.
 
-HL=$'\033[48;5;61m\033[38;5;231m'   # the soft highlight
-blk_lines=(); blk_offs=(); view_top=0; view_h=0
-w_s=(); w_e=(); w_a=(); w_b=(); w_state=none
-TERM_ROWS=24
-in_line=0
-
-part_of() {      # PART="part I of N · " while a job has more than one part
-  local parts=1
-  [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
-  PART=""; [ "${parts:-1}" -gt 1 ] && PART="part $1 of $parts · "
-  return 0
-}
-
-block_load() {   # wrap a line to the screen as it is now, remembering each row's byte offset
-  local LC_ALL=C row off=0 size
-  size="$(stty size 2>/dev/null </dev/tty)" || size=""
-  if [[ "$size" =~ ^([0-9]+)\ ([0-9]+)$ ]]; then TERM_ROWS=${BASH_REMATCH[1]} TERM_COLS=${BASH_REMATCH[2]}; fi
-  blk_lines=(); blk_offs=()
-  while IFS= read -r row; do
-    blk_lines+=("$row"); blk_offs+=("$off"); off=$(( off + ${#row} ))
-  done < <(fold -s -w $(( TERM_COLS - 3 )) "$1"; echo)
-  view_top=0
-  view_h=$(( ${#blk_lines[@]} < TERM_ROWS - 2 ? ${#blk_lines[@]} : TERM_ROWS - 2 ))
-  [ "$view_h" -ge 1 ] || view_h=1
-}
-
-block_draw() {   # block_draw A B: draw the visible rows with bytes A..B lit (A = -1: none lit)
-  local LC_ALL=C a=$1 b=$2 k o row len x y
-  for (( k = view_top; k < view_top + view_h; k++ )); do
-    o=${blk_offs[k]} row=${blk_lines[k]} len=${#blk_lines[k]}
-    printf '\r\033[K  ' >&2
-    if [ "$a" -lt 0 ] || [ $(( o + len )) -le "$a" ]; then
-      printf '%s' "$row" >&2                                  # already spoken
-    elif [ "$o" -ge "$b" ]; then
-      printf '%s%s%s' "$D" "$row" "$R" >&2                    # still to come
-    else
-      x=$(( a > o ? a - o : 0 )); y=$(( b - o < len ? b - o : len ))
-      printf '%s%s%s%s%s%s' "${row:0:x}" "$HL" "${row:x:y-x}" "$R$D" "${row:y}" "$R" >&2
-    fi
-    printf '\n' >&2
-  done
-}
-
-block_redraw() { # back up over the visible rows and draw them again, moving the window to the lit word
-  local a=$1 k=0
-  if [ "$a" -ge 0 ]; then
-    while [ $(( k + 1 )) -lt "${#blk_lines[@]}" ] && [ "${blk_offs[k + 1]}" -le "$a" ]; do k=$(( k + 1 )); done
-    if [ "$k" -lt "$view_top" ] || [ "$k" -ge $(( view_top + view_h )) ]; then
-      view_top=$(( k + view_h > ${#blk_lines[@]} ? ${#blk_lines[@]} - view_h : k ))
-    fi
-  fi
-  printf '\r\033[K\033[%dA' "$view_h" >&2
-  block_draw "$@"
-}
-
-block_finish() { # the whole line as read, nothing lit (it stays on screen as a transcript)
-  printf '\r\033[K\033[%dA' "$view_h" >&2
-  view_top=0; view_h=${#blk_lines[@]}
-  block_draw -1 -1
-}
-
-# The view the player draws through: the full-screen reader or the inline block.
-view_part() {    # view_part IDX BASE: a part starts playing
-  local parts=1
-  if [ "$ui" = tui ]; then
-    [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
-    TUI_TITLE=${book_title:-$name}
-    tui_part "$1" "$parts"
-    [ "$w_state" = off ] && tui_light -1 -1
-  elif [ "$show_words" = 1 ]; then
-    block_load "$2.txt"; status_clear
-    if [ "$w_state" = off ]; then block_draw -1 -1; else block_draw 0 0; fi   # dim until words light
-  fi
-  return 0
-}
-view_light() { if [ "$ui" = tui ]; then tui_light "$@"; elif [ "$show_words" = 1 ]; then block_redraw "$@"; fi; }
-view_state() {   # view_state TEXT EXTRA [SYMBOL] [PAUSED]: what's happening (a spinner if no symbol)
-  local sym=${3:-${SPIN[frame % 10]}}
-  frame=$(( frame + 1 ))
-  if [ "$ui" = tui ]; then tui_state "$1" "$2" "$sym" "${4:-0}"; else status "$1" "$2" "$sym"; fi
-}
-view_part_end() { if [ "$ui" = tui ]; then tui_light -1 -1; elif [ "$show_words" = 1 ]; then block_finish; fi; }
-view_refresh() { [ "$ui" = tui ] && tui_refresh; return 0; }
-
-words_load() {   # read NNNN.words once it lands
-  local f=$1 s e a b
-  [ -f "$f" ] || return 1
-  w_s=(); w_e=(); w_a=(); w_b=()
-  { read -r _                                 # the "confidence" line
-    while read -r s e a b; do w_s+=("$s"); w_e+=("$e"); w_a+=("$a"); w_b+=("$b"); done
-  } < "$f"
-  if [ "${#w_s[@]}" -gt 0 ]; then w_state=ready
-  else w_state=none; view_light -1 -1; fi    # below the bar: the line plain, nothing lit
-}
-
-# ------------------------------------------------------------ listening
-# Bookmarks, the notification and the controls that work while a text plays.
-
-book_title=""
-title_get() { [ -n "$book_title" ] || { [ -f "$tmpd/title" ] && read -r book_title < "$tmpd/title"; } || true; }
-
-bookmark_save() {   # bookmark_save PART: so the same command, or kokoro --continue, picks up here
-  local parts=1
-  [ -n "$book_id" ] || return 0
-  [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
-  [ "${parts:-1}" -gt 1 ] || return 0                     # nothing to come back to
-  [ -d "$BOOKS" ] || mkdir -p "$BOOKS"
-  [ "$kind" = text ] && [ ! -f "$BOOKS/$book_id.txt" ] && cp "$text" "$BOOKS/$book_id.txt"
-  printf 'part=%s\nparts=%s\ntitle=%s\nkind=%s\nsource=%s\nvoice=%s\nspeed=%s\nlang=%s\n' \
-    "$1" "$parts" "${book_title:-$name}" "$kind" "$source" "$voice" "$speed" "$lang" > "$BOOKS/$book_id.mark"
-}
-bookmark_done() { [ -n "$book_id" ] && rm -f "$BOOKS/$book_id.mark" "$BOOKS/$book_id.txt"; return 0; }
-
-# The notification: what's playing, with pause / next / again buttons that run
-# kokoro --pause / --next / --again. Swiping it away stops. In the background,
-# with a timeout, because termux-* commands hang without the Termux:API app.
-notify() {
-  [ "$KOKORO_NOTIFY" = 1 ] && command -v termux-notification >/dev/null || return 0
-  local k="$PREFIX/bin/kokoro"
-  ( timeout 15 termux-notification --id kokomux --type media --alert-once \
-      --title "${book_title:-$name}" --content "$1" --icon record_voice_over \
-      --media-previous "$k --again" --media-pause "$k --pause" --media-play "$k --pause" \
-      --media-next "$k --next" --on-delete "$k --stop" >/dev/null 2>&1 & )
-  return 0
-}
-notify_clear() {
-  [ "$KOKORO_NOTIFY" = 1 ] && command -v termux-notification-remove >/dev/null || return 0
-  ( timeout 10 termux-notification-remove kokomux >/dev/null 2>&1 & )
-  return 0
-}
-
-play_line() {    # play_line WAV IDX: play one part; light its words; obey pause / next / again
-  local wav=$1 i=$2 base="${1%.wav}" cur=-1 lit=-2 lit_now t t0 label last="" cmd paused=0 restart=1
-  w_state=pending
-  { [ -f "$tmpd/stream/words-off" ] || [ "$show_words" = 0 ]; } && w_state=off
-  echo "$i" > "$tmpd/stream/playing"          # the engine and aligner work from the part being heard
-  title_get; part_of "$i"
-  bookmark_save "$i"; notify "${PART% · }"
-  view_part "$i" "$base"
-  in_line=1
-  # Nothing in this loop starts a process except when something changes: it
-  # runs ~30 times a second on a phone.
-  while :; do
-    if [ "$restart" = 1 ]; then               # (re)start this part from its beginning
-      play-audio "$wav" >/dev/null 2>&1 & play_pid=$!
-      now_ms; t0=$NOW; cur=-1; lit=-2; restart=0
-      echo playing > "$PLAYER_STATE"
-    fi
-    cmd=""                                    # kokoro --pause / --next / --again, or a key or click
-    if [ -f "$CONTROL" ]; then read -r cmd < "$CONTROL" || cmd=""; rm -f "$CONTROL"; fi
-    if [ -z "$cmd" ] && [ -n "$KEY" ]; then key_cmd; cmd=$CMD; fi
-    if [ -n "$cmd" ]; then
-      case "$cmd" in
-        toggle)
-          if [ "$paused" = 1 ]; then paused=0; restart=1; notify "${PART% · }"   # carry on from the part's start
-          else kill "$play_pid" 2>/dev/null; wait "$play_pid" || true
-               paused=1; last=""; echo paused > "$PLAYER_STATE"; notify "Paused · ${PART% · }"; fi
-          continue ;;
-        next)  kill "$play_pid" 2>/dev/null; wait "$play_pid" || true; break ;;
-        again) kill "$play_pid" 2>/dev/null; wait "$play_pid" || true; restart=1; continue ;;
-        quit)  exit 0 ;;                          # the bookmark is kept; cleanup says where
-      esac
-    fi
-    view_refresh
-    if [ "$paused" = 1 ]; then
-      if [ -z "$last" ]; then
-        if [ "$ui" = tui ]; then view_state "Paused" "" "‖" 1; else view_state "Paused" "${PART}space to carry on" "‖"; fi
-        last=paused
-      fi
-      tick 0.1
-      continue
-    fi
-    kill -0 "$play_pid" 2>/dev/null || break  # the part has finished
-    if [ "$show_words" = 1 ]; then
-      if [ "$w_state" = pending ]; then words_load "$base.words" || true; fi   # not landed yet
-      if [ "$w_state" = ready ]; then
-        now_ms; t=$(( NOW - t0 - KOKORO_WORDS_OFFSET_MS ))
-        while [ $(( cur + 1 )) -lt "${#w_s[@]}" ] && [ "${w_s[cur + 1]}" -le "$t" ]; do cur=$(( cur + 1 )); done
-        # Keep the word lit through the pause after it; the last one goes out when it ends.
-        lit_now=$cur
-        if [ "$cur" -eq $(( ${#w_s[@]} - 1 )) ] && [ "$t" -gt "${w_e[cur]}" ]; then lit_now=-1; fi
-        if [ "$lit_now" -ne "$lit" ]; then
-          if [ "$lit_now" -ge 0 ]; then view_light "${w_a[lit_now]}" "${w_b[lit_now]}"
-          elif [ "$cur" -ge 0 ]; then view_light -1 -1      # past the last word
-          else view_light 0 0; fi                            # before the first
-          lit=$lit_now; last=""
-        fi
-      fi
-    fi
-    part_of "$i"
-    if [ "$ui" = tui ]; then label=""; [ "$w_state" = pending ] && label="word timings…"
-    else label="${PART}␣ pause · → next · q stop"; [ "$w_state" = pending ] && label="${PART}word timings…"; fi
-    if [ "$label|playing" != "$last" ]; then view_state "Playing" "$label" "▶"; last="$label|playing"; fi
-    tick 0.03
-  done
-  wait "$play_pid" || true
-  play_pid=""; in_line=0
-  echo $(( i + 1 )) > "$tmpd/stream/playing"  # heard: the aligner can drop this part
-  view_part_end
-  rm -f "$wav"
-}
+PLAYER_LIB="$PREFIX/share/kokomux/player.sh"
+[ -f "$PLAYER_LIB" ] || die "kokomux is only partly installed." "Run the installer again: kokoro --update"
+# shellcheck source=src/player.sh
+. "$PLAYER_LIB"
 
 # ------------------------------------------------------------ run
 
@@ -2944,7 +2822,10 @@ while :; do
   [ "$i" = "$start" ] && [ -f "$tmpd/stream/first" ] && { read -r i < "$tmpd/stream/first" || i=$start; start=$i; }
   f="$(printf '%s/stream/%04d.wav' "$tmpd" "$i")"
   if [ "$play" = 1 ] && [ -f "$f" ]; then
-    play_line "$f" "$i"; i=$((i + 1))
+    play_line "$f" "$i"
+    if [ -n "$JUMP" ]; then jump_to "$JUMP"; JUMP=""; continue; fi
+    i=$((i + 1))
+    if sleep_due "$i"; then SLEPT=1; bookmark_save "$i"; exit 0; fi   # the sleep timer: stop between parts
   elif [ "$play" = 1 ] && [ -f "$tmpd/stream/end" ]; then
     [ -f "$f" ] && continue   # a last chunk may have landed just now
     break
@@ -2955,7 +2836,10 @@ while :; do
     view_state "$(waiting_label)" "$(progress)"
     view_refresh
     tick 0.1
-    if [ -n "$KEY" ]; then key_cmd; [ "$CMD" = quit ] && exit 0; fi
+    if [ -n "$KEY" ]; then
+      key_cmd; [ "$CMD" = quit ] && exit 0
+      [ -n "$CMD" ] && listen_cmd "$CMD" "$i" && [ -n "$JUMP" ] && { jump_to "$JUMP"; JUMP=""; }
+    fi
   fi
 done
 rc=0; wait "$gen_pid" || rc=$?
@@ -3038,7 +2922,8 @@ kokoro_command() {
   { printf '#!%s/bin/bash\n' "$PREFIX"; tail -n +2 "$WORK/kokoro"; } > "$PREFIX/bin/kokoro"
   chmod +x "$PREFIX/bin/kokoro"
   mkdir -p "$PREFIX/share/kokomux"
-  cp "$WORK/tui.sh" "$PREFIX/share/kokomux/tui.sh"   # the full-screen reader and home screen
+  cp "$WORK/tui.sh" "$PREFIX/share/kokomux/tui.sh"         # the full-screen screens
+  cp "$WORK/player.sh" "$PREFIX/share/kokomux/player.sh"   # playing a text
 
   local conf="$HOME/.config/kokoro/config"
   if [ ! -f "$conf" ]; then
@@ -3057,9 +2942,9 @@ KOKORO_AUTOSERVE=1
 KOKORO_IDLE_MINUTES=30
 KOKORO_PORT=8880
 
-# Light up each word as it's spoken (with -p, on a terminal). Whistle listens to
-# each line and its words are matched to the text. Raise the offset if the
-# highlight runs ahead of the voice, lower it if it lags.
+# Light up each word as it's spoken (with -p, on a terminal), from Kokoro's own
+# timings. Raise the offset if the highlight runs ahead of the voice, lower it if
+# it lags.
 KOKORO_WORDS=1
 KOKORO_WORDS_OFFSET_MS=100
 

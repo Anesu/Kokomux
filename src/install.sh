@@ -275,7 +275,7 @@ else
 fi
 
 free_kb="$(df -Pk "$HOME" 2>/dev/null | awk 'NR == 2 { print $4 }')" || true
-need_mb=700; [ "$MODE" = update ] && need_mb=200
+need_mb=600; [ "$MODE" = update ] && need_mb=200
 if [[ "${free_kb:-}" =~ ^[0-9]+$ ]]; then
   free_mb=$(( free_kb / 1024 ))
   if [ "$free_mb" -ge 1024 ]; then free_h="$(awk "BEGIN { printf \"%.1f GB\", $free_mb / 1024 }")"; else free_h="$free_mb MB"; fi
@@ -305,11 +305,10 @@ fi
 if [ "$MODE" = install ]; then
   heading "Here's the plan"
   bullet "A small Debian system to run Kokoro in"
-  bullet "Python, Kokoro and 54 voices (a 250 MB download)"
-  bullet "Whistle, which lights up each word as it's read"
+  bullet "Python, Kokoro and 54 voices (a 200 MB download)"
   bullet "The kokoro command, plus Share and widget shortcuts"
   blank
-  wrap "  " "${D}Takes 5–15 minutes and about 700 MB. You can use your phone meanwhile; it stays awake until done.${R}"
+  wrap "  " "${D}Takes 5–15 minutes and about 600 MB. You can use your phone meanwhile; it stays awake until done.${R}"
 else
   if [ "$OLD_VERSION" = "$KOKOMUX_VERSION" ]; then
     heading "Reinstalling kokomux v$KOKOMUX_VERSION"
@@ -345,6 +344,10 @@ __KOKOMUX_WORDS__
 cat > "$WORK/tui.sh" <<'__KOKOMUX_TUI__'
 #@EMBED tui.sh
 __KOKOMUX_TUI__
+
+cat > "$WORK/player.sh" <<'__KOKOMUX_PLAYER__'
+#@EMBED player.sh
+__KOKOMUX_PLAYER__
 
 cat > "$WORK/setup.sh" <<'__KOKOMUX_SETUP__'
 #@EMBED setup-container.sh
@@ -402,7 +405,8 @@ kokoro_command() {
   { printf '#!%s/bin/bash\n' "$PREFIX"; tail -n +2 "$WORK/kokoro"; } > "$PREFIX/bin/kokoro"
   chmod +x "$PREFIX/bin/kokoro"
   mkdir -p "$PREFIX/share/kokomux"
-  cp "$WORK/tui.sh" "$PREFIX/share/kokomux/tui.sh"   # the full-screen reader and home screen
+  cp "$WORK/tui.sh" "$PREFIX/share/kokomux/tui.sh"         # the full-screen screens
+  cp "$WORK/player.sh" "$PREFIX/share/kokomux/player.sh"   # playing a text
 
   local conf="$HOME/.config/kokoro/config"
   if [ ! -f "$conf" ]; then
@@ -421,9 +425,9 @@ KOKORO_AUTOSERVE=1
 KOKORO_IDLE_MINUTES=30
 KOKORO_PORT=8880
 
-# Light up each word as it's spoken (with -p, on a terminal). Whistle listens to
-# each line and its words are matched to the text. Raise the offset if the
-# highlight runs ahead of the voice, lower it if it lags.
+# Light up each word as it's spoken (with -p, on a terminal), from Kokoro's own
+# timings. Raise the offset if the highlight runs ahead of the voice, lower it if
+# it lags.
 KOKORO_WORDS=1
 KOKORO_WORDS_OFFSET_MS=100
 

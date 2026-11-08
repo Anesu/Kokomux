@@ -25,29 +25,26 @@ CFG
     mkdir -p "$APP"
     [ -x "$APP/venv/bin/python" ] || python3 -m venv "$APP/venv"
     "$APP/venv/bin/pip" install --upgrade pip
-    # cactus-compute is Whistle, the recogniser behind word highlighting; pypdf reads PDFs.
-    "$APP/venv/bin/pip" install --upgrade kokoro-onnx soundfile cactus-compute pypdf | tee /tmp/kokoro-setup/.pip
+    # pypdf reads PDFs.
+    "$APP/venv/bin/pip" install --upgrade kokoro-onnx soundfile pypdf | tee /tmp/kokoro-setup/.pip
+    # Before 0.8, Whistle (cactus-compute) timed the words; Kokoro does that itself now.
+    # It and the packages only it needed are removed (about 54 MB).
+    "$APP/venv/bin/pip" uninstall -y cactus-compute pillow huggingface-hub hf-xet fsspec filelock \
+      tqdm pyyaml click anyio h11 httpcore2 httpx2 truststore 2>/dev/null || true
     grep -q '^Successfully installed' /tmp/kokoro-setup/.pip || printf 'up to date' > "$SRC/.note"
     cp "$SRC/engine.py" "$SRC/words.py" "$APP/"
     rm -f "$APP/speak.py"   # from older versions
     ;;
   models)
-    if [ -s "$APP/models/kokoro-v1.0.int8.onnx" ] && [ -s "$APP/models/voices-v1.0.bin" ]; then
+    if [ -s "$APP/models/kokoro-v1.0-timestamped.int8.onnx" ] && [ -s "$APP/models/voices-v1.0.bin" ]; then
       printf 'already downloaded' > "$SRC/.note"
     fi
     "$APP/venv/bin/python" -u "$APP/engine.py" download
-    # Whistle's engine and weights (~17 MB), fetched now so the first -p doesn't
-    # wait, and so highlighting works offline. Optional: kokomux reads without it.
-    echo "@@progress whistle 0 0 17"
-    if "$APP/venv/bin/python" -u "$APP/engine.py" whistle; then
-      echo "@@progress whistle 100 17 17"
-    else
-      echo "Whistle couldn't be fetched; words won't be highlighted until it can." >&2
-    fi
     ;;
   tidy)
     apt-get clean
     rm -rf /var/lib/apt/lists/* /root/.cache/pip /usr/share/man/* /usr/share/info/*
+    rm -rf /root/.cache/cactus /root/.cache/cactus-needle /root/.cache/huggingface/hub/models--Cactus-Compute--*   # old Whistle files
     find /usr/share/doc -mindepth 2 ! -name copyright -delete 2>/dev/null || true
     ;;
   *)
