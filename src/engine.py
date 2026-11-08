@@ -272,8 +272,7 @@ def run_job(path):
             # stopped, so a vanished folder means nobody is waiting any more.
             if not os.path.isdir(jobdir) or (stream and not os.path.isdir(stream)):
                 raise JobError("Cancelled")
-            if len(chunks) > 1 and not stream and not SERVING:
-                log(f"  part {i}/{len(chunks)}")
+            _write_atomic(os.path.join(jobdir, "progress"), f"{i} {len(chunks)}\n")
             samples, rate = engine.create(chunk, voice=voice, speed=speed, lang=lang)
             total += len(samples) / rate
             if stream:
@@ -289,7 +288,18 @@ def run_job(path):
         if stream and os.path.isdir(stream):
             open(os.path.join(stream, "end"), "w").close()
 
-    return f"Made {total:.1f}s of audio in {time.time() - t0:.1f}s"
+    elapsed = time.time() - t0
+    _write_atomic(os.path.join(jobdir, "result"), f"{total:.1f} {elapsed:.1f} {len(chunks)}\n")
+    return f"Made {total:.1f}s of audio in {elapsed:.1f}s"
+
+
+def _write_atomic(path, text):
+    try:
+        with open(path + ".tmp", "w") as fh:
+            fh.write(text)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass  # the job folder vanished (cancelled); the loop will notice
 
 
 # ------------------------------------------------------------------ server
@@ -393,10 +403,11 @@ def serve(port, idle):
 
 def download():
     os.makedirs(MODELS, exist_ok=True)
-    for name in ("kokoro-v1.0.int8.onnx", "voices-v1.0.bin"):
+    for name, label in (("kokoro-v1.0.int8.onnx", "model"), ("voices-v1.0.bin", "voices")):
         dest = os.path.join(MODELS, name)
         if os.path.exists(dest) and os.path.getsize(dest) > 0:
-            print(f"{name}: already downloaded")
+            print(f"@@progress {label} 100 0 0")
+            print(f"{name}: already downloaded", flush=True)
             continue
         part = dest + ".part"
         for attempt in range(1, 6):
@@ -411,13 +422,14 @@ def download():
                     size = have + int(r.headers.get("Content-Length", 0))
                     with open(part, "ab" if have else "wb") as fh:
                         done, shown = have, -1
-                        while block := r.read(1 << 20):
+                        while block := r.read(1 << 18):
                             fh.write(block)
                             done += len(block)
                             pct = done * 100 // size if size else 0
-                            if pct // 10 != shown:
-                                shown = pct // 10
-                                print(f"{name}: {pct}% of {size >> 20} MB", flush=True)
+                            if pct != shown:
+                                shown = pct
+                                # "@@progress LABEL PCT DONE_MB TOTAL_MB"
+                                print(f"@@progress {label} {pct} {done / 2**20:.0f} {size / 2**20:.0f}", flush=True)
                 os.replace(part, dest)
                 break
             except OSError as e:
@@ -425,6 +437,50 @@ def download():
                 time.sleep(2 * attempt)
         else:
             sys.exit(f"Couldn't download {name}. Run the installer again to resume.")
+
+
+# ------------------------------------------------------------------ voices
+
+LANGS = {"a": ("American English", "en-us"), "b": ("British English", "en-gb"),
+         "e": ("Spanish", "es"), "f": ("French", "fr-fr"), "h": ("Hindi", "hi"),
+         "i": ("Italian", "it"), "j": ("Japanese", "ja"),
+         "p": ("Brazilian Portuguese", "pt-br"), "z": ("Mandarin Chinese", "cmn")}
+
+
+def print_voices(names, width, default):
+    """Group voices by language and gender, wrapped to the terminal width.
+    Colour only when stdout is a terminal."""
+    tty = (sys.stdout.isatty() or "--color" in sys.argv) and not os.environ.get("NO_COLOR")
+    bold, dim, acc, off = ("\033[1m", "\033[2m", "\033[38;5;141m", "\033[0m") if tty else ("",) * 4
+    width = max(30, min(width, 100))
+    groups = {}
+    for n in names:
+        groups.setdefault(n[0], {}).setdefault(n[1] if len(n) > 1 else "?", []).append(n)
+    for code in sorted(groups, key=lambda c: list(LANGS).index(c) if c in LANGS else 99):
+        title, lang = LANGS.get(code, (f"Other ({code})", ""))
+        note = " (basic pronunciation)" if code in "jz" else ""
+        print(f"{bold}{title}{off}{dim}{note}" + (f" -l {lang}" if lang else "") + off)
+        for g, label in (("f", "female"), ("m", "male")):
+            vs = groups[code].get(g)
+            if not vs:
+                continue
+            line, cur = [], 9
+            out = []
+            for v in vs:
+                shown = f"{acc}{v}*{off}" if v == default else v
+                w = len(v) + (1 if v == default else 0) + 1
+                if cur + w > width and line:
+                    out.append(" ".join(line))
+                    line, cur = [], 9
+                line.append(shown)
+                cur += w
+            out.append(" ".join(line))
+            print(f"  {dim}{label:<7}{off}" + f"\n  {'':<7}".join(out))
+        print()
+    if default:
+        other = "bm_george" if default != "bm_george" else "af_heart"
+        print(f"{dim}* your default{off}")
+        print(f"{dim}Try another: kokoro -v {other} -p \"Hi\"{off}")
 
 
 # ------------------------------------------------------------------ main
@@ -437,7 +493,11 @@ def main():
     s = sub.add_parser("serve")
     s.add_argument("--port", type=int, default=8880)
     s.add_argument("--idle", type=int, default=1800, help="stop after this many idle seconds (0 = never)")
-    sub.add_parser("voices")
+    v = sub.add_parser("voices")
+    v.add_argument("--plain", action="store_true", help="one name per line")
+    v.add_argument("--width", type=int, default=60)
+    v.add_argument("--default", default="")
+    v.add_argument("--color", action="store_true", help="colour even when piped")
     sub.add_parser("download")
     a = p.parse_args()
 
@@ -449,7 +509,11 @@ def main():
     elif a.cmd == "serve":
         serve(a.port, a.idle)
     elif a.cmd == "voices":
-        print("\n".join(sorted(tts().get_voices())))
+        names = sorted(tts().get_voices())
+        if a.plain:
+            print("\n".join(names))
+        else:
+            print_voices(names, a.width, a.default)
     elif a.cmd == "download":
         download()
 

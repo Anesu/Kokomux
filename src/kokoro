@@ -7,6 +7,7 @@
 # localhost (fast); otherwise each call starts the container (slower).
 set -euo pipefail
 
+KOKOMUX_VERSION="@@VERSION@@"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -14,6 +15,7 @@ CONF="$CONF_DIR/config"
 # > these defaults.
 env_names="${!KOKORO_@}"
 env_overrides=""
+# shellcheck disable=SC2086
 [ -n "$env_names" ] && env_overrides="$(declare -p $env_names)"
 KOKORO_VOICE=af_heart
 KOKORO_SPEED=1.0
@@ -34,38 +36,106 @@ SRV_DIR="$PREFIX/tmp/kokoro-server"
 TOKEN_FILE="$SRV_DIR/token"
 PLAYER_PID="$PREFIX/tmp/kokoro-player.pid"
 
-die() { echo "kokoro: $*" >&2; exit 1; }
+# ------------------------------------------------------------ look & feel
+# Messages go to stderr. Colours and live status only on a terminal, so
+# scripts and pipes get plain, quiet output.
+
+LIVE=0
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then LIVE=1; fi
+if [ "$LIVE" = 1 ]; then
+  R=$'\033[0m' B=$'\033[1m' D=$'\033[2m' ACC=$'\033[38;5;141m' ACC2=$'\033[38;5;117m'
+  GRN=$'\033[38;5;114m' RED=$'\033[38;5;203m' YEL=$'\033[38;5;221m'
+else
+  R="" B="" D="" ACC="" ACC2="" GRN="" RED="" YEL=""
+fi
+SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+frame=0
+
+cols() {
+  local c
+  c="$(stty size 2>/dev/null </dev/tty | cut -d' ' -f2)" || true
+  [[ "${c:-}" =~ ^[0-9]+$ ]] && [ "$c" -ge 20 ] && echo "$c" || echo 60
+}
+
+# die "what went wrong" ["what to do about it"]
+die() {
+  status_clear
+  printf '%s✗%s %s\n' "$RED" "$R" "$1" >&2
+  [ -n "${2:-}" ] && printf '  %s%s%s\n' "$D" "$2" "$R" >&2
+  exit 1
+}
+done_msg() { printf '%s✓%s %s%s\n' "$GRN" "$R" "$1" "${2:+ $D$2$R}" >&2; }
+info() { printf '%s›%s %s\n' "$ACC" "$R" "$1" >&2; }
+
+# One live status line, never wider than the screen (a wrapped line can't
+# be redrawn in place): status "text" ["dim extra"] ["symbol"]
+TERM_COLS=60; [ "$LIVE" = 1 ] && TERM_COLS="$(cols)"
+status() {
+  [ "$LIVE" = 1 ] || return 0
+  local main=$1 extra=${2:-} sym=${3:-${SPIN[frame % 10]}} vis room
+  vis="$(printf '%s' "$main" | sed 's/\x1b\[[0-9;]*m//g')"
+  room=$(( TERM_COLS - 4 - ${#vis} ))
+  if [ "$room" -lt 4 ]; then extra=""
+  elif [ "${#extra}" -gt "$room" ]; then extra="${extra:0:$((room - 1))}…"; fi
+  printf '\r\033[K%s%s%s %s %s%s%s' "$ACC" "$sym" "$R" "$main" "$D" "$extra" "$R" >&2
+  frame=$((frame + 1))
+}
+status_clear() { [ "$LIVE" = 1 ] && printf '\r\033[K' >&2; return 0; }
+
+# shellcheck disable=SC2088  # a literal ~ is the point
+tilde() { case "$1" in "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac; }
+human_size() {
+  local b=$1
+  if [ "$b" -ge 1048576 ]; then awk "BEGIN { printf \"%.1f MB\", $b / 1048576 }"
+  else echo "$(( (b + 1023) / 1024 )) KB"; fi
+}
+human_secs() {
+  awk -v s="$1" 'BEGIN { if (s >= 60) printf "%dm %02ds", s / 60, s % 60; else printf "%.1fs", s }'
+}
+
+# Option rows "flags|what it does": two columns on wide screens, stacked on
+# narrow ones (phones in portrait).
+opt_rows() {
+  local w o d
+  w="$(cols)"
+  while IFS='|' read -r o d; do
+    if [ "$w" -ge 72 ]; then printf '  %s%-18s%s %s\n' "$ACC2" "$o" "$R" "$d"
+    else printf '  %s%s%s\n      %s%s%s\n' "$ACC2" "$o" "$R" "$D" "$d" "$R"; fi
+  done
+}
 
 usage() {
-  cat <<'TXT'
-Usage: kokoro [options] [text...]
-
-Text comes from the arguments, -f FILE, -c (clipboard), -u URL, or a pipe.
-
-  -p, --play        play as it's made (starts after the first sentence)
-  -o FILE           save to FILE: .wav .mp3 .ogg or .flac
-                    (default kokoro.wav; with -p, nothing is saved unless -o)
-  -v VOICE          voice, e.g. af_heart, am_adam, bf_emma (see --list-voices)
-  -s SPEED          0.5 to 2.0
-  -l LANG           en-us en-gb es fr-fr it pt-br hi
-  -f FILE           read text from FILE
-  -c, --clipboard   read the clipboard (a copied link reads that page)
-  -u URL            read a web page
-
-  --list-voices     show all voices
-  --stop            stop playback
-  --serve           start the background server now
-  --stop-server     stop the background server
-  --status          show server status and settings
-  --config          edit default voice, speed, etc.
-  --update          update kokomux and Kokoro
-  --uninstall       remove everything kokomux installed
-
-Examples:
-  kokoro -p "Hello there"
-  kokoro -c -p
-  kokoro -u https://example.com/article -o article.mp3
-TXT
+  printf '%skokoro%s %sv%s%s\n' "$B" "$R" "$ACC" "$KOKOMUX_VERSION" "$R"
+  printf '%sKokoro text-to-speech for Termux%s\n\n' "$D" "$R"
+  printf '%sUsage%s kokoro [options] [text]\n' "$B" "$R"
+  printf '%sText can also come from -f, -c, -u or a pipe.%s\n' "$D" "$R"
+  printf '\n%sSpeak%s\n' "$B" "$R"
+  opt_rows <<'ROWS'
+-p, --play|play as it's made
+-o FILE|save as .wav .mp3 .ogg or .flac
+-v VOICE|voice, e.g. af_heart, bm_george
+-s SPEED|0.5 to 2.0
+-l LANG|en-us en-gb es fr-fr it pt-br hi
+ROWS
+  printf '\n%sRead from%s\n' "$B" "$R"
+  opt_rows <<'ROWS'
+-f FILE|a text file
+-c, --clipboard|the clipboard (or the link in it)
+-u URL|a web page
+ROWS
+  printf '\n%sMore%s\n' "$B" "$R"
+  opt_rows <<'ROWS'
+--list-voices|all 54 voices by language
+--stop|stop playback
+--status|server status and settings
+--config|change your defaults
+--serve / --stop-server|start or stop the server
+--update|update kokomux and Kokoro
+--uninstall|remove kokomux
+ROWS
+  printf '\n%sExamples%s\n' "$B" "$R"
+  printf '  kokoro -p "Hello there"\n  kokoro -c -p\n  kokoro -u URL -o page.mp3\n'
+  printf '\n%sWithout -p, audio is saved to %s.%s\n' "$D" "$KOKORO_OUT" "$R"
 }
 
 # ------------------------------------------------------------ server
@@ -84,93 +154,125 @@ start_server() {
   server_up && return 0
   mkdir -p "$SRV_DIR"
   rm -f "$TOKEN_FILE"
-  if [ "$KOKORO_IDLE_MINUTES" = 0 ]; then
-    echo "Starting the Kokoro server (runs until: kokoro --stop-server)..." >&2
-  else
-    echo "Starting the Kokoro server (stops after ${KOKORO_IDLE_MINUTES} min unused)..." >&2
-  fi
   # Ignore Ctrl+C and hang-ups so the server outlives the command that started it.
   ( trap '' INT HUP
     exec nohup proot-distro login "$DISTRO" --shared-tmp -- \
       "$PY" "$ENGINE" serve --port "$KOKORO_PORT" --idle "$((KOKORO_IDLE_MINUTES * 60))"
   ) > "$SRV_DIR/log" 2>&1 < /dev/null &
-  local pid=$! i
-  for i in $(seq 1 240); do
-    server_up && return 0
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 0.5
+  local pid=$! n=0
+  [ "$LIVE" = 1 ] || echo "Starting the Kokoro server..." >&2
+  while [ "$n" -lt 1200 ]; do          # up to 2 minutes
+    if [ $((n % 5)) = 0 ]; then
+      server_up && { status_clear; return 0; }
+      kill -0 "$pid" 2>/dev/null || break
+    fi
+    status "Warming up Kokoro" "(a few seconds)"
+    sleep 0.1; n=$((n + 1))
   done
-  echo "kokoro: server didn't start. Log ($SRV_DIR/log):" >&2
-  tail -n 5 "$SRV_DIR/log" >&2 || true
+  status_clear
+  printf '%s✗%s The Kokoro server didn'"'"'t start.\n' "$RED" "$R" >&2
+  tail -n 5 "$SRV_DIR/log" 2>/dev/null | sed "s/^/  $D/; s/\$/$R/" >&2 || true
+  printf '  %sFull log: %s%s\n' "$D" "${SRV_DIR}/log" "$R" >&2
   return 1
 }
 
 stop_server() {
-  if ! server_up; then echo "Server isn't running."; return 0; fi
+  if ! server_up; then info "The server isn't running."; return 0; fi
   curl -fsS -m 5 -X POST -H "X-Kokoro-Token: $(server_token)" \
     "http://127.0.0.1:$(server_port)/shutdown" >/dev/null || true
   local i
   for i in $(seq 1 20); do server_up || break; sleep 0.25; done
-  echo "Server stopped."
+  done_msg "Server stopped." "It restarts when needed."
 }
 
 # ------------------------------------------------------------ playback
 
 stop_playback() {
   local pid
-  pid="$(cat "$PLAYER_PID" 2>/dev/null)" || return 0
-  [ -n "$pid" ] && [ "$pid" != "$$" ] && kill "$pid" 2>/dev/null || true
+  pid="$(cat "$PLAYER_PID" 2>/dev/null)" || return 1
   rm -f "$PLAYER_PID"
+  [ -n "$pid" ] && [ "$pid" != "$$" ] && kill "$pid" 2>/dev/null
 }
 
 # ------------------------------------------------------------ admin commands
 
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
-  --stop) stop_playback; exit 0 ;;
-  --serve) start_server && echo "Server running on port $(server_port)."; exit ;;
+  --version) echo "kokomux $KOKOMUX_VERSION"; exit 0 ;;
+  --stop)
+    if stop_playback; then done_msg "Stopped."; else info "Nothing is playing."; fi
+    exit 0 ;;
+  --serve)
+    if server_up; then info "The server is already running."; exit 0; fi
+    start_server || exit 1
+    done_msg "Server ready." "port $(server_port) · stops after ${KOKORO_IDLE_MINUTES} min unused"
+    exit 0 ;;
   --stop-server) stop_server; exit 0 ;;
   --status)
-    if server_up; then echo "Server: running on port $(server_port)"; else echo "Server: not running"; fi
-    echo "Voice: $KOKORO_VOICE   Speed: $KOKORO_SPEED   Language: $KOKORO_LANG"
-    echo "Auto-start server: $([ "$KOKORO_AUTOSERVE" = 1 ] && echo yes || echo no)   Idle stop: ${KOKORO_IDLE_MINUTES} min"
-    echo "Settings: $CONF"
+    printf '%skokomux%s %sv%s%s\n\n' "$B" "$R" "$ACC" "$KOKOMUX_VERSION" "$R"
+    if server_up; then
+      printf '  %s●%s Server    %srunning%s %s(port %s)%s\n' "$GRN" "$R" "$GRN" "$R" "$D" "$(server_port)" "$R"
+    elif [ "$KOKORO_AUTOSERVE" = 1 ]; then
+      printf '  %s○%s Server    sleeping %s(wakes on next use)%s\n' "$D" "$R" "$D" "$R"
+    else
+      printf '  %s○%s Server    off %s(KOKORO_AUTOSERVE=0)%s\n' "$D" "$R" "$D" "$R"
+    fi
+    idle="${KOKORO_IDLE_MINUTES} min"; [ "$KOKORO_IDLE_MINUTES" = 0 ] && idle="never"
+    printf '    Voice     %s%s%s\n' "$ACC2" "$KOKORO_VOICE" "$R"
+    printf '    Speed     %s\n' "$KOKORO_SPEED"
+    printf '    Language  %s\n' "$KOKORO_LANG"
+    printf '    Idle stop %s\n' "$idle"
+    printf '    Settings  %s%s%s\n' "$D" "$(tilde "$CONF")" "$R"
+    printf '    %sChange them with: kokoro --config%s\n' "$D" "$R"
     exit 0 ;;
   --config)
-    [ -f "$CONF" ] || die "no settings file at $CONF (re-run the installer)"
+    [ -f "$CONF" ] || die "There's no settings file at $(tilde "$CONF")." "Run the installer again to create it."
     exec "${EDITOR:-nano}" "$CONF" ;;
   --update)
-    stop_server >/dev/null
+    server_up && stop_server >/dev/null 2>&1
     tmp="$(mktemp "$PREFIX/tmp/kokomux-install.XXXXXX")"
-    if curl -fsSL "$KOKORO_REPO_RAW/install.sh" -o "$tmp"; then
-      rc=0; bash "$tmp" || rc=$?; rm -f "$tmp"; exit "$rc"
+    if curl -fsSL "$KOKORO_REPO_RAW/install.sh" -o "$tmp" 2>/dev/null; then
+      rc=0; bash "$tmp" --yes || rc=$?; rm -f "$tmp"; exit "$rc"
     fi
     rm -f "$tmp"
-    echo "Couldn't download the latest installer (is the repo private?)." >&2
-    echo "Updating Kokoro's Python packages only..." >&2
+    printf '%s!%s Couldn'"'"'t download the latest installer %s(is the repo private?)%s\n' "$YEL" "$R" "$D" "$R" >&2
+    info "Updating Kokoro's Python packages only..."
     exec proot-distro login "$DISTRO" -- "${PY%/python}/pip" install --no-cache-dir --upgrade kokoro-onnx soundfile ;;
   --uninstall)
-    read -r -p "Remove kokomux, its Debian container and settings? [y/N] " ans
-    [[ "$ans" =~ ^[Yy] ]] || exit 0
-    stop_playback; stop_server >/dev/null
-    proot-distro remove "$DISTRO" || true
+    printf '%s\n\n' "This removes the kokoro command, its Debian container, the voices, your settings and shortcuts." |
+      fold -s -w "$(( $(cols) - 1 ))" >&2
+    read -r -p "Uninstall kokomux? [y/N] " ans
+    [[ "$ans" =~ ^[Yy] ]] || { info "Nothing removed."; exit 0; }
+    stop_playback || true
+    server_up && stop_server >/dev/null 2>&1
+    proot-distro remove "$DISTRO" >/dev/null 2>&1 && done_msg "Debian container removed" || true
     for f in "$HOME/bin/termux-url-opener" "$HOME/bin/termux-file-editor" \
              "$HOME/.shortcuts/tasks/"Kokoro*; do
-      if [ -f "$f" ] && grep -q '^# kokomux' "$f"; then rm -f "$f"; echo "Removed $f"; fi
+      if [ -f "$f" ] && grep -q '^# kokomux' "$f"; then rm -f "$f"; done_msg "Removed $(tilde "$f")"; fi
     done
-    rm -rf "$CONF_DIR" "$SRV_DIR" "$HOME/kokoro-test.wav"
+    rm -rf "$CONF_DIR" "$SRV_DIR" "$HOME/kokoro-test.wav" "$HOME/.cache/kokomux"
+    done_msg "Settings removed"
     rm -f "$0"
-    echo "kokomux removed."
+    done_msg "kokomux is uninstalled." "Thanks for trying it!"
     exit 0 ;;
   --list-voices)
-    exec proot-distro login "$DISTRO" -- "$PY" "$ENGINE" voices ;;
+    status "Loading voices"
+    flags=(--width "$(cols)" --default "$KOKORO_VOICE")
+    [ "$LIVE" = 1 ] && [ -t 1 ] && flags+=(--color)
+    errf="$(mktemp "$PREFIX/tmp/kokoro-err.XXXXXX")"
+    out="$(proot-distro login "$DISTRO" -- "$PY" "$ENGINE" voices "${flags[@]}" 2>"$errf")" ||
+      die "Couldn't list the voices." "$(tail -n 1 "$errf"; rm -f "$errf")"
+    rm -f "$errf"
+    status_clear
+    printf '%s\n' "$out"
+    exit 0 ;;
 esac
 
 # ------------------------------------------------------------ options
 
 out=""; infile=""; url=""; play=0; clip=0; words=()
 voice="$KOKORO_VOICE"; speed="$KOKORO_SPEED"; lang="$KOKORO_LANG"
-need() { [ $# -ge 2 ] || die "$1 needs a value"; }
+need() { [ $# -ge 2 ] || die "$1 needs a value." "See: kokoro --help"; }
 while [ $# -gt 0 ]; do
   case "$1" in
     -o|--out)       need "$@"; out="$2"; shift 2 ;;
@@ -188,23 +290,24 @@ while [ $# -gt 0 ]; do
     -p|--play)      play=1; shift ;;
     -c|--clipboard) clip=1; shift ;;
     --)             shift; words+=("$@"); break ;;
-    -?*)            die "unknown option $1 (see kokoro --help)" ;;
+    -?*)            die "Unknown option $1" "See: kokoro --help" ;;
     *)              words+=("$1"); shift ;;
   esac
 done
 
-[[ "$voice" =~ ^[A-Za-z0-9_]+$ ]] || die "bad voice name: $voice"
-[[ "$speed" =~ ^[0-9]*\.?[0-9]+$ ]] || die "speed must be a number, e.g. 1.2"
-[[ "$lang" =~ ^[A-Za-z0-9-]+$ ]] || die "bad language code: $lang"
+[[ "$voice" =~ ^[A-Za-z0-9_]+$ ]] || die "\"$voice\" isn't a voice name." "See: kokoro --list-voices"
+[[ "$speed" =~ ^[0-9]*\.?[0-9]+$ ]] || die "Speed must be a number, like 1.2"
+[[ "$lang" =~ ^[A-Za-z0-9-]+$ ]] || die "\"$lang\" isn't a language code." "Try en-us, en-gb, es, fr-fr, it, pt-br or hi."
 
 [ "$play" = 1 ] || out="${out:-$KOKORO_OUT}"
 ext=""
 if [ -n "$out" ]; then
   ext="$(printf '%s' "${out##*.}" | tr '[:upper:]' '[:lower:]')"
-  case "$ext" in wav|mp3|ogg|flac) ;; *) die "-o must end in .wav, .mp3, .ogg or .flac" ;; esac
+  case "$ext" in wav|mp3|ogg|flac) ;; *) die "Can't save as \"$out\"." "End the name with .wav, .mp3, .ogg or .flac" ;; esac
+  [ -d "$(dirname "$out")" ] || die "The folder for \"$out\" doesn't exist."
 fi
 if [ "$play" = 1 ] && ! command -v play-audio >/dev/null; then
-  die "playback needs play-audio: pkg install play-audio"
+  die "Playback needs play-audio." "Install it with: pkg install play-audio"
 fi
 
 # ------------------------------------------------------------ job folder
@@ -212,6 +315,7 @@ fi
 tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
 gen_pid=""; play_pid=""
 cleanup() {
+  status_clear
   [ -n "$play_pid" ] && kill "$play_pid" 2>/dev/null
   [ -n "$gen_pid" ] && kill "$gen_pid" 2>/dev/null
   rm -rf "$tmpd"
@@ -226,11 +330,12 @@ if [ -n "$url" ]; then
   :
 elif [ "$clip" = 1 ]; then
   command -v termux-clipboard-get >/dev/null ||
-    die "-c needs the Termux:API app and: pkg install termux-api"
+    die "Reading the clipboard needs Termux:API." "Install the Termux:API app, then: pkg install termux-api"
+  status "Reading the clipboard"
   timeout 15 termux-clipboard-get > "$text" ||
-    die "couldn't read the clipboard (is the Termux:API app installed?)"
+    die "Couldn't read the clipboard." "Is the Termux:API app installed? Get it where you got Termux."
 elif [ -n "$infile" ]; then
-  [ -f "$infile" ] || die "no such file: $infile"
+  [ -f "$infile" ] || die "There's no file called \"$infile\"."
   cp "$infile" "$text"
 elif [ ${#words[@]} -gt 0 ]; then
   printf '%s\n' "${words[*]}" > "$text"
@@ -246,9 +351,10 @@ if [ -z "$url" ] && [ "$(wc -l < "$text")" -le 1 ] &&
   url="$(tr -d '[:space:]' < "$text")"
 fi
 if [ -z "$url" ] && ! grep -q '[^[:space:]]' "$text"; then
-  die "no text to read"
+  [ "$clip" = 1 ] && die "The clipboard is empty."
+  die "There's no text to read."
 fi
-[[ "$url" != *$'\n'* ]] || die "bad URL"
+[[ "$url" != *$'\n'* ]] || die "That doesn't look like a web address."
 
 {
   echo "voice=$voice"
@@ -260,52 +366,97 @@ fi
 } > "$tmpd/job"
 job="/tmp/$(basename "$tmpd")/job"   # the same file, as the container sees it
 
+# Use the server if it's up (or start it); otherwise run the job directly.
+use_server=0
+if server_up || { [ "$KOKORO_AUTOSERVE" = 1 ] && start_server; }; then use_server=1; fi
+
 run_engine() {
-  if server_up || { [ "$KOKORO_AUTOSERVE" = 1 ] && start_server; }; then
+  if [ "$use_server" = 1 ]; then
     local rc=0
     curl -s --fail-with-body -X POST -H "X-Kokoro-Token: $(server_token)" \
-      "http://127.0.0.1:$(server_port)/job?path=$job" >&2 || rc=$?
+      "http://127.0.0.1:$(server_port)/job?path=$job" || rc=$?
     # 22 = the server answered with an error, which it has already printed.
-    [ "$rc" = 0 ] || [ "$rc" = 22 ] || echo "kokoro: lost contact with the server (curl error $rc)" >&2
+    [ "$rc" = 0 ] || [ "$rc" = 22 ] || echo "Error: lost contact with the Kokoro server (curl error $rc)"
     [ "$rc" = 0 ] || return 1
   else
     proot-distro login "$DISTRO" --shared-tmp -- "$PY" "$ENGINE" job "$job"
   fi
 }
 
+# What's happening, for the live status line.
+progress() {
+  local p n i
+  if [ -f "$tmpd/progress" ] && read -r i n < "$tmpd/progress"; then
+    if [ "$n" -gt 1 ]; then p="part $i of $n"; else p=""; fi
+    echo "$p"; return
+  fi
+  echo ""
+}
+waiting_label() {
+  if [ "$play" = 1 ] && [ "$i" -gt 1 ]; then echo "Preparing"
+  elif [ -f "$tmpd/progress" ]; then echo "Making speech"
+  elif [ -n "$url" ]; then echo "Fetching the page"
+  else echo "Getting ready"; fi
+}
+
 # ------------------------------------------------------------ run
 
-if [ "$play" = 0 ]; then
-  run_engine
-else
-  stop_playback
+if [ "$play" = 1 ]; then
+  stop_playback || true
   echo "$$" > "$PLAYER_PID"
-  run_engine & gen_pid=$!
-  i=1
-  while :; do
-    f="$(printf '%s/stream/%04d.wav' "$tmpd" "$i")"
-    if [ -f "$f" ]; then
-      play-audio "$f" & play_pid=$!
-      wait "$play_pid" || true
-      play_pid=""
-      rm -f "$f"; i=$((i + 1))
-    elif [ -f "$tmpd/stream/end" ]; then
-      [ -f "$f" ] && continue   # a last chunk may have landed just now
-      break
-    elif ! kill -0 "$gen_pid" 2>/dev/null; then
-      [ -f "$f" ] && continue
-      break
-    else
-      sleep 0.1
-    fi
-  done
-  rc=0; wait "$gen_pid" || rc=$?
-  gen_pid=""
-  [ "$rc" = 0 ] || exit "$rc"
+fi
+run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
+
+i=1
+while :; do
+  f="$(printf '%s/stream/%04d.wav' "$tmpd" "$i")"
+  if [ "$play" = 1 ] && [ -f "$f" ]; then
+    play-audio "$f" >/dev/null 2>&1 & play_pid=$!
+    while kill -0 "$play_pid" 2>/dev/null; do
+      n="$(cut -d' ' -f2 "$tmpd/progress" 2>/dev/null || echo 1)"
+      if [ "${n:-1}" -gt 1 ]; then where="part $i of $n · "; else where=""; fi
+      status "Playing" "${where}Ctrl+C to stop" "▶"
+      sleep 0.15
+    done
+    wait "$play_pid" || true
+    play_pid=""
+    rm -f "$f"; i=$((i + 1))
+  elif [ "$play" = 1 ] && [ -f "$tmpd/stream/end" ]; then
+    [ -f "$f" ] && continue   # a last chunk may have landed just now
+    break
+  elif ! kill -0 "$gen_pid" 2>/dev/null; then
+    [ "$play" = 1 ] && [ -f "$f" ] && continue
+    break
+  else
+    status "$(waiting_label)" "$(progress)"
+    sleep 0.1
+  fi
+done
+rc=0; wait "$gen_pid" || rc=$?
+gen_pid=""
+status_clear
+
+if [ "$rc" != 0 ]; then
+  msg="$(grep -m1 '^Error: ' "$tmpd/engine.log" | sed 's/^Error: //')" || true
+  [ "$msg" = "Cancelled" ] && exit 130
+  if [ -n "$msg" ]; then die "$msg"; fi
+  printf '%s✗%s Something went wrong:\n' "$RED" "$R" >&2
+  tail -n 5 "$tmpd/engine.log" | sed "s/^/  $D/; s/\$/$R/" >&2
+  exit 1
 fi
 
+secs=""
+if [ -f "$tmpd/result" ] && read -r a _ < "$tmpd/result"; then secs="$(human_secs "$a") of audio"; fi
+
 if [ -n "$out" ]; then
-  [ -f "$tmpd/out.$ext" ] || die "no audio was made"
+  [ -f "$tmpd/out.$ext" ] || die "No audio was made."
   mv "$tmpd/out.$ext" "$out"
-  echo "Saved $out" >&2
+  if [ "$LIVE" = 1 ]; then
+    size="$(human_size "$(stat -c %s "$out" 2>/dev/null || wc -c < "$out")")"
+    done_msg "Saved ${B}$out${R}" "${secs:+$secs · }$size"
+  else
+    echo "Saved $out" >&2
+  fi
+elif [ "$LIVE" = 1 ]; then
+  done_msg "Done" "$secs"
 fi

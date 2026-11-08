@@ -6,6 +6,12 @@ Natural-sounding offline text-to-speech on your Android phone. kokomux installs 
 kokoro -p "Hello from my phone"
 ```
 
+<p>
+  <img src="docs/install-progress.png" width="32%" alt="The installer checking the phone and downloading the voice model">
+  <img src="docs/install-done.png" width="32%" alt="The finished install with a quick-start card">
+  <img src="docs/kokoro.png" width="32%" alt="Using the kokoro command: saving a file, playing text, an error message and the status screen">
+</p>
+
 ## Install
 
 You need **Termux from F-Droid or GitHub** (the Play Store version is outdated), a 64-bit phone, and about **600 MB** of free space. Then run this in Termux:
@@ -14,7 +20,12 @@ You need **Termux from F-Droid or GitHub** (the Play Store version is outdated),
 curl -fsSLO https://raw.githubusercontent.com/Anesu/kokomux/main/install.sh && bash install.sh
 ```
 
-Installing takes 5–15 minutes. When it's done it plays a test clip. Running it again is safe: it skips what's already done and updates the rest.
+The installer checks your phone first (CPU, free space, connection), shows what it's going to do, and asks before starting. Then it works through seven steps with live progress, and keeps the phone awake until it's done. Installing takes 5–15 minutes. At the end it says hello out loud. Running it again is safe: it skips what's already done and updates the rest.
+
+- `--yes` skips the question (for scripts).
+- `--verbose` shows everything the installer runs.
+
+If a step fails, the installer shows what went wrong and how to fix it ([example](docs/install-error.png)). The full log is kept at `~/.cache/kokomux/install.log`. If you stop it with Ctrl+C, nothing breaks: run it again and it carries on.
 
 **Optional extras:**
 - **Termux:API app** (from the same place you got Termux) plus `pkg install termux-api`, for reading the clipboard.
@@ -114,4 +125,5 @@ The files in `src/` are the source. `./build.sh` bundles them into the single `i
 | `src/kokoro` | the `kokoro` command (Termux side) |
 | `src/engine.py` | Kokoro engine, server, web-page reader and model downloader (container side) |
 | `src/setup-container.sh` | installs everything inside the container |
-| `src/install.sh` | installer template |
+| `src/install.sh` | installer template (UI, checks, steps) |
+| `VERSION` | the version stamped into both by `build.sh` |
