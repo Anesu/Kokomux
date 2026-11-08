@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.9.0"
+KOKOMUX_VERSION="0.10.0"
 DISTRO=kokoro
 
 ASSUME_YES=0; VERBOSE=0
@@ -39,6 +39,8 @@ done
 #                          its own background)
 #   theme_detect           ask the terminal what its colours are (OSC 10/11)
 #   theme_grad N           GRAD: N colours from violet to cyan (the logo)
+#   theme_tone LEVEL       REPLY: the text colour faded to LEVEL thousandths
+#                          (the reader's focus effect)
 #
 # One palette for dark and light, derived from the terminal's own background:
 # every grey is the background moved part of the way towards the text colour,
@@ -62,6 +64,10 @@ done
 # command-line output always follows the terminal, since it can't.
 
 THEME_STEPS=(1000 618 382 236 146 90)            # φ⁻ⁿ, in thousandths
+# φ^(−i/4), in thousandths: a falloff in quarter golden steps (the focus effect)
+THEME_DECAY=(1000 887 786 697 618 548 486 431 382 339 300 266 236 209 186 165 146 129 115 102
+             90 80 71 63 56 49 44 39 34 31 27 24 21 19 17 15 13 12 10 9 8)
+declare -gA THEME_TONES=()            # theme_tone's colours, by level
 # name:   background  text    violet  sky     green   red     amber   cyan (logo end)
 THEME_DARK=(16151d    e8e6f0  b69cff  7cd0f5  86d39a  ff7a7a  efc764  9ff0ec)
 THEME_LIGHT=(fbfaf8   1c1b22  6438c9  0b67a0  21743a  c0262d  855300  0f7c86)
@@ -194,6 +200,7 @@ theme_apply() {  # theme_apply [screen]
   bg=${p[0]} fg=${p[1]}
   [ "$THEME_PAINT" = 0 ] && [ -n "$THEME_TERM_BG" ] && [ "$THEME_TERM_MODE" = "$THEME_MODE" ] && bg=$THEME_TERM_BG
   THEME_BG=$bg THEME_FG=$fg THEME_ACC=${p[2]} THEME_END=${p[7]}
+  THEME_TONES=()
   if theme_truecolor; then THEME_TRUE=1; else THEME_TRUE=0; fi
 
   R=$'\033[0m' B=$'\033[1m' BASE=""
@@ -227,6 +234,14 @@ theme_grad() {   # theme_grad N: GRAD, N colours from the accent to the logo's c
     theme_mix "$THEME_ACC" "$THEME_END" $(( n > 1 ? k * 1000 / (n - 1) : 0 ))
     theme_fg "$REPLY"; GRAD+=("$REPLY")
   done
+}
+
+theme_tone() {   # theme_tone LEVEL: REPLY = the text colour, LEVEL thousandths of the way from the background
+  local k=$(( ($1 + 5) / 10 * 10 ))                # in steps of 1%, so there are few to remember
+  if [ -z "${THEME_TONES[$k]+x}" ]; then
+    theme_mix "$THEME_BG" "$THEME_FG" "$k"; theme_fg "$REPLY"; THEME_TONES[$k]=$REPLY
+  fi
+  REPLY=${THEME_TONES[$k]}
 }
 
 theme_name() {   # what the settings menu shows beside "Colours"
@@ -1409,6 +1424,11 @@ cat > "$WORK/tui.sh" <<'__KOKOMUX_TUI__'
 # content (the optical centre, a little above the middle); settings split
 # their width φ⁻² : φ⁻¹ between labels and values.
 #
+# The focus effect (KOKORO_FOCUS): like a camera's depth of field, text fades
+# the further it is from the part being read, by quarter golden steps, down to
+# φ⁻⁴ at the edges. Ahead of the voice the next words are in sharpest focus,
+# and the part just heard eases out of focus over 382 ms.
+#
 # Expects from kokoro: the colours, $tmpd, $KBD (a read descriptor on
 # /dev/tty), KEY (set by tick), and for the home screen BOOKS, CONF, mark_get,
 # KOKORO_VOICE and KOKORO_SPEED.
@@ -1422,6 +1442,7 @@ TUI_STATE=""; TUI_EXTRA=""; TUI_SYM=""; TUI_PAUSED=0; TUI_TITLE=""; TUI_INFO=""
 TUI_BTN=()                            # clickable buttons: "row x0 x1 command"
 TUI_CHAPTER=""; TUI_HAS_CHAPTERS=0; TUI_BAR=(3 10)   # the progress bar's first column and width
 SYNC_ON=$'\033[?2026h'; SYNC_OFF=$'\033[?2026l'
+TUI_FOCUS=0; TUI_EASE_AT=0; TUI_EASE_MS=382   # the focus effect; the part just heard eases out
 
 tui_size() {
   local size
@@ -1457,6 +1478,7 @@ tui_theme() {    # ask the terminal its colours (once), then pick the palette
   [ "$THEME_ON" = 1 ] || return 0                             # no colours (NO_COLOR)
   [ "$THEME_ASKED" = 1 ] || theme_detect || true
   theme_apply screen
+  TUI_FOCUS=0; [ "${KOKORO_FOCUS:-1}" = 1 ] && TUI_FOCUS=1
 }
 
 tui_open() {
@@ -1511,8 +1533,14 @@ tui_wrap() {     # tui_wrap K: part K's text wrapped to the column, once
   TUI_WRAP[$k]=$lines; TUI_OFFS[$k]=$offs
 }
 
+tui_far() {      # tui_far NEAR DIST SCALE: REPLY = the tone DIST rows away (SCALE: rows per golden step, ×1000)
+  local i=$(( ($2 * 4000 + $3 / 2) / $3 ))
+  [ "$i" -le 40 ] || i=40
+  REPLY=$(( 146 + ($1 - 146) * THEME_DECAY[i] / 1000 ))   # never fainter than φ⁻⁴
+}
+
 tui_text() {     # the reading column: what's been heard above, this part, what's next below
-  local top=4 bottom=$(( TH - 5 )) h k j n r idx a hl=0 LC_ALL=C
+  local top=4 bottom=$(( TH - 5 )) h k j n r idx a hl=0 s ease=1000 last=0 lvl LC_ALL=C
   local -a past=() now_rows=() offs=() next=() rows=()
   h=$(( bottom - top + 1 ))
   if [ "$TUI_PART" = 0 ] || ! tui_wrap "$TUI_PART"; then   # nothing to show yet
@@ -1530,6 +1558,7 @@ tui_text() {     # the reading column: what's been heard above, this part, what'
     tui_wrap "${tui_hist[j]}" || continue
     mapfile -t rows <<< "${TUI_WRAP[${tui_hist[j]}]%$'\n'}"
     past=("${rows[@]}" "${past[@]}")
+    [ "$j" = $(( ${#tui_hist[@]} - 1 )) ] && last=${#rows[@]}   # the part just heard
   done
   for (( k = TUI_PART + 1; ${#next[@]} < h; k++ )); do
     tui_wrap "$k" || break
@@ -1543,20 +1572,35 @@ tui_text() {     # the reading column: what's been heard above, this part, what'
   golden "$h"; a=$(( top + REPLY ))
   [ $(( a + hl )) -le $(( bottom - 2 )) ] || a=$(( bottom - 2 - hl ))
   n=${#now_rows[@]}
+  # Focus: the fade takes a golden step every h·φ⁻⁵ rows, whatever the screen's height.
+  s=$(( h * 90 )); [ "$s" -ge 1200 ] || s=1200
+  if [ "$TUI_FOCUS" = 1 ] && [ "$TUI_EASE_AT" -gt 0 ]; then
+    now_ms; ease=$(( (NOW - TUI_EASE_AT) * 1000 / TUI_EASE_MS ))
+    if [ "$ease" -ge 1000 ]; then ease=1000 TUI_EASE_AT=0
+    else ease=$(( ease * ease * (3000 - 2 * ease) / 1000000 )); fi   # smoothstep: slow, quick, slow
+  fi
   printf '%s%s' "$SYNC_ON" "$R" >&2
   for (( r = top; r <= bottom; r++ )); do
     idx=$(( r - a ))
     printf '\033[%d;1H\033[2K\033[%dG' "$r" $(( LM + 1 )) >&2
     if [ "$idx" -lt 0 ]; then
       j=$(( ${#past[@]} + idx ))
-      [ "$j" -ge 0 ] && printf '%s%s%s' "$PAST" "${past[j]}" "$R" >&2
+      [ "$j" -ge 0 ] || continue
+      if [ "$TUI_FOCUS" = 1 ]; then                # heard: from ½, fading upwards
+        tui_far 500 $(( -idx - 1 )) "$s"; lvl=$REPLY
+        [ "$j" -ge $(( ${#past[@]} - last )) ] && lvl=$(( lvl + (1000 - lvl) * (1000 - ease) / 1000 ))
+        theme_tone "$lvl"; printf '%s%s%s' "$REPLY" "${past[j]}" "$R" >&2
+      else printf '%s%s%s' "$PAST" "${past[j]}" "$R" >&2; fi
     elif [ "$idx" -lt "$n" ]; then
       printf '\033[%dG%s▎%s' $(( LM - 1 )) "$ACC" "$R" >&2   # marks the part being read
       printf '\033[%dG' $(( LM + 1 )) >&2
       tui_row "${now_rows[idx]}" "${offs[idx]}"
     else
       j=$(( idx - n ))
-      [ "$j" -lt "${#next[@]}" ] && printf '%s%s%s' "$D" "${next[j]}" "$R" >&2
+      [ "$j" -lt "${#next[@]}" ] || continue
+      if [ "$TUI_FOCUS" = 1 ]; then                # still to come: from φ⁻¹, fading downwards
+        tui_far 618 "$j" "$s"; theme_tone "$REPLY"; printf '%s%s%s' "$REPLY" "${next[j]}" "$R" >&2
+      else printf '%s%s%s' "$D" "${next[j]}" "$R" >&2; fi
     fi
   done
   printf '%s' "$SYNC_OFF" >&2
@@ -1567,11 +1611,26 @@ tui_row() {      # tui_row TEXT OFFSET: one row of this part, the lit word in th
   if [ "$a" -lt 0 ] || [ $(( o + len )) -le "$a" ]; then
     printf '%s' "$row" >&2                                    # already spoken
   elif [ "$o" -ge "$b" ]; then
-    printf '%s%s%s' "$D" "$row" "$R" >&2                      # still to come
+    tui_ahead "$row" $(( o - b ))                             # still to come
   else
     x=$(( a > o ? a - o : 0 )); y=$(( b - o < len ? b - o : len ))
-    printf '%s%s%s%s%s%s' "${row:0:x}" "$HL" "${row:x:y-x}" "$R$D" "${row:y}" "$R" >&2
+    printf '%s%s%s%s' "${row:0:x}" "$HL" "${row:x:y-x}" "$R" >&2
+    tui_ahead "${row:y}" $(( o + y - b ))
   fi
+}
+
+tui_ahead() {    # tui_ahead TEXT DIST: words still to come, DIST bytes after the lit word
+  # In focus: the next word is halfway between full and φ⁻¹, and the words after
+  # it settle to φ⁻¹ by a golden step every 12 characters (two or three words).
+  local t=$1 d=$2 w i LC_ALL=C
+  if [ "$TUI_FOCUS" != 1 ]; then printf '%s%s%s' "$D" "$t" "$R" >&2; return 0; fi
+  while [ -n "$t" ]; do
+    w=${t%% *}; [ "$w" = "$t" ] || w+=" "                     # a word and the space after it
+    i=$(( d / 3 )); [ "$i" -le 40 ] || i=40
+    theme_tone $(( 618 + 191 * THEME_DECAY[i] / 1000 )); printf '%s%s' "$REPLY" "$w" >&2
+    d=$(( d + ${#w} )); t=${t:${#w}}
+  done
+  printf '%s' "$R" >&2
 }
 
 tui_progress() {
@@ -1645,12 +1704,16 @@ tui_draw() {
 # ---------------------------------------------------------------- the reader's view API
 
 tui_part() {     # tui_part I PARTS: a new part starts playing (dim until its words light)
-  [ "$TUI_PART" -gt 0 ] && [ "$TUI_PART" != "$1" ] && tui_hist+=("$TUI_PART")
+  if [ "$TUI_PART" -gt 0 ] && [ "$TUI_PART" != "$1" ]; then
+    tui_hist+=("$TUI_PART")
+    [ "$TUI_FOCUS" = 1 ] && { now_ms; TUI_EASE_AT=$NOW; }    # it eases out of focus
+  fi
   [ "${#tui_hist[@]}" -le 40 ] || tui_hist=("${tui_hist[@]: -40}")
   TUI_PART=$1 TUI_PARTS=${2:-$TUI_PARTS} TUI_A=0 TUI_B=0
   tui_draw
 }
 tui_light() { TUI_A=$1 TUI_B=$2; tui_text; }
+tui_anim() { [ "$TUI_EASE_AT" -gt 0 ] && tui_text; return 0; }   # each tick while the part just heard eases out
 tui_state() {    # tui_state TEXT EXTRA SYMBOL PAUSED: only the footer is redrawn
   [ "$1|$2|$3|${4:-0}" = "$TUI_STATE|$TUI_EXTRA|$TUI_SYM|$TUI_PAUSED" ] && return 0
   TUI_STATE=$1 TUI_EXTRA=$2 TUI_SYM=$3 TUI_PAUSED=${4:-0}
@@ -1875,6 +1938,7 @@ TUI_SETTINGS=(
   "#Reading"
   "KOKORO_TUI|Full-screen reader|Open the full-screen reader when you listen on a terminal. Off: show the text below the command instead."
   "theme|Colours|Auto follows your terminal's own colours. Dark or Light uses that palette on these screens, with its own background if your terminal is the other kind."
+  "KOKORO_FOCUS|Focus effect|Text fades the further it is from the part being read, like a camera's depth of field, and the words just ahead of the voice are in sharpest focus."
   "KOKORO_WORDS|Light up words|Highlight each word as it's spoken, using the timings Kokoro reports as it speaks, in every language."
   "offset|Highlight timing|Moves the highlight relative to the voice. Raise it if the highlight runs ahead, lower it if it lags."
   "#While listening"
@@ -2224,7 +2288,7 @@ view_state() {   # view_state TEXT EXTRA [SYMBOL] [PAUSED]: what's happening (a 
   if [ "$ui" = tui ]; then tui_state "$1" "$2" "$sym" "${4:-0}"; else status "$1" "$2" "$sym"; fi
 }
 view_part_end() { if [ "$ui" = tui ]; then tui_light -1 -1; elif [ "$show_words" = 1 ]; then block_finish; fi; }
-view_refresh() { [ "$ui" = tui ] && tui_refresh; return 0; }
+view_refresh() { [ "$ui" = tui ] && { tui_refresh; tui_anim; }; return 0; }
 
 words_load() {   # read NNNN.words once it lands
   local f=$1 s e a b
@@ -2443,6 +2507,8 @@ cat > "$WORK/theme.sh" <<'__KOKOMUX_THEME__'
 #                          its own background)
 #   theme_detect           ask the terminal what its colours are (OSC 10/11)
 #   theme_grad N           GRAD: N colours from violet to cyan (the logo)
+#   theme_tone LEVEL       REPLY: the text colour faded to LEVEL thousandths
+#                          (the reader's focus effect)
 #
 # One palette for dark and light, derived from the terminal's own background:
 # every grey is the background moved part of the way towards the text colour,
@@ -2466,6 +2532,10 @@ cat > "$WORK/theme.sh" <<'__KOKOMUX_THEME__'
 # command-line output always follows the terminal, since it can't.
 
 THEME_STEPS=(1000 618 382 236 146 90)            # φ⁻ⁿ, in thousandths
+# φ^(−i/4), in thousandths: a falloff in quarter golden steps (the focus effect)
+THEME_DECAY=(1000 887 786 697 618 548 486 431 382 339 300 266 236 209 186 165 146 129 115 102
+             90 80 71 63 56 49 44 39 34 31 27 24 21 19 17 15 13 12 10 9 8)
+declare -gA THEME_TONES=()            # theme_tone's colours, by level
 # name:   background  text    violet  sky     green   red     amber   cyan (logo end)
 THEME_DARK=(16151d    e8e6f0  b69cff  7cd0f5  86d39a  ff7a7a  efc764  9ff0ec)
 THEME_LIGHT=(fbfaf8   1c1b22  6438c9  0b67a0  21743a  c0262d  855300  0f7c86)
@@ -2598,6 +2668,7 @@ theme_apply() {  # theme_apply [screen]
   bg=${p[0]} fg=${p[1]}
   [ "$THEME_PAINT" = 0 ] && [ -n "$THEME_TERM_BG" ] && [ "$THEME_TERM_MODE" = "$THEME_MODE" ] && bg=$THEME_TERM_BG
   THEME_BG=$bg THEME_FG=$fg THEME_ACC=${p[2]} THEME_END=${p[7]}
+  THEME_TONES=()
   if theme_truecolor; then THEME_TRUE=1; else THEME_TRUE=0; fi
 
   R=$'\033[0m' B=$'\033[1m' BASE=""
@@ -2631,6 +2702,14 @@ theme_grad() {   # theme_grad N: GRAD, N colours from the accent to the logo's c
     theme_mix "$THEME_ACC" "$THEME_END" $(( n > 1 ? k * 1000 / (n - 1) : 0 ))
     theme_fg "$REPLY"; GRAD+=("$REPLY")
   done
+}
+
+theme_tone() {   # theme_tone LEVEL: REPLY = the text colour, LEVEL thousandths of the way from the background
+  local k=$(( ($1 + 5) / 10 * 10 ))                # in steps of 1%, so there are few to remember
+  if [ -z "${THEME_TONES[$k]+x}" ]; then
+    theme_mix "$THEME_BG" "$THEME_FG" "$k"; theme_fg "$REPLY"; THEME_TONES[$k]=$REPLY
+  fi
+  REPLY=${THEME_TONES[$k]}
 }
 
 theme_name() {   # what the settings menu shows beside "Colours"
@@ -2706,7 +2785,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
 # localhost (fast); otherwise each call starts the container (slower).
 set -euo pipefail
 
-KOKOMUX_VERSION="0.9.0"
+KOKOMUX_VERSION="0.10.0"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -2730,6 +2809,7 @@ KOKORO_DEFAULTS=(
   KOKORO_NOTIFY=1               # a notification with pause / next / again buttons (Termux:API)
   KOKORO_TUI=1                  # -p on a terminal opens the full-screen reader (0: inline)
   KOKORO_THEME=auto             # colours: auto (follow the terminal), dark or light
+  KOKORO_FOCUS=1                # the reader fades text with its distance from the line being read
 )
 for kv in "${KOKORO_DEFAULTS[@]}"; do declare "$kv"; done
 KOKORO_REPO_RAW=https://raw.githubusercontent.com/Anesu/kokomux/main
@@ -3482,6 +3562,10 @@ KOKORO_TUI=1
 # uses that palette in the full-screen views, with its own background if the
 # terminal is the other kind.
 KOKORO_THEME=auto
+
+# The reader's focus effect: text fades the further it is from the part being
+# read, like a camera's depth of field. 0 shows it all evenly.
+KOKORO_FOCUS=1
 CFG
   fi
 

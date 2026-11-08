@@ -66,7 +66,9 @@ kokoro --stop                             # stop playback
 
 ## The reader and the home screen
 
-On a terminal, `kokoro -p` opens a full-screen reader. Across the top are the title, voice and speed. In the middle is a reading column, with what you've heard above it, the part being read marked with a bar and the spoken word lit, and what's coming next dimmed below. The part being read sits on the golden line, 38% of the way down, where the eye naturally rests. At the bottom are a progress bar and a row of buttons. The column stays at a comfortable reading width, so it works on a phone held upright and just as well on a wide Samsung DeX or tablet screen. It follows the window when you resize it.
+On a terminal, `kokoro -p` opens a full-screen reader. Across the top are the title, voice and speed. In the middle is a reading column, with what you've heard above it, the part being read marked with a bar and the spoken word lit, and what's coming next dimmed below. The part being read sits on the golden line, 38% of the way down, where the eye naturally rests.
+
+**The focus effect.** Like a camera's depth of field, the text fades the further it is from the part being read, down to a faint ghost at the edges of the screen, so your eye stays on the line being spoken. Ahead of the voice, the next few words are in sharpest focus and the rest of the sentence settles behind them. When a part ends, it eases out of focus over about a third of a second as the next one comes in. The fade follows the golden ratio: a quarter of a golden step for every half-line or so, never fainter than 14.6% of the way from the background to the text. A terminal can't blur text, so the effect works with brightness alone. If you'd rather see everything evenly, turn off **Focus effect** in the settings (or set `KOKORO_FOCUS=0`). At the bottom are a progress bar and a row of buttons. The column stays at a comfortable reading width, so it works on a phone held upright and just as well on a wide Samsung DeX or tablet screen. It follows the window when you resize it.
 
 <p>
   <img src="docs/reader-wide.png" width="68%" alt="The reader on a wide screen: header, centred reading column with the spoken word highlighted, progress bar and buttons">
@@ -191,6 +193,7 @@ Before 0.8, a separate speech recogniser (Whistle) listened to each line to find
 - **Reading:**
   - **Full-screen reader:** on or off.
   - **Colours:** Auto, Dark or Light (see [Colours](#colours-dark-and-light)).
+  - **Focus effect:** text fades with its distance from the line being read; on or off.
   - **Light up words:** on or off.
   - **Highlight timing:** in steps of 20 ms, for when the highlight runs ahead of or behind the voice.
 - **While listening:** notification controls on or off.
@@ -261,6 +264,7 @@ The files in `src/` are the source. `./build.sh` bundles them into the single `i
 | `src/words.py` | word timings from Kokoro's per-sound timings (container side) |
 | `tests/test_words.py` | tests for word timings, on recorded Kokoro output: `python3 tests/test_words.py` |
 | `tests/test_books.py` | tests for reading EPUB, PDF and text: `python3 tests/test_books.py` |
+| `tests/test_reader.py` | tests for the reader's focus effect: `python3 tests/test_reader.py` |
 | `tests/test_theme.py` | tests for the colours: contrast on 15 terminal themes, the golden steps, asking the terminal: `python3 tests/test_theme.py` |
 | `src/setup-container.sh` | installs everything inside the container |
 | `src/install.sh` | installer template (UI, checks, steps) |

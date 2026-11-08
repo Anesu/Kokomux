@@ -105,7 +105,7 @@ view_state() {   # view_state TEXT EXTRA [SYMBOL] [PAUSED]: what's happening (a 
   if [ "$ui" = tui ]; then tui_state "$1" "$2" "$sym" "${4:-0}"; else status "$1" "$2" "$sym"; fi
 }
 view_part_end() { if [ "$ui" = tui ]; then tui_light -1 -1; elif [ "$show_words" = 1 ]; then block_finish; fi; }
-view_refresh() { [ "$ui" = tui ] && tui_refresh; return 0; }
+view_refresh() { [ "$ui" = tui ] && { tui_refresh; tui_anim; }; return 0; }
 
 words_load() {   # read NNNN.words once it lands
   local f=$1 s e a b

@@ -31,6 +31,7 @@ KOKORO_DEFAULTS=(
   KOKORO_NOTIFY=1               # a notification with pause / next / again buttons (Termux:API)
   KOKORO_TUI=1                  # -p on a terminal opens the full-screen reader (0: inline)
   KOKORO_THEME=auto             # colours: auto (follow the terminal), dark or light
+  KOKORO_FOCUS=1                # the reader fades text with its distance from the line being read
 )
 for kv in "${KOKORO_DEFAULTS[@]}"; do declare "$kv"; done
 KOKORO_REPO_RAW=https://raw.githubusercontent.com/Anesu/kokomux/main

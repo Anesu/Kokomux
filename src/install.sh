@@ -459,6 +459,10 @@ KOKORO_TUI=1
 # uses that palette in the full-screen views, with its own background if the
 # terminal is the other kind.
 KOKORO_THEME=auto
+
+# The reader's focus effect: text fades the further it is from the part being
+# read, like a camera's depth of field. 0 shows it all evenly.
+KOKORO_FOCUS=1
 CFG
   fi
 

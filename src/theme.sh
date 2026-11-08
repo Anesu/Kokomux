@@ -6,6 +6,8 @@
 #                          its own background)
 #   theme_detect           ask the terminal what its colours are (OSC 10/11)
 #   theme_grad N           GRAD: N colours from violet to cyan (the logo)
+#   theme_tone LEVEL       REPLY: the text colour faded to LEVEL thousandths
+#                          (the reader's focus effect)
 #
 # One palette for dark and light, derived from the terminal's own background:
 # every grey is the background moved part of the way towards the text colour,
@@ -29,6 +31,10 @@
 # command-line output always follows the terminal, since it can't.
 
 THEME_STEPS=(1000 618 382 236 146 90)            # φ⁻ⁿ, in thousandths
+# φ^(−i/4), in thousandths: a falloff in quarter golden steps (the focus effect)
+THEME_DECAY=(1000 887 786 697 618 548 486 431 382 339 300 266 236 209 186 165 146 129 115 102
+             90 80 71 63 56 49 44 39 34 31 27 24 21 19 17 15 13 12 10 9 8)
+declare -gA THEME_TONES=()            # theme_tone's colours, by level
 # name:   background  text    violet  sky     green   red     amber   cyan (logo end)
 THEME_DARK=(16151d    e8e6f0  b69cff  7cd0f5  86d39a  ff7a7a  efc764  9ff0ec)
 THEME_LIGHT=(fbfaf8   1c1b22  6438c9  0b67a0  21743a  c0262d  855300  0f7c86)
@@ -161,6 +167,7 @@ theme_apply() {  # theme_apply [screen]
   bg=${p[0]} fg=${p[1]}
   [ "$THEME_PAINT" = 0 ] && [ -n "$THEME_TERM_BG" ] && [ "$THEME_TERM_MODE" = "$THEME_MODE" ] && bg=$THEME_TERM_BG
   THEME_BG=$bg THEME_FG=$fg THEME_ACC=${p[2]} THEME_END=${p[7]}
+  THEME_TONES=()
   if theme_truecolor; then THEME_TRUE=1; else THEME_TRUE=0; fi
 
   R=$'\033[0m' B=$'\033[1m' BASE=""
@@ -194,6 +201,14 @@ theme_grad() {   # theme_grad N: GRAD, N colours from the accent to the logo's c
     theme_mix "$THEME_ACC" "$THEME_END" $(( n > 1 ? k * 1000 / (n - 1) : 0 ))
     theme_fg "$REPLY"; GRAD+=("$REPLY")
   done
+}
+
+theme_tone() {   # theme_tone LEVEL: REPLY = the text colour, LEVEL thousandths of the way from the background
+  local k=$(( ($1 + 5) / 10 * 10 ))                # in steps of 1%, so there are few to remember
+  if [ -z "${THEME_TONES[$k]+x}" ]; then
+    theme_mix "$THEME_BG" "$THEME_FG" "$k"; theme_fg "$REPLY"; THEME_TONES[$k]=$REPLY
+  fi
+  REPLY=${THEME_TONES[$k]}
 }
 
 theme_name() {   # what the settings menu shows beside "Colours"
