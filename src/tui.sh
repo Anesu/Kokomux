@@ -300,6 +300,9 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
   trap 'TUI_RESIZED=1' WINCH
   mapfile -t marks < <(ls -t "$BOOKS"/*.mark 2>/dev/null | head -n 6)
   HOME_CHOICE=()
+  while IFS= read -rsn1 -t 0.05 -u "$KBD" _; do :; done   # drop keys typed before it opened
+  local clip_note=""
+  [ "$(cat "${CONF%/*}/termux-api" 2>/dev/null)" = yes ] || clip_note="  ${D}needs the Termux:API app${R}"
   while :; do
     tui_size; rowact=()
     printf '%s\033[2J' "$SYNC_ON" >&2
@@ -338,7 +341,7 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
     done
     y=$(( y + 1 ))
     printf '\033[%d;%dH%sStart something new%s' "$y" "$x0" "$B" "$R" >&2; y=$(( y + 1 ))
-    for spec in "c|Read the clipboard|clip" "f|Open a file  ${D}text, EPUB or PDF${R}|file" \
+    for spec in "c|Read the clipboard$clip_note|clip" "f|Open a file  ${D}text, EPUB or PDF${R}|file" \
                 "u|Read a web page|url" "t|Type something to hear|text" \
                 "v|Voice  ${D}$KOKORO_VOICE · ${KOKORO_SPEED}×${R}|voice" "s|Settings  ${D}speed, highlighting, notifications…${R}|settings"; do
       IFS='|' read -r key r cmd <<< "$spec"

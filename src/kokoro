@@ -460,14 +460,15 @@ gen_pid=""; play_pid=""
 cleanup() {
   set +e   # best effort from here: a process that's already gone mustn't change the exit code
   status_clear
-  [ "${in_line:-0}" = 1 ] && [ "${ui:-}" = inline ] && [ "${show_words:-0}" = 1 ] && block_finish   # nothing lit
+  # (the player's functions exist only once player.sh is loaded: a run can stop before that)
+  [ "${in_line:-0}" = 1 ] && [ "${ui:-}" = inline ] && [ "${show_words:-0}" = 1 ] && declare -F block_finish >/dev/null && block_finish
   declare -F tui_close >/dev/null && tui_close
   keys_off
   if [ "${ui:-none}" != none ] && [ -n "${book_id:-}" ] && [ -f "$BOOKS/$book_id.mark" ]; then
     [ "${SLEPT:-0}" = 1 ] && info "Sleep timer: good night."
     info "Stopped at part $(mark_get "$BOOKS/$book_id.mark" part) of $(mark_get "$BOOKS/$book_id.mark" parts). ${D}kokoro --continue picks up there.${R}"
   fi
-  if [ "${play:-0}" = 1 ]; then notify_clear; rm -f "$PLAYER_STATE"; fi
+  if [ "${play:-0}" = 1 ]; then declare -F notify_clear >/dev/null && notify_clear; rm -f "$PLAYER_STATE"; fi
   [ -n "$play_pid" ] && kill "$play_pid" 2>/dev/null
   [ -n "$gen_pid" ] && kill "$gen_pid" 2>/dev/null
   rm -rf "$tmpd"
@@ -486,9 +487,21 @@ if [ -n "$url" ]; then
 elif [ "$clip" = 1 ]; then
   command -v termux-clipboard-get >/dev/null ||
     die "Reading the clipboard needs Termux:API." "Install the Termux:API app, then: pkg install termux-api"
-  status "Reading the clipboard"
-  timeout 15 termux-clipboard-get > "$text" ||
-    die "Couldn't read the clipboard." "Is the Termux:API app installed? Get it where you got Termux."
+  # termux-clipboard-get waits forever without the Termux:API app, so give it a few
+  # seconds, show that it's waiting, and remember the answer for the home screen.
+  termux-clipboard-get > "$text" 2>/dev/null & cpid=$!
+  for n in $(seq 60); do
+    kill -0 "$cpid" 2>/dev/null || break
+    status "Reading the clipboard" "(this needs the Termux:API app)"; sleep 0.1
+  done
+  mkdir -p "$CONF_DIR"
+  if kill -0 "$cpid" 2>/dev/null || ! wait "$cpid"; then
+    kill "$cpid" 2>/dev/null || true
+    echo no > "$CONF_DIR/termux-api"
+    die "Couldn't read the clipboard: the Termux:API app didn't answer." \
+        "Install the Termux:API app from F-Droid (where you got Termux), open it once, then try again."
+  fi
+  echo yes > "$CONF_DIR/termux-api"
 elif [ -n "$infile" ]; then
   [ -f "$infile" ] || die "There's no file called \"$infile\"."
   cp "$infile" "$text"

@@ -463,8 +463,11 @@ voice_test() {
   rm -f "$HOME/kokoro-test.wav"   # left by older versions
   kokoro -o "$WORK/hello.wav" "$GREETING"
   # Is the Termux:API app there? (termux-* commands hang without it.)
+  mkdir -p "$HOME/.config/kokoro"
   if command -v termux-clipboard-get >/dev/null && timeout 4 termux-clipboard-get >/dev/null 2>&1; then
-    touch "$WORK/.api"
+    touch "$WORK/.api"; echo yes > "$HOME/.config/kokoro/termux-api"
+  else
+    echo no > "$HOME/.config/kokoro/termux-api"
   fi
   # The container's size, for the summary. Only a nicety: du complains about the
   # odd file it can't read inside a proot container, and that mustn't fail the step.

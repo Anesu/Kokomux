@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.8.1"
+KOKOMUX_VERSION="0.8.2"
 DISTRO=kokoro
 
 ASSUME_YES=0; VERBOSE=0
@@ -1471,6 +1471,9 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
   trap 'TUI_RESIZED=1' WINCH
   mapfile -t marks < <(ls -t "$BOOKS"/*.mark 2>/dev/null | head -n 6)
   HOME_CHOICE=()
+  while IFS= read -rsn1 -t 0.05 -u "$KBD" _; do :; done   # drop keys typed before it opened
+  local clip_note=""
+  [ "$(cat "${CONF%/*}/termux-api" 2>/dev/null)" = yes ] || clip_note="  ${D}needs the Termux:API app${R}"
   while :; do
     tui_size; rowact=()
     printf '%s\033[2J' "$SYNC_ON" >&2
@@ -1509,7 +1512,7 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
     done
     y=$(( y + 1 ))
     printf '\033[%d;%dH%sStart something new%s' "$y" "$x0" "$B" "$R" >&2; y=$(( y + 1 ))
-    for spec in "c|Read the clipboard|clip" "f|Open a file  ${D}text, EPUB or PDF${R}|file" \
+    for spec in "c|Read the clipboard$clip_note|clip" "f|Open a file  ${D}text, EPUB or PDF${R}|file" \
                 "u|Read a web page|url" "t|Type something to hear|text" \
                 "v|Voice  ${D}$KOKORO_VOICE · ${KOKORO_SPEED}×${R}|voice" "s|Settings  ${D}speed, highlighting, notifications…${R}|settings"; do
       IFS='|' read -r key r cmd <<< "$spec"
@@ -2213,7 +2216,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
 # localhost (fast); otherwise each call starts the container (slower).
 set -euo pipefail
 
-KOKOMUX_VERSION="0.8.1"
+KOKOMUX_VERSION="0.8.2"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -2666,14 +2669,15 @@ gen_pid=""; play_pid=""
 cleanup() {
   set +e   # best effort from here: a process that's already gone mustn't change the exit code
   status_clear
-  [ "${in_line:-0}" = 1 ] && [ "${ui:-}" = inline ] && [ "${show_words:-0}" = 1 ] && block_finish   # nothing lit
+  # (the player's functions exist only once player.sh is loaded: a run can stop before that)
+  [ "${in_line:-0}" = 1 ] && [ "${ui:-}" = inline ] && [ "${show_words:-0}" = 1 ] && declare -F block_finish >/dev/null && block_finish
   declare -F tui_close >/dev/null && tui_close
   keys_off
   if [ "${ui:-none}" != none ] && [ -n "${book_id:-}" ] && [ -f "$BOOKS/$book_id.mark" ]; then
     [ "${SLEPT:-0}" = 1 ] && info "Sleep timer: good night."
     info "Stopped at part $(mark_get "$BOOKS/$book_id.mark" part) of $(mark_get "$BOOKS/$book_id.mark" parts). ${D}kokoro --continue picks up there.${R}"
   fi
-  if [ "${play:-0}" = 1 ]; then notify_clear; rm -f "$PLAYER_STATE"; fi
+  if [ "${play:-0}" = 1 ]; then declare -F notify_clear >/dev/null && notify_clear; rm -f "$PLAYER_STATE"; fi
   [ -n "$play_pid" ] && kill "$play_pid" 2>/dev/null
   [ -n "$gen_pid" ] && kill "$gen_pid" 2>/dev/null
   rm -rf "$tmpd"
@@ -2692,9 +2696,21 @@ if [ -n "$url" ]; then
 elif [ "$clip" = 1 ]; then
   command -v termux-clipboard-get >/dev/null ||
     die "Reading the clipboard needs Termux:API." "Install the Termux:API app, then: pkg install termux-api"
-  status "Reading the clipboard"
-  timeout 15 termux-clipboard-get > "$text" ||
-    die "Couldn't read the clipboard." "Is the Termux:API app installed? Get it where you got Termux."
+  # termux-clipboard-get waits forever without the Termux:API app, so give it a few
+  # seconds, show that it's waiting, and remember the answer for the home screen.
+  termux-clipboard-get > "$text" 2>/dev/null & cpid=$!
+  for n in $(seq 60); do
+    kill -0 "$cpid" 2>/dev/null || break
+    status "Reading the clipboard" "(this needs the Termux:API app)"; sleep 0.1
+  done
+  mkdir -p "$CONF_DIR"
+  if kill -0 "$cpid" 2>/dev/null || ! wait "$cpid"; then
+    kill "$cpid" 2>/dev/null || true
+    echo no > "$CONF_DIR/termux-api"
+    die "Couldn't read the clipboard: the Termux:API app didn't answer." \
+        "Install the Termux:API app from F-Droid (where you got Termux), open it once, then try again."
+  fi
+  echo yes > "$CONF_DIR/termux-api"
 elif [ -n "$infile" ]; then
   [ -f "$infile" ] || die "There's no file called \"$infile\"."
   cp "$infile" "$text"
@@ -2980,8 +2996,11 @@ voice_test() {
   rm -f "$HOME/kokoro-test.wav"   # left by older versions
   kokoro -o "$WORK/hello.wav" "$GREETING"
   # Is the Termux:API app there? (termux-* commands hang without it.)
+  mkdir -p "$HOME/.config/kokoro"
   if command -v termux-clipboard-get >/dev/null && timeout 4 termux-clipboard-get >/dev/null 2>&1; then
-    touch "$WORK/.api"
+    touch "$WORK/.api"; echo yes > "$HOME/.config/kokoro/termux-api"
+  else
+    echo no > "$HOME/.config/kokoro/termux-api"
   fi
   # The container's size, for the summary. Only a nicety: du complains about the
   # odd file it can't read inside a proot container, and that mustn't fail the step.
