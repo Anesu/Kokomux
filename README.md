@@ -90,7 +90,8 @@ Run `kokoro` on its own to open the **home screen**. It lists the books and long
 | f | open a file (text, EPUB or PDF), with Tab completion |
 | u | read a web page |
 | t | type something to hear |
-| v / s | change and save your default voice or speed |
+| v | choose a voice (type to filter, Space to hear it) |
+| s | settings |
 
 <p><img src="docs/home.png" width="80%" alt="The home screen: books in progress with progress bars, and one-key actions"></p>
 
@@ -138,6 +139,26 @@ After the installer has fetched Whistle, highlighting works offline. Whistle tra
 - **Home-screen buttons.** With Termux:Widget installed, add a Termux widget to the home screen. It lists **Kokoro read clipboard**, **Kokoro pause**, **Kokoro next**, **Kokoro continue** and **Kokoro stop**. Copy some text, then tap **Kokoro read clipboard**; tap **Kokoro continue** to pick up your book.
 
 ## Settings
+
+`kokoro --settings` (or **s** on the home screen) opens the settings menu. Move with ↑↓ or the mouse wheel. Change a value with ← and →, or with Enter, a click, or a second click. A line at the bottom says what the selected setting does. Every change is saved at once, with a ✓ Saved in the corner.
+
+<p>
+  <img src="docs/settings.png" width="49%" alt="The settings menu: voice, speed slider, language, toggles for the reader, word highlighting and notifications, and the background server">
+  <img src="docs/voices.png" width="49%" alt="The voice picker, filtered to British female voices">
+</p>
+
+- **Voice and speech:**
+  - **Voice:** a picker for all 54 voices. Type to filter (`bf` shows the British female voices), press Space to hear one say a line in its own language, and Enter to choose it. Choosing a voice also sets the matching language.
+  - **Speed:** a slider from 0.5× to 2×.
+  - **Language:** cycle through Kokoro's nine languages.
+  - **Save files as:** the default file name.
+- **Reading:**
+  - **Full-screen reader:** on or off.
+  - **Light up words:** on or off.
+  - **Highlight timing:** in steps of 20 ms, for when the highlight runs ahead of or behind the voice.
+- **While listening:** notification controls on or off.
+- **Background server:** keep Kokoro loaded, how long until it unloads (5 minutes to 2 hours, or never), and the port.
+- **Reset to defaults**, and **Edit the settings file** (opens it in your editor).
 
 `kokoro --config` opens the settings file (`~/.config/kokoro/config`). There you can set your default voice, speed, language, file name, and how the background server behaves. For a single command, environment variables override the file:
 

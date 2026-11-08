@@ -280,7 +280,7 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
     printf '\033[%d;%dH%sStart something new%s' "$y" "$x0" "$B" "$R" >&2; y=$(( y + 1 ))
     for spec in "c|Read the clipboard|clip" "f|Open a file  ${D}text, EPUB or PDF${R}|file" \
                 "u|Read a web page|url" "t|Type something to hear|text" \
-                "v|Voice  ${D}$KOKORO_VOICE${R}|voice" "s|Speed  ${D}${KOKORO_SPEED}×${R}|speed"; do
+                "v|Voice  ${D}$KOKORO_VOICE · ${KOKORO_SPEED}×${R}|voice" "s|Settings  ${D}speed, highlighting, notifications…${R}|settings"; do
       IFS='|' read -r key r cmd <<< "$spec"
       printf '\033[%d;%dH %s%s%s  %s' "$y" "$x0" "$ACC2" "$key" "$R" "$r" >&2
       rowact[$y]=$cmd; y=$(( y + 1 ))
@@ -297,7 +297,7 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
       $'\n'|$'\r') [ "${#marks[@]}" -gt 0 ] && cmd="mark:$sel" ;;
       $'\033[A'|$'\033OA'|k|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;   # also the mouse wheel
       $'\033[B'|$'\033OB'|j|$'\033[<65;'*M) [ "$sel" -lt $(( ${#marks[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
-      c) cmd="clip" ;; f) cmd="file" ;; u) cmd="url" ;; t) cmd="text" ;; v) cmd="voice" ;; s) cmd="speed" ;;
+      c) cmd="clip" ;; f) cmd="file" ;; u) cmd="url" ;; t) cmd="text" ;; v) cmd="voice" ;; s|o|,) cmd="settings" ;;
       q|Q|$'\033') break ;;
       $'\033[<0;'*M) [[ "$KEY" =~ \;([0-9]+)M$ ]] && cmd="${rowact[${BASH_REMATCH[1]}]:-}" ;;
     esac
@@ -307,16 +307,293 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
       file)    tui_prompt "File to read:"; [ -n "$ANSWER" ] && { HOME_CHOICE=(-p -f "${ANSWER/#\~/$HOME}"); break; } ;;
       url)     tui_prompt "Web address:" "https://"; [ "${ANSWER:-https://}" != "https://" ] && { HOME_CHOICE=(-p -u "$ANSWER"); break; } ;;
       text)    tui_prompt "Say:"; [ -n "$ANSWER" ] && { HOME_CHOICE=(-p "$ANSWER"); break; } ;;
-      voice)   tui_prompt "Voice (see kokoro --list-voices):" "$KOKORO_VOICE"
-               if [[ "$ANSWER" =~ ^[a-z]{2}_[a-z]+$ ]]; then KOKORO_VOICE=$ANSWER; tui_save KOKORO_VOICE "$ANSWER"; fi ;;
-      speed)   tui_prompt "Speed, 0.5 to 2.0:" "$KOKORO_SPEED"
-               if [[ "$ANSWER" =~ ^(0\.[5-9][0-9]*|1(\.[0-9]+)?|2(\.0+)?)$ ]]; then KOKORO_SPEED=$ANSWER; tui_save KOKORO_SPEED "$ANSWER"; fi ;;
+      voice)    tui_voices ;;
+      settings) tui_settings ;;
     esac
   done
   tui_close
 }
 
-tui_save() {     # tui_save NAME VALUE: keep a choice made on the home screen in the settings
-  [ -f "$CONF" ] || return 0
+
+# ---------------------------------------------------------------- settings
+
+# Kokoro's voices (model v1.0), by language. The first letter of a voice is its
+# language and the second its gender, e.g. bf_emma is British English, female.
+TUI_VOICES=(
+  af_alloy af_aoede af_bella af_heart af_jessica af_kore af_nicole af_nova af_river af_sarah af_sky
+  am_adam am_echo am_eric am_fenrir am_liam am_michael am_onyx am_puck am_santa
+  bf_alice bf_emma bf_isabella bf_lily bm_daniel bm_fable bm_george bm_lewis
+  ef_dora em_alex em_santa ff_siwis hf_alpha hf_beta hm_omega hm_psi if_sara im_nicola
+  jf_alpha jf_gongitsune jf_nezumi jf_tebukuro jm_kumo pf_dora pm_alex pm_santa
+  zf_xiaobei zf_xiaoni zf_xiaoxiao zf_xiaoyi zm_yunjian zm_yunxi zm_yunxia zm_yunyang
+)
+TUI_LANGS=(en-us en-gb es fr-fr it pt-br hi ja cmn)
+SET_NARROW=0
+declare -A TUI_LANG_NAME=([en-us]="American English" [en-gb]="British English" [es]="Spanish"
+  [fr-fr]="French" [it]="Italian" [pt-br]="Brazilian Portuguese" [hi]="Hindi"
+  [ja]="Japanese" [cmn]="Mandarin Chinese")
+declare -A TUI_VOICE_LANG=([a]=en-us [b]=en-gb [e]=es [f]=fr-fr [h]=hi [i]=it [j]=ja [p]=pt-br [z]=cmn)
+declare -A TUI_SAMPLE=(
+  [en-us]="Hello! This is how I sound when I read to you." [en-gb]="Hello! This is how I sound when I read to you."
+  [es]="¡Hola! Así sueno cuando leo para ti." [fr-fr]="Bonjour ! Voici ma voix quand je lis pour vous."
+  [it]="Ciao! Ecco come suono quando leggo per te." [pt-br]="Olá! É assim que eu soo lendo para você."
+  [hi]="नमस्ते! मैं ऐसे पढ़कर सुनाती हूँ।" [ja]="こんにちは。私はこんな声で読みます。" [cmn]="你好！我就是这样为你朗读的。")
+
+voice_desc() {   # voice_desc VOICE: "British English, female"
+  local v=$1 g="female"
+  [ "${v:1:1}" = m ] && g="male"
+  printf '%s, %s' "${TUI_LANG_NAME[${TUI_VOICE_LANG[${v:0:1}]:-}]:-Other}" "$g"
+}
+
+voice_sample() { # voice_sample VOICE: hear a voice say a line in its own language
+  local v=$1 lang=${TUI_VOICE_LANG[${1:0:1}]:-en-us}
+  KOKORO_TUI=0 KOKORO_WORDS=0 KOKORO_NOTIFY=0 \
+    "$0" -p -v "$v" -s "$KOKORO_SPEED" -l "$lang" "${TUI_SAMPLE[$lang]}" </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  SAVED_AT=0; SETTINGS_NOTE="Playing a sample of $v…"
+}
+
+tui_save() {     # tui_save NAME VALUE: keep a setting (and use it straight away)
+  mkdir -p "${CONF%/*}"; [ -f "$CONF" ] || : > "$CONF"
   if grep -q "^$1=" "$CONF"; then sed -i "s|^$1=[^ #]*|$1=$2|" "$CONF"; else echo "$1=$2" >> "$CONF"; fi
+  printf -v "$1" '%s' "$2"
+  now_ms; SAVED_AT=$NOW
+}
+
+# Each setting: id | label | what it does (shown under the list for the one selected).
+TUI_SETTINGS=(
+  "#Voice and speech"
+  "voice|Voice|The voice that reads to you. Enter opens the list of 54 voices; Space plays a sample."
+  "speed|Speed|How fast it reads, from 0.5× to 2×. Use ← and → to change it in steps of 0.1."
+  "lang|Language|How words are pronounced. Choosing a voice sets this to match; change it to read another language."
+  "out|Save files as|The file name used when you save without -o. The ending picks the format: .wav .mp3 .ogg or .flac."
+  "#Reading"
+  "KOKORO_TUI|Full-screen reader|Open the full-screen reader when you listen on a terminal. Off: show the text below the command instead."
+  "KOKORO_WORDS|Light up words|Highlight each word as it's spoken (uses Whistle). Off saves a little battery."
+  "offset|Highlight timing|Moves the highlight relative to the voice. Raise it if the highlight runs ahead, lower it if it lags."
+  "#While listening"
+  "KOKORO_NOTIFY|Notification controls|Show a notification with pause, next and again buttons, also on the lock screen. Needs the Termux:API app."
+  "#Background server"
+  "KOKORO_AUTOSERVE|Keep Kokoro loaded|Keep the voice model in memory between uses, so reading starts at once. Off: each use loads it (slower, but frees memory)."
+  "idle|Unload after|How long Kokoro stays loaded when you're not using it. Takes effect the next time it starts."
+  "port|Port|The local port the background server listens on. Only change it if another app uses 8880."
+  "#"
+  "reset|Reset to defaults|Put every setting back as it was when kokomux was installed."
+  "edit|Edit the settings file|Open ~/.config/kokoro/config in your editor."
+)
+
+setting_value() {  # what the row shows on the right for setting $1
+  local id=$1 t f e bar
+  case "$id" in
+    voice) printf '%s%s%s' "$ACC2" "$KOKORO_VOICE" "$R"
+           [ "$SET_NARROW" = 1 ] || printf '  %s%s%s' "$D" "$(voice_desc "$KOKORO_VOICE")" "$R" ;;
+    speed)
+      local w=15; [ "$SET_NARROW" = 1 ] && w=9
+      t=$(speed_tenths); f=$(( (t - 5) * w / 15 )); [ "$f" -lt 0 ] && f=0
+      printf -v bar '%*s' "$f" ''; bar="$ACC${bar// /━}●$R"
+      printf -v e '%*s' $(( w - f )) ''; bar+="$D${e// /─}$R"
+      printf '%s  %s×' "$bar" "$KOKORO_SPEED" ;;
+    lang)  printf '‹ %s%s%s ›' "$ACC2" "$KOKORO_LANG" "$R"
+           [ "$SET_NARROW" = 1 ] || printf '  %s%s%s' "$D" "${TUI_LANG_NAME[$KOKORO_LANG]:-}" "$R" ;;
+    out)   printf '%s' "$KOKORO_OUT" ;;
+    offset) printf '‹ %+d ms ›' "$KOKORO_WORDS_OFFSET_MS" ;;
+    idle)  if [ "$KOKORO_IDLE_MINUTES" = 0 ]; then printf '‹ never ›'; else printf '‹ %s min ›' "$KOKORO_IDLE_MINUTES"; fi ;;
+    port)  printf '%s' "$KOKORO_PORT" ;;
+    KOKORO_*) if [ "${!id}" = 1 ]; then printf '%s● On%s' "$GRN" "$R"; else printf '%s○ Off%s' "$D" "$R"; fi ;;
+  esac
+}
+
+speed_tenths() {   # "1.25" -> 12 (tenths, for the slider and the arrow keys)
+  local s=${KOKORO_SPEED:-1.0} d
+  [[ "$s" == *.* ]] || s="$s.0"
+  d=${s#*.}; d=${d:0:1}
+  echo $(( 10#${s%%.*} * 10 + 10#${d:-0} ))
+}
+
+setting_change() { # setting_change ID STEP: ←/→ (-1/+1); 0 means Enter, a click or Space
+  local id=$1 step=$2 t i
+  case "$id" in
+    voice) [ "$step" = 0 ] && tui_voices ;;
+    speed)
+      if [ "$step" = 0 ]; then tui_prompt "Speed, 0.5 to 2.0:" "$KOKORO_SPEED"
+        [[ "$ANSWER" =~ ^(0\.[5-9][0-9]?|1(\.[0-9]{1,2})?|2(\.0+)?)$ ]] && tui_save KOKORO_SPEED "$ANSWER"
+      else t=$(( $(speed_tenths) + step )); [ "$t" -ge 5 ] && [ "$t" -le 20 ] && tui_save KOKORO_SPEED "$(( t / 10 )).$(( t % 10 ))"; fi ;;
+    lang)
+      for i in "${!TUI_LANGS[@]}"; do [ "${TUI_LANGS[i]}" = "$KOKORO_LANG" ] && break; done
+      [ "$step" = 0 ] && step=1
+      tui_save KOKORO_LANG "${TUI_LANGS[$(( (i + step + ${#TUI_LANGS[@]}) % ${#TUI_LANGS[@]} ))]}" ;;
+    out)
+      tui_prompt "Save files as:" "$KOKORO_OUT"
+      if [[ "$ANSWER" =~ ^[^/[:space:]]+\.(wav|mp3|ogg|flac)$ ]]; then tui_save KOKORO_OUT "$ANSWER"
+      elif [ -n "$ANSWER" ]; then SETTINGS_NOTE="A file name ending in .wav, .mp3, .ogg or .flac, please."; fi ;;
+    offset) t=$(( KOKORO_WORDS_OFFSET_MS + (step == 0 ? 20 : step * 20) ))
+            [ "$t" -ge -500 ] && [ "$t" -le 1000 ] && tui_save KOKORO_WORDS_OFFSET_MS "$t" ;;
+    idle)
+      local opts=(5 10 15 30 60 120 0)
+      for i in "${!opts[@]}"; do [ "${opts[i]}" = "$KOKORO_IDLE_MINUTES" ] && break; done
+      [ "$step" = 0 ] && step=1
+      tui_save KOKORO_IDLE_MINUTES "${opts[$(( (i + step + ${#opts[@]}) % ${#opts[@]} ))]}" ;;
+    port)
+      tui_prompt "Port (1024 to 65535):" "$KOKORO_PORT"
+      if [[ "$ANSWER" =~ ^[0-9]+$ ]] && [ "$ANSWER" -ge 1024 ] && [ "$ANSWER" -le 65535 ]; then tui_save KOKORO_PORT "$ANSWER"
+      elif [ -n "$ANSWER" ]; then SETTINGS_NOTE="A port between 1024 and 65535, please."; fi ;;
+    KOKORO_*) tui_save "$id" $(( 1 - ${!id} )) ;;
+    reset)
+      [ "$step" = 0 ] || return 0
+      tui_prompt "Reset every setting to its default? (y/N)"
+      if [[ "$ANSWER" =~ ^[Yy] ]]; then
+        local kv; for kv in "${KOKORO_DEFAULTS[@]}"; do tui_save "${kv%%=*}" "${kv#*=}"; done
+        SETTINGS_NOTE="Everything is back to its default."
+      fi ;;
+    edit)
+      [ "$step" = 0 ] || return 0
+      tui_cooked; printf '\033[?1049l' >&2
+      "${EDITOR:-nano}" "$CONF" </dev/tty >/dev/tty 2>&1 || true
+      # shellcheck source=/dev/null
+      [ -f "$CONF" ] && . "$CONF"
+      printf '\033[?1049h' >&2; tui_raw ;;
+  esac
+}
+
+tui_settings() { # the settings menu; works on its own or from the home screen
+  local own=0 sel=0 top=0 key rows=() i n n_this=0 y=0 r id label desc val first=4 last view lw=26
+  local -A rowsel=()
+  SAVED_AT=0; SETTINGS_NOTE=""
+  if [ "$TUI" != 1 ]; then
+    own=1; TUI_TTY="$(stty -g 2>/dev/null </dev/tty)" || TUI_TTY=""
+    printf '\033[?1049h' >&2; tui_raw; TUI=1; trap 'TUI_RESIZED=1' WINCH
+  fi
+  local items=(); for r in "${TUI_SETTINGS[@]}"; do [ "${r:0:1}" = "#" ] || items+=("${r%%|*}"); done
+  while :; do
+    tui_size
+    SET_NARROW=0; lw=26; [ "$CW" -lt 64 ] && { SET_NARROW=1; lw=25; }
+    # what the selected setting does, wrapped: the bottom of the screen is laid out around it
+    for r in "${TUI_SETTINGS[@]}"; do [ "${r%%|*}" = "${items[sel]}" ] && desc=${r##*|}; done
+    [ -n "$SETTINGS_NOTE" ] && desc="$SETTINGS_NOTE"
+    local -a dl=(); mapfile -t dl < <(printf '%s\n' "$desc" | fold -s -w "$CW")
+    last=$(( TH - ${#dl[@]} - 3 )); view=$(( last - first + 1 ))
+    # one entry per screen line: a section heading, a gap, or a setting
+    rows=(); for r in "${TUI_SETTINGS[@]}"; do
+      if [ "$r" = "#" ]; then rows+=("")                        # an unnamed section: just a gap
+      elif [ "${r:0:1}" = "#" ]; then [ "${#rows[@]}" -gt 0 ] && rows+=(""); rows+=("$r"); else rows+=("$r"); fi
+    done
+    n=0; for i in "${!rows[@]}"; do [[ "${rows[i]}" == *"|"* ]] && { [ "$n" = "$sel" ] && y=$i; n=$(( n + 1 )); }; done
+    [ "$y" -lt "$top" ] && top=$(( y > 0 && ${rows[y-1]:0:1} == "#" ? y - 1 : y ))
+    [ "$y" -ge $(( top + view )) ] && top=$(( y - view + 1 ))
+    [ "$y" -le 1 ] && top=0
+    printf '%s\033[2J' "$SYNC_ON" >&2
+    printf '\033[1;1H  %skokomux%s  %sSettings%s' "$ACC" "$R" "$B" "$R" >&2
+    now_ms
+    if [ "$SAVED_AT" -gt 0 ] && [ $(( NOW - SAVED_AT )) -lt 1500 ]; then
+      printf '\033[1;%dH%s✓ Saved%s' $(( TW - 9 )) "$GRN" "$R" >&2
+    fi
+    printf '\033[2;1H%s%s%s' "$D" "$(rule "$TW")" "$R" >&2
+    rowsel=(); n=0
+    for i in "${!rows[@]}"; do
+      r=${rows[i]}
+      [[ "$r" == *"|"* ]] && n_this=$n
+      if [[ "$r" == *"|"* ]]; then n=$(( n + 1 )); fi
+      [ "$i" -lt "$top" ] || [ "$i" -ge $(( top + view )) ] && continue
+      y=$(( first + i - top ))
+      if [ "${r:0:1}" = "#" ]; then
+        [ -n "${r:1}" ] && printf '\033[%d;%dH%s%s%s' "$y" "$LM" "$B" "${r:1}" "$R" >&2
+      elif [ -n "$r" ]; then
+        IFS='|' read -r id label desc <<< "$r"
+        val="$(setting_value "$id")"
+        if [ "$n_this" = "$sel" ]; then
+          printf '\033[%d;%dH\033[48;5;237m%*s\033[%d;%dH%s›%s\033[48;5;237m %s' "$y" "$LM" "$CW" "" "$y" "$LM" "$ACC" "$R" "$label" >&2
+          printf '\033[%d;%dH\033[48;5;237m%s\033[0m' "$y" $(( LM + lw )) "${val//$R/$R$'\033[48;5;237m'}" >&2
+        else
+          printf '\033[%d;%dH  %s\033[%d;%dH%s' "$y" "$LM" "$label" "$y" $(( LM + lw )) "$val" >&2
+        fi
+        rowsel[$y]=$n_this
+      fi
+    done
+    # "more" markers on their own rows, above and below the list
+    [ "$top" -gt 0 ] && printf '\033[%d;%dH%s▲ more%s' $(( first - 1 )) $(( LM + CW - 6 )) "$D" "$R" >&2
+    [ $(( top + view )) -lt "${#rows[@]}" ] && printf '\033[%d;%dH%s▼ more%s' $(( last + 1 )) $(( LM + CW - 6 )) "$D" "$R" >&2
+    y=$(( TH - ${#dl[@]} - 1 ))
+    printf '\033[%d;1H%s%s%s' "$y" "$D" "$(rule "$TW")" "$R" >&2
+    for r in "${dl[@]}"; do y=$(( y + 1 )); printf '\033[%d;%dH%s' "$y" "$LM" "$r" >&2; done
+    if [ "$TW" -ge 72 ]; then r="↑↓ choose · ←→ change · Enter edit · Space hear voice · q done"
+    else r="↑↓ · ←→ change · Enter · q done"; fi
+    printf '\033[%d;%dH%s%s%s' "$TH" "$LM" "$D" "$r" "$R" >&2
+    printf '%s' "$SYNC_OFF" >&2
+
+    KEY=""; tick 0.5; [ -n "$KEY" ] || continue
+    SETTINGS_NOTE=""
+    case "$KEY" in
+      $'\033[A'|$'\033OA'|k|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
+      $'\033[B'|$'\033OB'|j|$'\033[<65;'*M) [ "$sel" -lt $(( ${#items[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
+      $'\033[D'|$'\033OD'|h|-) setting_change "${items[sel]}" -1 ;;
+      $'\033[C'|$'\033OC'|l|+|=) setting_change "${items[sel]}" 1 ;;
+      $'\n'|$'\r') setting_change "${items[sel]}" 0 ;;
+      " ") if [ "${items[sel]}" = voice ]; then voice_sample "$KOKORO_VOICE"; else setting_change "${items[sel]}" 0; fi ;;
+      $'\033[<0;'*M)
+        [[ "$KEY" =~ \;([0-9]+)M$ ]] || continue
+        r=${rowsel[${BASH_REMATCH[1]}]:-}
+        [ -n "$r" ] || continue
+        if [ "$r" = "$sel" ]; then setting_change "${items[sel]}" 0; else sel=$r; fi ;;   # a second click acts
+      q|Q|$'\033') break ;;
+    esac
+  done
+  if [ "$own" = 1 ]; then tui_close; fi
+}
+
+tui_voices() {   # the voice picker: type to filter, Space to hear, Enter to choose
+  local filter="" sel=0 top=0 list=() v i y view lang prev g key
+  local -A rowsel=()
+  for i in "${!TUI_VOICES[@]}"; do [ "${TUI_VOICES[i]}" = "$KOKORO_VOICE" ] && sel=$i; done
+  while :; do
+    tui_size; view=$(( TH - 7 ))
+    list=(); for v in "${TUI_VOICES[@]}"; do [[ -z "$filter" || "$v" == *"$filter"* ]] && list+=("$v"); done
+    [ "$sel" -ge "${#list[@]}" ] && sel=$(( ${#list[@]} > 0 ? ${#list[@]} - 1 : 0 ))
+    [ "$sel" -lt "$top" ] && top=$sel
+    [ "$sel" -ge $(( top + view )) ] && top=$(( sel - view + 1 ))
+    printf '%s\033[2J\033[1;1H  %skokomux%s  %sChoose a voice%s' "$SYNC_ON" "$ACC" "$R" "$B" "$R" >&2
+    printf '\033[1;%dH%s%s%s' $(( TW - 20 )) "$D" "${#list[@]} of ${#TUI_VOICES[@]} voices" "$R" >&2
+    printf '\033[2;1H%s%s%s' "$D" "$(rule "$TW")" "$R" >&2
+    printf '\033[3;%dH%sFilter:%s %s%s▏' "$LM" "$D" "$R" "$filter" "$ACC" >&2; printf '%s' "$R" >&2
+    rowsel=(); prev=""
+    for (( i = top, y = 5; i < ${#list[@]} && y <= TH - 3; i++, y++ )); do
+      v=${list[i]}; lang=${TUI_VOICE_LANG[${v:0:1}]:-}; g=female; [ "${v:1:1}" = m ] && g=male
+      local mark=" "; [ "$v" = "$KOKORO_VOICE" ] && mark="$GRN✓$R"
+      if [ "$i" = "$sel" ]; then
+        printf '\033[%d;%dH\033[48;5;237m%*s\033[%d;%dH%s›%s\033[48;5;237m %s %s%-16s\033[48;5;237m %s%s · %s\033[0m' \
+          "$y" "$LM" "$CW" "" "$y" "$LM" "$ACC" "$R" "$mark" "$ACC2" "$v" "$R" "${TUI_LANG_NAME[$lang]:-}" "$g" >&2
+      else
+        printf '\033[%d;%dH  %s %-16s %s%s · %s%s' "$y" "$LM" "$mark" "$v" "$D" "${TUI_LANG_NAME[$lang]:-}" "$g" "$R" >&2
+      fi
+      rowsel[$y]=$i
+    done
+    [ "${#list[@]}" = 0 ] && printf '\033[5;%dH%sNo voice matches "%s".%s' "$LM" "$D" "$filter" "$R" >&2
+    printf '\033[%d;1H%s%s%s' $(( TH - 1 )) "$D" "$(rule "$TW")" "$R" >&2
+    if [ "$TW" -ge 72 ]; then g="type to filter · ↑↓ choose · Space hear it · Enter use it · Esc back"
+    else g="type · ↑↓ · Space hear · Enter use · Esc"; fi
+    printf '\033[%d;%dH%s%s%s%s' "$TH" "$LM" "$D" "$g" "$R" "$SYNC_OFF" >&2
+
+    KEY=""; tick 0.5; [ -n "$KEY" ] || continue
+    case "$KEY" in
+      $'\033[A'|$'\033OA'|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
+      $'\033[B'|$'\033OB'|$'\033[<65;'*M) [ "$sel" -lt $(( ${#list[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
+      $'\033[5~') sel=$(( sel > view ? sel - view : 0 )) ;;
+      $'\033[6~') sel=$(( sel + view < ${#list[@]} ? sel + view : ${#list[@]} - 1 )) ;;
+      " ") [ "${#list[@]}" -gt 0 ] && voice_sample "${list[sel]}" ;;
+      $'\n'|$'\r')
+        if [ "${#list[@]}" -gt 0 ]; then
+          v=${list[sel]}; tui_save KOKORO_VOICE "$v"
+          tui_save KOKORO_LANG "${TUI_VOICE_LANG[${v:0:1}]:-$KOKORO_LANG}"   # its own language
+          return 0
+        fi ;;
+      $'\177'|$'\b') filter=${filter%?}; sel=0; top=0 ;;
+      [a-z_]) filter+=$KEY; sel=0; top=0 ;;
+      $'\033[<0;'*M)
+        [[ "$KEY" =~ \;([0-9]+)M$ ]] || continue
+        i=${rowsel[${BASH_REMATCH[1]}]:-}; [ -n "$i" ] || continue
+        if [ "$i" = "$sel" ]; then v=${list[sel]}; tui_save KOKORO_VOICE "$v"
+          tui_save KOKORO_LANG "${TUI_VOICE_LANG[${v:0:1}]:-$KOKORO_LANG}"; return 0
+        else sel=$i; fi ;;
+      $'\033'|q) return 0 ;;
+    esac
+  done
 }

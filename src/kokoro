@@ -17,17 +17,21 @@ env_names="${!KOKORO_@}"
 env_overrides=""
 # shellcheck disable=SC2086
 [ -n "$env_names" ] && env_overrides="$(declare -p $env_names)"
-KOKORO_VOICE=af_heart
-KOKORO_SPEED=1.0
-KOKORO_LANG=en-us
-KOKORO_OUT=kokoro.wav
-KOKORO_AUTOSERVE=1
-KOKORO_IDLE_MINUTES=30
-KOKORO_PORT=8880
-KOKORO_WORDS=1                 # light up each word as it's spoken (-p on a terminal)
-KOKORO_WORDS_OFFSET_MS=100     # play-audio's start-up delay, so the highlight isn't early
-KOKORO_NOTIFY=1                # a notification with pause / next / again buttons (Termux:API)
-KOKORO_TUI=1                   # -p on a terminal opens the full-screen reader (0: inline)
+# The defaults, in one place (the settings menu's "Reset to defaults" uses them too).
+KOKORO_DEFAULTS=(
+  KOKORO_VOICE=af_heart         # see: kokoro --list-voices
+  KOKORO_SPEED=1.0              # 0.5 to 2.0
+  KOKORO_LANG=en-us
+  KOKORO_OUT=kokoro.wav         # file name when -o isn't given
+  KOKORO_AUTOSERVE=1            # keep Kokoro loaded in the background
+  KOKORO_IDLE_MINUTES=30        # ...until unused this long (0: never stop)
+  KOKORO_PORT=8880
+  KOKORO_WORDS=1                # light up each word as it's spoken (-p on a terminal)
+  KOKORO_WORDS_OFFSET_MS=100    # play-audio's start-up delay, so the highlight isn't early
+  KOKORO_NOTIFY=1               # a notification with pause / next / again buttons (Termux:API)
+  KOKORO_TUI=1                  # -p on a terminal opens the full-screen reader (0: inline)
+)
+for kv in "${KOKORO_DEFAULTS[@]}"; do declare "$kv"; done
 KOKORO_REPO_RAW=https://raw.githubusercontent.com/Anesu/kokomux/main
 # shellcheck source=/dev/null
 [ -f "$CONF" ] && . "$CONF"
@@ -153,7 +157,8 @@ ROWS
   opt_rows <<'ROWS'
 --list-voices|all 54 voices by language
 --status|server status and settings
---config|change your defaults
+--settings|voice, speed, highlighting and more
+--config|edit the settings file directly
 --serve / --stop-server|start or stop the server
 --update|update kokomux and Kokoro
 --uninstall|remove kokomux
@@ -241,6 +246,7 @@ stop_playback() {
 
 STOP=""; IN_TICK=0; KEY=""; CMD=""; KBD=""; KEYS_TTY=""
 exec {TICK}<> <(:)                    # read -t on this is a sleep with no process
+now_ms() { local t=${EPOCHREALTIME//[!0-9]/}; NOW=$(( t / 1000 )); }   # no subshell: called every frame
 keys_on() {      # read keys from the terminal, unechoed (restored on exit)
   [ -n "$KBD" ] && return 0
   [ "$LIVE" = 1 ] && [ -r /dev/tty ] || return 0
@@ -344,8 +350,17 @@ case "${1:-}" in
         "$(mark_get "$last" part)" "$(mark_get "$last" parts)" "$R"
     fi
     printf '    Settings  %s%s%s\n' "$D" "$(tilde "$CONF")" "$R"
-    printf '    %sChange them with: kokoro --config%s\n' "$D" "$R"
+    printf '    %sChange them with: kokoro --settings%s\n' "$D" "$R"
     exit 0 ;;
+  --settings)
+    if [ "$LIVE" = 1 ] && [ -t 0 ] && declare -F tui_settings >/dev/null; then
+      keys_on
+      trap 'tui_close; keys_off; exit 130' INT TERM HUP
+      tui_settings
+      keys_off; trap - INT TERM HUP
+      exit 0
+    fi
+    exec "$0" --status ;;
   --config)
     [ -f "$CONF" ] || die "There's no settings file at $(tilde "$CONF")." "Run the installer again to create it."
     exec "${EDITOR:-nano}" "$CONF" ;;
@@ -580,7 +595,6 @@ HL=$'\033[48;5;61m\033[38;5;231m'   # the soft highlight
 blk_lines=(); blk_offs=(); view_top=0; view_h=0
 w_s=(); w_e=(); w_a=(); w_b=(); w_state=none
 TERM_ROWS=24
-now_ms() { local t=${EPOCHREALTIME//[!0-9]/}; NOW=$(( t / 1000 )); }   # no subshell: called every frame
 in_line=0
 
 part_of() {      # PART="part I of N · " while a job has more than one part
