@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.8.2"
+KOKOMUX_VERSION="0.9.0"
 DISTRO=kokoro
 
 ASSUME_YES=0; VERBOSE=0
@@ -26,14 +26,225 @@ done
 
 # ================================================================ look & feel
 
+# The colours: the same palette as kokoro (theme.sh, built in below), made
+# from the terminal's own background, which we ask it for once (and remember,
+# so kokoro's messages match from the start).
+# shellcheck disable=SC2034  # it also sets the colours only kokoro's screens use
+{
+# kokomux: colours. Sourced by `kokoro` and built into the installer (bash).
+# shellcheck shell=bash disable=SC2034  # the colours are used by whoever sources this
+#
+#   theme_apply [screen]   set the colours below for the terminal (or, with
+#                          "screen", for a full-screen view, which may paint
+#                          its own background)
+#   theme_detect           ask the terminal what its colours are (OSC 10/11)
+#   theme_grad N           GRAD: N colours from violet to cyan (the logo)
+#
+# One palette for dark and light, derived from the terminal's own background:
+# every grey is the background moved part of the way towards the text colour,
+# in steps of the golden ratio (φ = 1.618…). Each step is φ times the one
+# before it, so the levels read as evenly spaced, and there are only five:
+#
+#   φ⁻¹  .618  D      secondary text: hints, labels, what's still to be read
+#   φ⁻²  .382  LINE   rules, the progress bar's track
+#   φ⁻³  .236  GHOST  the logo's texture; PSEL, a selected row on a panel
+#   φ⁻⁴  .146  SURF   buttons and panels; SEL, a selected row (accent-tinted)
+#   ½          PAST   what's already been heard: it recedes, but stays legible
+#
+# The accents (violet ACC, sky ACC2, GRN, RED, YEL) come in a dark and a light
+# set, each checked against the backgrounds of popular terminal themes
+# (tests/test_theme.py): text ≥ 10:1, accents and secondary text ≈ 4.5:1 or
+# better. The word being spoken (HL) sits on the background moved φ⁻² of the
+# way towards the accent: soft, but clearly lit.
+#
+# KOKORO_THEME picks: auto (follow the terminal), dark or light. A full-screen
+# view on a terminal of the other kind paints its own background; plain
+# command-line output always follows the terminal, since it can't.
+
+THEME_STEPS=(1000 618 382 236 146 90)            # φ⁻ⁿ, in thousandths
+# name:   background  text    violet  sky     green   red     amber   cyan (logo end)
+THEME_DARK=(16151d    e8e6f0  b69cff  7cd0f5  86d39a  ff7a7a  efc764  9ff0ec)
+THEME_LIGHT=(fbfaf8   1c1b22  6438c9  0b67a0  21743a  c0262d  855300  0f7c86)
+THEME_TERM_BG=""; THEME_TERM_FG=""    # the terminal's colours as rrggbb (asked, or remembered)
+THEME_ASKED=0                         # 1 once theme_detect has asked, this run
+THEME_MODE=dark; THEME_PAINT=0; THEME_TERM_MODE=""; THEME_TRUE=0; THEME_ON=0
+THEME_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/kokomux/theme"
+
+# --------------------------------------------------------------- colour maths
+# Colours are rrggbb strings; results come back in REPLY (no subshells: this
+# runs every time kokoro starts).
+
+theme_mix() {    # theme_mix A B T: A moved T thousandths of the way to B
+  local a=$1 b=$2 t=$3 i x y out=""
+  for i in 0 2 4; do
+    x=$(( 16#${a:i:2} )) y=$(( 16#${b:i:2} ))
+    printf -v out '%s%02x' "$out" $(( x + ((y - x) * t + ((y - x) * t >= 0 ? 500 : -500)) / 1000 ))
+  done
+  REPLY=$out
+}
+
+theme_luma() {   # theme_luma RGB: perceived brightness, 0 to 255
+  REPLY=$(( (2126 * 16#${1:0:2} + 7152 * 16#${1:2:2} + 722 * 16#${1:4:2}) / 10000 ))
+}
+
+theme_sgr() {    # theme_sgr 38|48 RGB: the SGR parameters for that colour (REPLY)
+  local r=$(( 16#${2:0:2} )) g=$(( 16#${2:2:2} )) b=$(( 16#${2:4:2} ))
+  if [ "$THEME_TRUE" = 1 ]; then REPLY="$1;2;$r;$g;$b"; return 0; fi
+  # The nearest of the 256 colours: the 6×6×6 cube or the 24 greys.
+  local -a lv=(0 95 135 175 215 255)
+  local ri gi bi k v d1 d2 grey
+  for k in r g b; do
+    v=${!k}; if [ "$v" -lt 48 ]; then v=0; elif [ "$v" -lt 115 ]; then v=1; else v=$(( (v - 35) / 40 )); fi
+    printf -v "${k}i" '%s' "$v"
+  done
+  d1=$(( (r - lv[ri]) ** 2 + (g - lv[gi]) ** 2 + (b - lv[bi]) ** 2 ))
+  grey=$(( (r + g + b) / 3 )); k=$(( grey > 238 ? 23 : (grey < 8 ? 0 : (grey - 3) / 10) ))
+  v=$(( 8 + 10 * k ))
+  d2=$(( (r - v) ** 2 + (g - v) ** 2 + (b - v) ** 2 ))
+  if [ "$d2" -lt "$d1" ]; then REPLY="$1;5;$(( 232 + k ))"; else REPLY="$1;5;$(( 16 + 36 * ri + 6 * gi + bi ))"; fi
+}
+
+theme_fg() { theme_sgr 38 "$1"; REPLY=$'\033['"$REPLY"m; }
+theme_bg() { theme_sgr 48 "$1"; REPLY=$'\033['"$REPLY"m; }
+
+# --------------------------------------------------------------- the terminal
+
+theme_truecolor() {
+  case "${KOKORO_TRUECOLOR:-}" in 1) return 0 ;; 0) return 1 ;; esac
+  case "${COLORTERM:-}" in truecolor|24bit) return 0 ;; esac
+  [ -n "${TERMUX_VERSION:-}" ] && return 0                  # Termux has 24-bit colour
+  case "${TERM_PROGRAM:-}" in iTerm.app|WezTerm|vscode|ghostty) return 0 ;; esac
+  case "${TERM:-}" in *-direct|xterm-kitty|alacritty|foot*|wezterm) return 0 ;; esac
+  return 1
+}
+
+theme_detect() { # ask the terminal for its background and text colours
+  # OSC 11 and 10 ask; DA1 (which every terminal answers) marks the end of the
+  # replies, so a terminal that doesn't know OSC 11 costs no waiting.
+  local fd saved="" buf="" c n=0 hex x wait=1 got=0
+  THEME_ASKED=1
+  [ -t 2 ] || return 1
+  { exec {fd}<>/dev/tty; } 2>/dev/null || return 1
+  saved="$(stty -g <&"$fd" 2>/dev/null)" || saved=""
+  stty -echo -icanon <&"$fd" 2>/dev/null || true
+  printf '\033]11;?\033\\\033]10;?\033\\\033[c' >&"$fd"
+  while [ "$n" -lt 160 ] && IFS= read -r -s -n1 -t "$wait" -u "$fd" c; do
+    buf+=$c; n=$(( n + 1 )) wait=0.2                    # the first reply may take a moment
+    [[ "$buf" =~ $'\033'\[\?[0-9\;]*c$ ]] && break
+  done
+  [ -n "$saved" ] && stty "$saved" <&"$fd" 2>/dev/null
+  exec {fd}>&-
+  for x in 11 10; do
+    [[ "$buf" =~ \]$x\;rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+) ]] || continue
+    hex=""
+    for c in "${BASH_REMATCH[@]:1:3}"; do              # 1 to 4 hex digits per channel
+      [ "${#c}" = 1 ] && c="$c$c"
+      hex+="${c:0:2}"
+    done
+    hex=${hex,,}
+    if [ "$x" = 11 ]; then THEME_TERM_BG=$hex got=1; else THEME_TERM_FG=$hex; fi
+  done
+  [ "$got" = 1 ] || return 1                          # no answer: what we remembered stands
+  # Remember it, so plain command-line output can follow the terminal too.
+  if [ "$(cat "$THEME_CACHE" 2>/dev/null)" != "$THEME_TERM_BG $THEME_TERM_FG" ]; then
+    mkdir -p "${THEME_CACHE%/*}" 2>/dev/null && printf '%s %s\n' "$THEME_TERM_BG" "$THEME_TERM_FG" > "$THEME_CACHE" 2>/dev/null
+  fi
+  return 0
+}
+
+theme_term() {   # THEME_TERM_MODE (dark, light or "") and THEME_TERM_BG, from what we know
+  local f="" bgi
+  if [ -z "$THEME_TERM_BG" ] && [ -f "$THEME_CACHE" ]; then
+    read -r f _ < "$THEME_CACHE" 2>/dev/null || f=""
+    [[ "$f" =~ ^[0-9a-f]{6}$ ]] && THEME_TERM_BG=$f
+  fi
+  THEME_TERM_MODE=""
+  if [ -n "$THEME_TERM_BG" ]; then
+    theme_luma "$THEME_TERM_BG"; if [ "$REPLY" -ge 128 ]; then THEME_TERM_MODE=light; else THEME_TERM_MODE=dark; fi
+  elif [[ "${COLORFGBG:-}" =~ ([0-9]+)$ ]]; then          # "15;0": text white, background black
+    bgi=${BASH_REMATCH[1]}
+    if [ "$bgi" = 7 ] || [ "$bgi" -ge 9 ]; then THEME_TERM_MODE=light; else THEME_TERM_MODE=dark; fi
+  fi
+}
+
+# --------------------------------------------------------------- the palette
+
+theme_off() {
+  R="" B="" D="" PAST="" LINE="" GHOST="" ACC="" ACC2="" GRN="" RED="" YEL=""
+  HL="" SURF="" SEL="" PSEL="" BASE="" ACC_SGR="" D_SGR=""
+  THEME_ON=0
+}
+
+theme_apply() {  # theme_apply [screen]
+  local want=${KOKORO_THEME:-auto} screen=${1:-} bg fg
+  local -a p
+  case "$want" in dark|light) ;; *) want=auto ;; esac
+  theme_term
+  THEME_PAINT=0
+  if [ "$want" != auto ] && [ "$screen" = screen ]; then
+    THEME_MODE=$want
+    [ "$THEME_TERM_MODE" = "$want" ] || THEME_PAINT=1           # paint our own canvas
+  elif [ -n "$THEME_TERM_MODE" ]; then THEME_MODE=$THEME_TERM_MODE
+  elif [ "$want" != auto ]; then THEME_MODE=$want                # the best guess we have
+  else THEME_MODE=dark; fi
+  if [ "$THEME_MODE" = light ]; then p=("${THEME_LIGHT[@]}"); else p=("${THEME_DARK[@]}"); fi
+  # The greys are made from the real background when we know it, and always
+  # lead towards the palette's own text colour, so they keep their contrast
+  # even with a low-contrast terminal theme.
+  bg=${p[0]} fg=${p[1]}
+  [ "$THEME_PAINT" = 0 ] && [ -n "$THEME_TERM_BG" ] && [ "$THEME_TERM_MODE" = "$THEME_MODE" ] && bg=$THEME_TERM_BG
+  THEME_BG=$bg THEME_FG=$fg THEME_ACC=${p[2]} THEME_END=${p[7]}
+  if theme_truecolor; then THEME_TRUE=1; else THEME_TRUE=0; fi
+
+  R=$'\033[0m' B=$'\033[1m' BASE=""
+  if [ "$THEME_PAINT" = 1 ]; then
+    theme_bg "$bg"; BASE=$REPLY; theme_fg "$fg"; BASE+=$REPLY
+    R+=$BASE                                    # a reset goes back to our canvas
+  fi
+  theme_mix "$bg" "$fg" "${THEME_STEPS[1]}"; theme_fg "$REPLY"; D=$REPLY
+  D_SGR=${D#$'\033['}; D_SGR=${D_SGR%m}
+  theme_mix "$bg" "$fg" 500;                  theme_fg "$REPLY"; PAST=$REPLY
+  theme_mix "$bg" "$fg" "${THEME_STEPS[2]}"; theme_fg "$REPLY"; LINE=$REPLY
+  theme_mix "$bg" "$fg" "${THEME_STEPS[3]}"; theme_fg "$REPLY"; GHOST=$REPLY
+  theme_mix "$bg" "$fg" "${THEME_STEPS[4]}"; theme_bg "$REPLY"; SURF=$REPLY
+  local tint; theme_mix "$fg" "${p[2]}" "${THEME_STEPS[1]}"; tint=$REPLY
+  theme_mix "$bg" "$tint" "${THEME_STEPS[4]}"; theme_bg "$REPLY"; SEL=$REPLY
+  theme_mix "$bg" "$tint" "${THEME_STEPS[3]}"; theme_bg "$REPLY"; PSEL=$REPLY
+  theme_mix "$bg" "${p[2]}" "${THEME_STEPS[2]}"; theme_bg "$REPLY"; HL=$REPLY
+  theme_fg "$fg"; HL+=$REPLY
+  theme_fg "${p[2]}"; ACC=$REPLY; ACC_SGR=${ACC#$'\033['}; ACC_SGR=${ACC_SGR%m}
+  theme_fg "${p[3]}"; ACC2=$REPLY
+  theme_fg "${p[4]}"; GRN=$REPLY
+  theme_fg "${p[5]}"; RED=$REPLY
+  theme_fg "${p[6]}"; YEL=$REPLY
+  THEME_ON=1
+}
+
+theme_grad() {   # theme_grad N: GRAD, N colours from the accent to the logo's cyan
+  local n=$1 k
+  GRAD=()
+  for (( k = 0; k < n; k++ )); do
+    theme_mix "$THEME_ACC" "$THEME_END" $(( n > 1 ? k * 1000 / (n - 1) : 0 ))
+    theme_fg "$REPLY"; GRAD+=("$REPLY")
+  done
+}
+
+theme_name() {   # what the settings menu shows beside "Colours"
+  case "${KOKORO_THEME:-auto}" in
+    dark) REPLY="Dark" ;; light) REPLY="Light" ;;
+    *) REPLY="Auto" ;;
+  esac
+}
+}
+
 FANCY=0   # colours + spinners, only on a real terminal
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then FANCY=1; fi
 if [ "$FANCY" = 1 ]; then
-  R=$'\033[0m' B=$'\033[1m' D=$'\033[2m'
-  ACC=$'\033[38;5;141m' ACC2=$'\033[38;5;117m'
-  GRN=$'\033[38;5;114m' RED=$'\033[38;5;203m' YEL=$'\033[38;5;221m'
+  KOKORO_THEME="$(sed -n 's/^KOKORO_THEME=\([a-z]*\).*/\1/p' "$HOME/.config/kokoro/config" 2>/dev/null | tail -n 1)"
+  [ -t 0 ] && { theme_detect || true; }
+  theme_apply
 else
-  R="" B="" D="" ACC="" ACC2="" GRN="" RED="" YEL=""
+  theme_off
 fi
 SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
 
@@ -79,7 +290,7 @@ show_cursor() {
 }
 
 banner() {
-  local c=(135 141 147 153 159 195) i=0 line
+  local i=0 line
   local big=(
 '██╗  ██╗ ██████╗ ██╗  ██╗ ██████╗ ███╗   ███╗██╗   ██╗██╗  ██╗'
 '██║ ██╔╝██╔═══██╗██║ ██╔╝██╔═══██╗████╗ ████║██║   ██║╚██╗██╔╝'
@@ -92,18 +303,19 @@ banner() {
 '░█▀▄░█░█░█▀▄░█░█░█░█░█░█░▄▀▄'
 '░▀░▀░▀▀▀░▀░▀░▀▀▀░▀░▀░▀▀▀░▀░▀')
   blank
+  GRAD=("" "" "" "" "" "")
   if [ "$COLS" -ge 66 ]; then
+    [ "$FANCY" = 1 ] && theme_grad 6              # violet to cyan, one colour a line
     for line in "${big[@]}"; do
-      if [ "$FANCY" = 1 ]; then printf '  \033[38;5;%sm%s%s\n' "${c[i]}" "$line" "$R"; else say "  $line"; fi
+      printf '  %s%s%s\n' "${GRAD[i]}" "$line" "$R"
       i=$((i + 1))
     done
   else
+    [ "$FANCY" = 1 ] && theme_grad 3
     for line in "${small[@]}"; do
-      # the ░ texture in dark grey so the letters stand out
-      if [ "$FANCY" = 1 ]; then
-        line="${line//░/$'\033[38;5;237m'░$'\033[38;5;'"${c[i * 2]}"m}"
-        printf '  \033[38;5;%sm%s%s\n' "${c[i * 2]}" "$line" "$R"
-      else say "  $line"; fi
+      # the ░ texture recedes so the letters stand out
+      [ "$FANCY" = 1 ] && line="${line//░/$GHOST░${GRAD[i]}}"
+      printf '  %s%s%s\n' "${GRAD[i]}" "$line" "$R"
       i=$((i + 1))
     done
   fi
@@ -972,11 +1184,16 @@ LANGS = {"a": ("American English", "en-us"), "b": ("British English", "en-gb"),
          "p": ("Brazilian Portuguese", "pt-br"), "z": ("Mandarin Chinese", "cmn")}
 
 
-def print_voices(names, width, default):
+def sgr(params, fallback):
+    """An SGR escape from kokoro's theme ("38;2;182;156;255"), or the fallback."""
+    return f"\033[{params}m" if params and all(c in "0123456789;" for c in params) else fallback
+
+
+def print_voices(names, width, default, accent="", muted=""):
     """Group voices by language and gender, wrapped to the terminal width.
-    Colour only when stdout is a terminal."""
+    Colour only when stdout is a terminal, in kokoro's theme colours."""
     tty = (sys.stdout.isatty() or "--color" in sys.argv) and not os.environ.get("NO_COLOR")
-    bold, dim, acc, off = ("\033[1m", "\033[2m", "\033[38;5;141m", "\033[0m") if tty else ("",) * 4
+    bold, dim, acc, off = ("\033[1m", sgr(muted, "\033[2m"), sgr(accent, "\033[38;5;141m"), "\033[0m") if tty else ("",) * 4
     width = max(30, min(width, 100))
     groups = {}
     for n in names:
@@ -1023,6 +1240,8 @@ def main():
     v.add_argument("--width", type=int, default=60)
     v.add_argument("--default", default="")
     v.add_argument("--color", action="store_true", help="colour even when piped")
+    v.add_argument("--accent", default="", help="SGR parameters for the accent colour")
+    v.add_argument("--muted", default="", help="SGR parameters for secondary text")
     sub.add_parser("download")
     a = p.parse_args()
 
@@ -1038,7 +1257,7 @@ def main():
         if a.plain:
             print("\n".join(names))
         else:
-            print_voices(names, a.width, a.default)
+            print_voices(names, a.width, a.default, a.accent, a.muted)
     elif a.cmd == "download":
         download()
 
@@ -1170,7 +1389,7 @@ __KOKOMUX_WORDS__
 
 cat > "$WORK/tui.sh" <<'__KOKOMUX_TUI__'
 # kokomux: the full-screen interface. Sourced by `kokoro` (bash).
-# shellcheck shell=bash disable=SC2034,SC2154  # shares its globals with kokoro
+# shellcheck shell=bash disable=SC2034,SC2153,SC2154  # shares its globals with kokoro
 #
 #   tui_home              the home screen: books in progress, and ways to start
 #   tui_open / tui_close  the reader: header, a centred reading column with the
@@ -1182,9 +1401,17 @@ cat > "$WORK/tui.sh" <<'__KOKOMUX_TUI__'
 # where the terminal supports it, and redraws on resize. Mouse clicks and taps
 # are read as SGR mouse reports.
 #
-# Expects from kokoro: the colours (R B D ACC ACC2 GRN YEL HL), $tmpd, $KBD
-# (a read descriptor on /dev/tty), KEY (set by tick), and for the home screen
-# BOOKS, CONF, mark_get, KOKORO_VOICE and KOKORO_SPEED.
+# Colours come from theme.sh (R B D PAST LINE GHOST ACC ACC2 GRN HL SURF SEL
+# PSEL): when a screen opens it asks the terminal for its colours, so the greys
+# are made from its real background. Proportions follow the golden ratio: the
+# line being read sits φ⁻² (38.2%) of the way down the reading area, where the
+# eye rests; the home screen's free space is split 1 : φ above and below its
+# content (the optical centre, a little above the middle); settings split
+# their width φ⁻² : φ⁻¹ between labels and values.
+#
+# Expects from kokoro: the colours, $tmpd, $KBD (a read descriptor on
+# /dev/tty), KEY (set by tick), and for the home screen BOOKS, CONF, mark_get,
+# KOKORO_VOICE and KOKORO_SPEED.
 
 TUI=0; TUI_TTY=""; TUI_RESIZED=0
 TW=80; TH=24; CW=72; LM=4             # screen size; reading column width and margin
@@ -1216,23 +1443,38 @@ tui_cooked() {   # back to normal typing, for a prompt
   stty echo icanon 2>/dev/null </dev/tty || true
 }
 
-tui_open() {
-  [ "$TUI" = 1 ] && return 0
+tui_enter() {    # the alternate screen, raw keys, and the colours for a full screen
   TUI_TTY="$(stty -g 2>/dev/null </dev/tty)" || TUI_TTY=""
   printf '\033[?1049h' >&2
   tui_raw
   TUI=1
   trap 'TUI_RESIZED=1' WINCH
+  tui_theme
+}
+
+tui_theme() {    # ask the terminal its colours (once), then pick the palette
+  declare -F theme_apply >/dev/null || return 0
+  [ "$THEME_ON" = 1 ] || return 0                             # no colours (NO_COLOR)
+  [ "$THEME_ASKED" = 1 ] || theme_detect || true
+  theme_apply screen
+}
+
+tui_open() {
+  [ "$TUI" = 1 ] && return 0
+  tui_enter
   tui_size
   tui_draw
 }
 
 tui_close() {
   [ "$TUI" = 1 ] || return 0
-  printf '\033[?1000l\033[?1006l%s\033[?25h\033[?1049l' "$SYNC_OFF" >&2
+  printf '\033[0m\033[?1000l\033[?1006l%s\033[?25h\033[?1049l' "$SYNC_OFF" >&2
   [ -n "$TUI_TTY" ] && stty "$TUI_TTY" 2>/dev/null </dev/tty
   trap - WINCH
   TUI=0
+  # back to the terminal's own colours for what's printed after
+  [ "$THEME_PAINT" = 1 ] && declare -F theme_apply >/dev/null && theme_apply
+  return 0
 }
 
 tui_refresh() {  # after a resize: measure again and draw everything
@@ -1243,6 +1485,7 @@ tui_refresh() {  # after a resize: measure again and draw everything
 }
 
 rule() { local line; printf -v line '%*s' "$1" ''; printf '%s' "${line// /─}"; }
+golden() { REPLY=$(( $1 * 382 / 1000 )); }   # golden N: the smaller golden part of N (N/φ²)
 
 # ---------------------------------------------------------------- drawing
 
@@ -1251,9 +1494,9 @@ tui_header() {
   room=$(( TW - 14 - ${#info} ))
   title=$TUI_TITLE
   [ "${#title}" -gt "$room" ] && title="${title:0:$(( room > 1 ? room - 1 : 0 ))}…"
-  printf '\033[1;1H\033[2K  %skokomux%s  %s%s%s' "$ACC" "$R" "$B" "$title" "$R" >&2
+  printf '%s\033[1;1H\033[2K  %skokomux%s  %s%s%s' "$R" "$ACC" "$R" "$B" "$title" "$R" >&2
   printf '\033[1;%dH%s%s%s' $(( TW - ${#info} )) "$D" "$info" "$R" >&2
-  printf '\033[2;1H\033[2K%s%s%s' "$D" "$(rule "$TW")" "$R" >&2
+  printf '\033[2;1H\033[2K%s%s%s' "$LINE" "$(rule "$TW")" "$R" >&2
 }
 
 tui_wrap() {     # tui_wrap K: part K's text wrapped to the column, once
@@ -1273,9 +1516,11 @@ tui_text() {     # the reading column: what's been heard above, this part, what'
   local -a past=() now_rows=() offs=() next=() rows=()
   h=$(( bottom - top + 1 ))
   if [ "$TUI_PART" = 0 ] || ! tui_wrap "$TUI_PART"; then   # nothing to show yet
+    printf '%s' "$R" >&2
     for (( r = top; r <= bottom; r++ )); do printf '\033[%d;1H\033[2K' "$r" >&2; done
     local msg="${TUI_STATE:-Getting ready}"
-    printf '\033[%d;%dH%s%s%s %s%s%s' $(( top + h / 3 )) $(( (TW - ${#msg} - 2) / 2 )) \
+    golden "$h"
+    printf '\033[%d;%dH%s%s%s %s%s%s' $(( top + REPLY )) $(( (TW - ${#msg} - 2) / 2 )) \
       "$ACC" "${TUI_SYM:-·}" "$R" "$D" "$msg" "$R" >&2
     return 0
   fi
@@ -1291,20 +1536,20 @@ tui_text() {     # the reading column: what's been heard above, this part, what'
     mapfile -t rows <<< "${TUI_WRAP[$k]%$'\n'}"
     next+=("${rows[@]}")
   done
-  # This part starts a third of the way down, but the lit word always stays on screen.
+  # This part starts on the golden line, φ⁻² of the way down; the lit word always stays on screen.
   if [ "$TUI_A" -gt 0 ]; then
     while [ $(( hl + 1 )) -lt "${#offs[@]}" ] && [ "${offs[hl + 1]}" -le "$TUI_A" ]; do hl=$(( hl + 1 )); done
   fi
-  a=$(( top + h / 3 ))
+  golden "$h"; a=$(( top + REPLY ))
   [ $(( a + hl )) -le $(( bottom - 2 )) ] || a=$(( bottom - 2 - hl ))
   n=${#now_rows[@]}
-  printf '%s' "$SYNC_ON" >&2
+  printf '%s%s' "$SYNC_ON" "$R" >&2
   for (( r = top; r <= bottom; r++ )); do
     idx=$(( r - a ))
     printf '\033[%d;1H\033[2K\033[%dG' "$r" $(( LM + 1 )) >&2
     if [ "$idx" -lt 0 ]; then
       j=$(( ${#past[@]} + idx ))
-      [ "$j" -ge 0 ] && printf '\033[38;5;245m%s%s' "${past[j]}" "$R" >&2
+      [ "$j" -ge 0 ] && printf '%s%s%s' "$PAST" "${past[j]}" "$R" >&2
     elif [ "$idx" -lt "$n" ]; then
       printf '\033[%dG%s▎%s' $(( LM - 1 )) "$ACC" "$R" >&2   # marks the part being read
       printf '\033[%dG' $(( LM + 1 )) >&2
@@ -1340,42 +1585,59 @@ tui_progress() {
   TUI_BAR=(3 "$bw")
   filled=0; [ "$TUI_PARTS" -gt 0 ] && filled=$(( TUI_PART * bw / TUI_PARTS ))
   printf -v bar '%*s' "$filled" ''; bar=${bar// /━}
-  printf '\033[%d;1H\033[2K  %s%s%s' $(( TH - 3 )) "$ACC" "$bar" "$R" >&2
+  printf '%s\033[%d;1H\033[2K  %s%s%s' "$R" $(( TH - 3 )) "$ACC" "$bar" "$R" >&2
   printf -v bar '%*s' $(( bw - filled )) ''
-  printf '%s%s%s  %s' "$D" "${bar// /─}" "$R" "$label" >&2
+  printf '%s%s%s  %s' "$LINE" "${bar// /─}" "$R" "$label" >&2
 }
 
-tui_button() {   # tui_button ROW X KEY LABEL COMMAND: draw one, remember where it is; X advances
-  local text=" k $4 "                         # (the key glyph is one column, whatever its bytes)
-  printf '\033[%d;%dH\033[48;5;236m %s%s%s\033[48;5;236m %s \033[0m' "$1" "$BX" "$ACC2" "$3" "$R" "$4" >&2
-  TUI_BTN+=("$1 $BX $(( BX + ${#text} - 1 )) $5")
-  BX=$(( BX + ${#text} + 2 ))
+tui_button() {   # tui_button ROW KEY LABEL COMMAND: draw one at BX, remember where it is; BX advances by BGAP
+  local text=" k $3 "                         # (the key glyph is one column, whatever its bytes)
+  printf '\033[%d;%dH%s %s%s%s%s %s %s' "$1" "$BX" "$SURF" "$ACC2" "$2" "$R" "$SURF" "$3" "$R" >&2
+  TUI_BTN+=("$1 $BX $(( BX + ${#text} - 1 )) $4")
+  BX=$(( BX + ${#text} + BGAP ))
+}
+
+tui_buttons() {  # tui_buttons ROW "key|label|short|command"...: a row that always fits
+  # Full labels two columns apart; if that's too wide, one apart; then short labels.
+  local row=$1 spec k l s c w full=0 brief=0 n=$(( $# - 1 ))
+  shift
+  for spec in "$@"; do
+    IFS='|' read -r k l s c <<< "$spec"
+    full=$(( full + ${#l} + 4 )); brief=$(( brief + ${#s} + 4 ))
+  done
+  local short=0
+  BGAP=2
+  if [ $(( 2 + full + 2 * (n - 1) )) -gt "$TW" ]; then
+    BGAP=1; [ $(( 2 + full + n - 1 )) -gt "$TW" ] && short=1
+  fi
+  BX=3
+  for spec in "$@"; do
+    IFS='|' read -r k l s c <<< "$spec"
+    [ "$short" = 1 ] && l=$s
+    tui_button "$row" "$k" "$l" "$c"
+  done
 }
 
 tui_footer() {   # the buttons (keys and clicks), and what's happening on the right
-  local state room
+  local state room play=Pause
   TUI_BTN=()
-  printf '\033[%d;1H\033[2K\033[%d;1H\033[2K' $(( TH - 1 )) "$TH" >&2
-  BX=3
-  tui_button "$TH" "$BX" "␣" "$( [ "$TUI_PAUSED" = 1 ] && echo Play || echo Pause)" toggle
-  tui_button "$TH" "$BX" "←" Again again
-  tui_button "$TH" "$BX" "→" Next next
-  tui_button "$TH" "$BX" q Stop quit
+  printf '%s\033[%d;1H\033[2K\033[%d;1H\033[2K' "$R" $(( TH - 1 )) "$TH" >&2
+  [ "$TUI_PAUSED" = 1 ] && play=Play
+  tui_buttons "$TH" "␣|$play|$play|toggle" "←|Again|Back|again" "→|Next|Next|next" "q|Stop|Stop|quit"
   state="${TUI_SYM:+$TUI_SYM }$TUI_STATE${TUI_EXTRA:+ · $TUI_EXTRA}"
-  room=$(( TW - BX - 2 ))
+  room=$(( TW - BX - 2 + BGAP ))
   if [ "$room" -gt 6 ]; then
     [ "${#state}" -gt "$room" ] && state="${state:0:$(( room - 1 ))}…"
     printf '\033[%d;%dH%s%s%s' "$TH" $(( TW - ${#state} - 1 )) "$D" "$state" "$R" >&2
   fi
-  BX=3                                        # the second row: the rest
-  [ "$TUI_HAS_CHAPTERS" = 1 ] && tui_button $(( TH - 1 )) "$BX" c Chapters chapters
-  tui_button $(( TH - 1 )) "$BX" "−" Slower slower
-  tui_button $(( TH - 1 )) "$BX" "+" Faster faster
-  tui_button $(( TH - 1 )) "$BX" t Sleep sleep
+  local more=()                               # the second row: the rest
+  [ "$TUI_HAS_CHAPTERS" = 1 ] && more+=("c|Chapters|Chap|chapters")
+  more+=("−|Slower|Slow|slower" "+|Faster|Fast|faster" "t|Sleep|Sleep|sleep")
+  tui_buttons $(( TH - 1 )) "${more[@]}"
 }
 
 tui_draw() {
-  printf '%s\033[2J' "$SYNC_ON" >&2         # a full redraw clears what overlays left behind
+  printf '%s%s\033[2J' "$SYNC_ON" "$R" >&2  # a full redraw clears what overlays left behind
   tui_header; tui_text; tui_progress; tui_footer
   printf '%s' "$SYNC_OFF" >&2
 }
@@ -1423,21 +1685,21 @@ tui_chapters() { # tui_chapters CURRENT: pick a chapter over the reading area; C
     [ "$sel" -lt "$top" ] && top=$sel
     [ "$sel" -ge $(( top + view )) ] && top=$(( sel - view + 1 ))
     printf '%s' "$SYNC_ON" >&2
-    printf '\033[3;%dH\033[48;5;235m%*s\033[3;%dH %sChapters%s\033[48;5;235m' "$x0" "$w" "" "$x0" "$B" "$R" >&2
+    printf '\033[3;%dH%s%*s\033[3;%dH %sChapters%s%s' "$x0" "$SURF" "$w" "" "$x0" "$B" "$R" "$SURF" >&2
     rowsel=()
     for (( i = top, y = 4; y < 4 + view; i++, y++ )); do
-      printf '\033[%d;%dH\033[48;5;235m%*s' "$y" "$x0" "$w" "" >&2
+      printf '\033[%d;%dH%s%*s' "$y" "$x0" "$SURF" "$w" "" >&2
       [ "$i" -lt "${#CH_TITLE[@]}" ] || continue
       title=${CH_TITLE[i]}; [ "${#title}" -gt $(( w - 12 )) ] && title="${title:0:$(( w - 13 ))}…"
       if [ "$i" = "$sel" ]; then
-        printf '\033[%d;%dH\033[48;5;238m%*s\033[%d;%dH%s›%s\033[48;5;238m %-*s %spart %s\033[0m' "$y" "$x0" "$w" "" "$y" "$x0" \
-          "$ACC" "$R" $(( w - 12 )) "$title" "$D" "${CH_START[i]}" >&2
+        printf '\033[%d;%dH%s%*s\033[%d;%dH%s%s▎%s%s %-*s %spart %s%s' "$y" "$x0" "$PSEL" "$w" "" "$y" "$x0" \
+          "$PSEL" "$ACC" "$R" "$PSEL" $(( w - 12 )) "$title" "$D" "${CH_START[i]}" "$R" >&2
       else
-        printf '\033[%d;%dH\033[48;5;235m  %-*s %spart %s\033[0m' "$y" "$x0" $(( w - 12 )) "$title" "$D" "${CH_START[i]}" >&2
+        printf '\033[%d;%dH%s  %-*s %spart %s%s' "$y" "$x0" "$SURF" $(( w - 12 )) "$title" "$D" "${CH_START[i]}" "$R" >&2
       fi
       rowsel[$y]=$i
     done
-    printf '\033[%d;%dH\033[48;5;235m%*s\033[%d;%dH %s↑↓ Enter jump · Esc close%s\033[0m' $(( 4 + view )) "$x0" "$w" "" $(( 4 + view )) "$x0" "$D" "$R" >&2
+    printf '\033[%d;%dH%s%*s\033[%d;%dH %s↑↓ Enter jump · Esc close%s' $(( 4 + view )) "$x0" "$SURF" "$w" "" $(( 4 + view )) "$x0" "$D" "$R" >&2
     printf '%s' "$SYNC_OFF" >&2
     KEY=""; tick 0.5; [ -n "$KEY" ] || continue
     case "$KEY" in
@@ -1455,7 +1717,7 @@ tui_chapters() { # tui_chapters CURRENT: pick a chapter over the reading area; C
 
 tui_prompt() {   # tui_prompt LABEL [DEFAULT]: ask on the bottom line (with Tab completion)
   local ans=""
-  printf '%s\033[%d;1H\033[2K\033[%d;1H\033[2K' "$SYNC_OFF" $(( TH - 1 )) "$TH" >&2
+  printf '%s%s\033[%d;1H\033[2K\033[%d;1H\033[2K' "$SYNC_OFF" "$R" $(( TH - 1 )) "$TH" >&2
   tui_cooked
   printf '\033[%d;3H' "$TH" >&2
   IFS= read -e -r -p "$1 " -i "${2:-}" ans </dev/tty 2>&1 || ans=""
@@ -1464,37 +1726,44 @@ tui_prompt() {   # tui_prompt LABEL [DEFAULT]: ask on the bottom line (with Tab 
 }
 
 tui_home() {     # runs until something is chosen; prints the chosen kokoro arguments
-  local sel=0 marks=() key r i m title part parts pct bw bar row y
+  local sel=0 marks=() key r i m title part parts pct bw bar row y h free n
   local -A rowact=()
-  TUI_TTY="$(stty -g 2>/dev/null </dev/tty)" || TUI_TTY=""
-  printf '\033[?1049h' >&2; tui_raw; TUI=1
-  trap 'TUI_RESIZED=1' WINCH
+  tui_enter
   mapfile -t marks < <(ls -t "$BOOKS"/*.mark 2>/dev/null | head -n 6)
   HOME_CHOICE=()
   while IFS= read -rsn1 -t 0.05 -u "$KBD" _; do :; done   # drop keys typed before it opened
-  local clip_note=""
-  [ "$(cat "${CONF%/*}/termux-api" 2>/dev/null)" = yes ] || clip_note="  ${D}needs the Termux:API app${R}"
+  local api=0
+  [ "$(cat "${CONF%/*}/termux-api" 2>/dev/null)" = yes ] && api=1
   while :; do
     tui_size; rowact=()
-    printf '%s\033[2J' "$SYNC_ON" >&2
-    y=2
+    printf '%s%s\033[2J' "$SYNC_ON" "$R" >&2
+    # The content as one block, its free space split 1 : φ above and below:
+    # the optical centre, where a block looks centred rather than low.
+    n=${#marks[@]}; [ "$n" -gt 0 ] || n=1
+    if [ "$TH" -ge 22 ]; then h=6; else h=2; fi
+    h=$(( h + 1 + n + 1 + 1 + 6 ))
+    free=$(( TH - 2 - h )); [ "$free" -gt 0 ] || free=0
+    golden "$free"; y=$(( 1 + REPLY ))
     if [ "$TH" -ge 22 ]; then                     # the logo, when there's room for it
-      local c=(141 153 159) l=0 line
+      local l=0 line
+      theme_grad 3 2>/dev/null || GRAD=("$ACC" "$ACC" "$ACC2")
       for line in '░█░█░█▀█░█░█░█▀█░█▄█░█░█░█░█' '░█▀▄░█░█░█▀▄░█░█░█░█░█░█░▄▀▄' '░▀░▀░▀▀▀░▀░▀░▀▀▀░▀░▀░▀▀▀░▀░▀'; do
-        line="${line//░/$'\033[38;5;237m'░$'\033[38;5;'"${c[l]}"m}"
-        printf '\033[%d;%dH\033[38;5;%sm%s%s' "$y" $(( (TW - 28) / 2 )) "${c[l]}" "$line" "$R" >&2
+        line="${line//░/$GHOST░${GRAD[l]}}"         # the ░ texture recedes, the letters stand out
+        printf '\033[%d;%dH%s%s%s' "$y" $(( (TW - 28) / 2 )) "${GRAD[l]}" "$line" "$R" >&2
         y=$(( y + 1 )); l=$(( l + 1 ))
       done
       printf '\033[%d;%dH%sKokoro text-to-speech%s' $(( y + 1 )) $(( (TW - 21) / 2 )) "$D" "$R" >&2
       y=$(( y + 3 ))
     else
-      printf '\033[%d;3H%skokomux%s  %sKokoro text-to-speech%s' "$y" "$ACC" "$R" "$D" "$R" >&2
+      printf '\033[%d;%dH%skokomux%s  %sKokoro text-to-speech%s' "$y" "$LM" "$ACC" "$R" "$D" "$R" >&2
       y=$(( y + 2 ))
     fi
     local x0=$LM
     printf '\033[%d;%dH%sContinue listening%s' "$y" "$x0" "$B" "$R" >&2; y=$(( y + 1 ))
     if [ "${#marks[@]}" = 0 ]; then
-      printf '\033[%d;%dH%sNothing in progress yet. Long texts and books are remembered here.%s' "$y" "$x0" "$D" "$R" >&2
+      r="Nothing in progress yet. Long texts and books are remembered here."
+      [ "${#r}" -gt "$CW" ] && r="Nothing in progress yet."
+      printf '\033[%d;%dH%s%s%s' "$y" "$x0" "$D" "$r" "$R" >&2
       y=$(( y + 1 ))
     fi
     for i in "${!marks[@]}"; do
@@ -1502,26 +1771,28 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
       [ "${parts:-0}" -gt 0 ] 2>/dev/null || parts=1
       pct=$(( 100 * (part - 1) / parts )); bw=12
       printf -v bar '%*s' $(( pct * bw / 100 )) ''; bar="$ACC${bar// /━}$R"
-      local rest; printf -v rest '%*s' $(( bw - pct * bw / 100 )) ''; bar+="$D${rest// /─}$R"
-      local room=$(( CW - 30 )); [ "${#title}" -gt "$room" ] && title="${title:0:$(( room - 1 ))}…"
-      if [ "$i" = "$sel" ]; then row=$'\033[48;5;237m'; else row=""; fi
+      local rest; printf -v rest '%*s' $(( bw - pct * bw / 100 )) ''; bar+="$LINE${rest// /─}$R"
+      local room=$(( CW - 23 )); [ "${#title}" -gt "$room" ] && title="${title:0:$(( room - 1 ))}…"
+      local mk=" "; row=""
+      if [ "$i" = "$sel" ]; then row=$SEL; mk="$ACC▎"; fi
       bar="${bar//$R/$R$row}"            # keep the selected row's background across the bar
-      printf '\033[%d;%dH%s %s%d%s  %-*s %s %s%3d%%%s \033[0m' "$y" "$x0" "$row" "$ACC2" $(( i + 1 )) "$R$row" \
-        "$room" "$title" "$bar$row" "$D" "$pct" "$R$row" >&2
+      printf '\033[%d;%dH%s%s%s%s%d%s  %-*s %s %s%3d%%%s %s' "$y" "$x0" "$row" "$mk" "$R$row" \
+        "$ACC2" $(( i + 1 )) "$R$row" "$room" "$title" "$bar$row" "$D" "$pct" "$R$row" "$R" >&2
       rowact[$y]="mark:$i"; y=$(( y + 1 ))
     done
     y=$(( y + 1 ))
+    local clip_note=""; [ "$api" = 1 ] || clip_note="  ${D}needs the Termux:API app${R}"
     printf '\033[%d;%dH%sStart something new%s' "$y" "$x0" "$B" "$R" >&2; y=$(( y + 1 ))
     for spec in "c|Read the clipboard$clip_note|clip" "f|Open a file  ${D}text, EPUB or PDF${R}|file" \
                 "u|Read a web page|url" "t|Type something to hear|text" \
-                "v|Voice  ${D}$KOKORO_VOICE · ${KOKORO_SPEED}×${R}|voice" "s|Settings  ${D}speed, highlighting, notifications…${R}|settings"; do
+                "v|Voice  ${D}$KOKORO_VOICE · ${KOKORO_SPEED}×${R}|voice" "s|Settings  ${D}speed, colours, highlighting…${R}|settings"; do
       IFS='|' read -r key r cmd <<< "$spec"
       printf '\033[%d;%dH %s%s%s  %s' "$y" "$x0" "$ACC2" "$key" "$R" "$r" >&2
       rowact[$y]=$cmd; y=$(( y + 1 ))
     done
     if [ "$TW" -ge 64 ]; then r="↑↓ choose · Enter play · click or tap anything · q quit"
     else r="↑↓ · Enter play · tap · q quit"; fi
-    printf '\033[%d;3H%s%s%s' "$TH" "$D" "$r" "$R" >&2
+    printf '\033[%d;%dH%s%s%s' "$TH" "$LM" "$D" "$r" "$R" >&2
     printf '%s' "$SYNC_OFF" >&2
 
     KEY=""; tick 1; [ -n "$KEY" ] || continue
@@ -1603,6 +1874,7 @@ TUI_SETTINGS=(
   "out|Save files as|The file name used when you save without -o. The ending picks the format: .wav .mp3 .ogg or .flac."
   "#Reading"
   "KOKORO_TUI|Full-screen reader|Open the full-screen reader when you listen on a terminal. Off: show the text below the command instead."
+  "theme|Colours|Auto follows your terminal's own colours. Dark or Light uses that palette on these screens, with its own background if your terminal is the other kind."
   "KOKORO_WORDS|Light up words|Highlight each word as it's spoken, using the timings Kokoro reports as it speaks, in every language."
   "offset|Highlight timing|Moves the highlight relative to the voice. Raise it if the highlight runs ahead, lower it if it lags."
   "#While listening"
@@ -1630,6 +1902,12 @@ setting_value() {  # what the row shows on the right for setting $1
     lang)  printf '‹ %s%s%s ›' "$ACC2" "$KOKORO_LANG" "$R"
            [ "$SET_NARROW" = 1 ] || printf '  %s%s%s' "$D" "${TUI_LANG_NAME[$KOKORO_LANG]:-}" "$R" ;;
     out)   printf '%s' "$KOKORO_OUT" ;;
+    theme) theme_name 2>/dev/null || REPLY=Auto
+           printf '‹ %s%s%s ›' "$ACC2" "$REPLY" "$R"
+           if [ "$SET_NARROW" = 0 ]; then
+             if [ "${KOKORO_THEME:-auto}" = auto ]; then printf '  %s%s terminal%s' "$D" "${THEME_MODE^}" "$R"
+             elif [ "$THEME_PAINT" = 1 ]; then printf '  %sits own background%s' "$D" "$R"; fi
+           fi ;;
     offset) printf '‹ %+d ms ›' "$KOKORO_WORDS_OFFSET_MS" ;;
     idle)  if [ "$KOKORO_IDLE_MINUTES" = 0 ]; then printf '‹ never ›'; else printf '‹ %s min ›' "$KOKORO_IDLE_MINUTES"; fi ;;
     port)  printf '%s' "$KOKORO_PORT" ;;
@@ -1656,6 +1934,12 @@ setting_change() { # setting_change ID STEP: ←/→ (-1/+1); 0 means Enter, a c
       for i in "${!TUI_LANGS[@]}"; do [ "${TUI_LANGS[i]}" = "$KOKORO_LANG" ] && break; done
       [ "$step" = 0 ] && step=1
       tui_save KOKORO_LANG "${TUI_LANGS[$(( (i + step + ${#TUI_LANGS[@]}) % ${#TUI_LANGS[@]} ))]}" ;;
+    theme)                                    # auto → dark → light, shown at once
+      local themes=(auto dark light)
+      for i in "${!themes[@]}"; do [ "${themes[i]}" = "${KOKORO_THEME:-auto}" ] && break; done
+      [ "$step" = 0 ] && step=1
+      tui_save KOKORO_THEME "${themes[$(( (i + step + 3) % 3 ))]}"
+      tui_theme ;;
     out)
       tui_prompt "Save files as:" "$KOKORO_OUT"
       if [[ "$ANSWER" =~ ^[^/[:space:]]+\.(wav|mp3|ogg|flac)$ ]]; then tui_save KOKORO_OUT "$ANSWER"
@@ -1681,7 +1965,7 @@ setting_change() { # setting_change ID STEP: ←/→ (-1/+1); 0 means Enter, a c
       fi ;;
     edit)
       [ "$step" = 0 ] || return 0
-      tui_cooked; printf '\033[?1049l' >&2
+      tui_cooked; printf '\033[0m\033[?1049l' >&2
       "${EDITOR:-nano}" "$CONF" </dev/tty >/dev/tty 2>&1 || true
       # shellcheck source=/dev/null
       [ -f "$CONF" ] && . "$CONF"
@@ -1693,14 +1977,13 @@ tui_settings() { # the settings menu; works on its own or from the home screen
   local own=0 sel=0 top=0 key rows=() i n n_this=0 y=0 r id label desc val first=4 last view lw=26
   local -A rowsel=()
   SAVED_AT=0; SETTINGS_NOTE=""
-  if [ "$TUI" != 1 ]; then
-    own=1; TUI_TTY="$(stty -g 2>/dev/null </dev/tty)" || TUI_TTY=""
-    printf '\033[?1049h' >&2; tui_raw; TUI=1; trap 'TUI_RESIZED=1' WINCH
-  fi
+  if [ "$TUI" != 1 ]; then own=1; tui_enter; fi
   local items=(); for r in "${TUI_SETTINGS[@]}"; do [ "${r:0:1}" = "#" ] || items+=("${r%%|*}"); done
   while :; do
     tui_size
-    SET_NARROW=0; lw=26; [ "$CW" -lt 64 ] && { SET_NARROW=1; lw=25; }
+    # labels and values share the width φ⁻² : φ⁻¹, with room for the longest label
+    SET_NARROW=0; [ "$CW" -lt 64 ] && SET_NARROW=1
+    golden "$CW"; lw=$(( REPLY > 25 ? REPLY : 25 ))
     # what the selected setting does, wrapped: the bottom of the screen is laid out around it
     for r in "${TUI_SETTINGS[@]}"; do [ "${r%%|*}" = "${items[sel]}" ] && desc=${r##*|}; done
     [ -n "$SETTINGS_NOTE" ] && desc="$SETTINGS_NOTE"
@@ -1715,13 +1998,13 @@ tui_settings() { # the settings menu; works on its own or from the home screen
     [ "$y" -lt "$top" ] && top=$(( y > 0 && ${rows[y-1]:0:1} == "#" ? y - 1 : y ))
     [ "$y" -ge $(( top + view )) ] && top=$(( y - view + 1 ))
     [ "$y" -le 1 ] && top=0
-    printf '%s\033[2J' "$SYNC_ON" >&2
+    printf '%s%s\033[2J' "$SYNC_ON" "$R" >&2
     printf '\033[1;1H  %skokomux%s  %sSettings%s' "$ACC" "$R" "$B" "$R" >&2
     now_ms
     if [ "$SAVED_AT" -gt 0 ] && [ $(( NOW - SAVED_AT )) -lt 1500 ]; then
       printf '\033[1;%dH%s✓ Saved%s' $(( TW - 9 )) "$GRN" "$R" >&2
     fi
-    printf '\033[2;1H%s%s%s' "$D" "$(rule "$TW")" "$R" >&2
+    printf '\033[2;1H%s%s%s' "$LINE" "$(rule "$TW")" "$R" >&2
     rowsel=(); n=0
     for i in "${!rows[@]}"; do
       r=${rows[i]}
@@ -1735,8 +2018,8 @@ tui_settings() { # the settings menu; works on its own or from the home screen
         IFS='|' read -r id label desc <<< "$r"
         val="$(setting_value "$id")"
         if [ "$n_this" = "$sel" ]; then
-          printf '\033[%d;%dH\033[48;5;237m%*s\033[%d;%dH%s›%s\033[48;5;237m %s' "$y" "$LM" "$CW" "" "$y" "$LM" "$ACC" "$R" "$label" >&2
-          printf '\033[%d;%dH\033[48;5;237m%s\033[0m' "$y" $(( LM + lw )) "${val//$R/$R$'\033[48;5;237m'}" >&2
+          printf '\033[%d;%dH%s%*s\033[%d;%dH%s▎%s%s %s' "$y" "$LM" "$SEL" "$CW" "" "$y" "$LM" "$ACC" "$R" "$SEL" "$label" >&2
+          printf '\033[%d;%dH%s%s%s' "$y" $(( LM + lw )) "$SEL" "${val//$R/$R$SEL}" "$R" >&2
         else
           printf '\033[%d;%dH  %s\033[%d;%dH%s' "$y" "$LM" "$label" "$y" $(( LM + lw )) "$val" >&2
         fi
@@ -1747,7 +2030,7 @@ tui_settings() { # the settings menu; works on its own or from the home screen
     [ "$top" -gt 0 ] && printf '\033[%d;%dH%s▲ more%s' $(( first - 1 )) $(( LM + CW - 6 )) "$D" "$R" >&2
     [ $(( top + view )) -lt "${#rows[@]}" ] && printf '\033[%d;%dH%s▼ more%s' $(( last + 1 )) $(( LM + CW - 6 )) "$D" "$R" >&2
     y=$(( TH - ${#dl[@]} - 1 ))
-    printf '\033[%d;1H%s%s%s' "$y" "$D" "$(rule "$TW")" "$R" >&2
+    printf '\033[%d;1H%s%s%s' "$y" "$LINE" "$(rule "$TW")" "$R" >&2
     for r in "${dl[@]}"; do y=$(( y + 1 )); printf '\033[%d;%dH%s' "$y" "$LM" "$r" >&2; done
     if [ "$TW" -ge 72 ]; then r="↑↓ choose · ←→ change · Enter edit · Space hear voice · q done"
     else r="↑↓ · ←→ change · Enter · q done"; fi
@@ -1784,24 +2067,24 @@ tui_voices() {   # the voice picker: type to filter, Space to hear, Enter to cho
     [ "$sel" -ge "${#list[@]}" ] && sel=$(( ${#list[@]} > 0 ? ${#list[@]} - 1 : 0 ))
     [ "$sel" -lt "$top" ] && top=$sel
     [ "$sel" -ge $(( top + view )) ] && top=$(( sel - view + 1 ))
-    printf '%s\033[2J\033[1;1H  %skokomux%s  %sChoose a voice%s' "$SYNC_ON" "$ACC" "$R" "$B" "$R" >&2
+    printf '%s%s\033[2J\033[1;1H  %skokomux%s  %sChoose a voice%s' "$SYNC_ON" "$R" "$ACC" "$R" "$B" "$R" >&2
     printf '\033[1;%dH%s%s%s' $(( TW - 20 )) "$D" "${#list[@]} of ${#TUI_VOICES[@]} voices" "$R" >&2
-    printf '\033[2;1H%s%s%s' "$D" "$(rule "$TW")" "$R" >&2
+    printf '\033[2;1H%s%s%s' "$LINE" "$(rule "$TW")" "$R" >&2
     printf '\033[3;%dH%sFilter:%s %s%s▏' "$LM" "$D" "$R" "$filter" "$ACC" >&2; printf '%s' "$R" >&2
     rowsel=(); prev=""
     for (( i = top, y = 5; i < ${#list[@]} && y <= TH - 3; i++, y++ )); do
       v=${list[i]}; lang=${TUI_VOICE_LANG[${v:0:1}]:-}; g=female; [ "${v:1:1}" = m ] && g=male
       local mark=" "; [ "$v" = "$KOKORO_VOICE" ] && mark="$GRN✓$R"
       if [ "$i" = "$sel" ]; then
-        printf '\033[%d;%dH\033[48;5;237m%*s\033[%d;%dH%s›%s\033[48;5;237m %s %s%-16s\033[48;5;237m %s%s · %s\033[0m' \
-          "$y" "$LM" "$CW" "" "$y" "$LM" "$ACC" "$R" "$mark" "$ACC2" "$v" "$R" "${TUI_LANG_NAME[$lang]:-}" "$g" >&2
+        printf '\033[%d;%dH%s%*s\033[%d;%dH%s▎%s%s %s%s %s%-16s%s %s%s · %s%s' \
+          "$y" "$LM" "$SEL" "$CW" "" "$y" "$LM" "$ACC" "$R" "$SEL" "${mark//$R/$R$SEL}" "$SEL" "$ACC2" "$v" "$R$SEL" "$D" "${TUI_LANG_NAME[$lang]:-}" "$g" "$R" >&2
       else
         printf '\033[%d;%dH  %s %-16s %s%s · %s%s' "$y" "$LM" "$mark" "$v" "$D" "${TUI_LANG_NAME[$lang]:-}" "$g" "$R" >&2
       fi
       rowsel[$y]=$i
     done
     [ "${#list[@]}" = 0 ] && printf '\033[5;%dH%sNo voice matches "%s".%s' "$LM" "$D" "$filter" "$R" >&2
-    printf '\033[%d;1H%s%s%s' $(( TH - 1 )) "$D" "$(rule "$TW")" "$R" >&2
+    printf '\033[%d;1H%s%s%s' $(( TH - 1 )) "$LINE" "$(rule "$TW")" "$R" >&2
     if [ "$TW" -ge 72 ]; then g="type to filter · ↑↓ choose · Space hear it · Enter use it · Esc back"
     else g="type · ↑↓ · Space hear · Enter use · Esc"; fi
     printf '\033[%d;%dH%s%s%s%s' "$TH" "$LM" "$D" "$g" "$R" "$SYNC_OFF" >&2
@@ -1835,7 +2118,7 @@ __KOKOMUX_TUI__
 
 cat > "$WORK/player.sh" <<'__KOKOMUX_PLAYER__'
 # kokomux: the player. Sourced by `kokoro` (bash) once a listening run is set up.
-# shellcheck shell=bash disable=SC2034,SC2154  # shares its globals with kokoro
+# shellcheck shell=bash disable=SC2034,SC2153,SC2154  # shares its globals with kokoro
 #
 #   play_line WAV IDX     plays one part: the inline view or the full-screen
 #                         reader (via the view API below), word highlights,
@@ -1844,7 +2127,7 @@ cat > "$WORK/player.sh" <<'__KOKOMUX_PLAYER__'
 #                         restart the reading at a part (jump_to)
 #
 # Expects from kokoro: the run's globals (tmpd, play, ui, show_words, voice,
-# speed, lang, name, kind, source, text, book_id, start, i), the colours,
+# speed, lang, name, kind, source, text, book_id, start, i), the colours (HL),
 # status/status_clear, tick, now_ms, write_job and run_engine.
 
 # ------------------------------------------------------------ the line being heard
@@ -1856,7 +2139,7 @@ cat > "$WORK/player.sh" <<'__KOKOMUX_PLAYER__'
 # A line taller than the screen is shown as a window of rows that follows the
 # lit word, then printed in full when it ends.
 
-HL=$'\033[48;5;61m\033[38;5;231m'   # the soft highlight
+# The soft highlight is HL, from the theme: the background moved φ⁻² towards the accent.
 blk_lines=(); blk_offs=(); view_top=0; view_h=0
 w_s=(); w_e=(); w_a=(); w_b=(); w_state=none
 TERM_ROWS=24
@@ -2151,6 +2434,213 @@ play_line() {    # play_line WAV IDX: play one part; light its words; obey pause
 
 __KOKOMUX_PLAYER__
 
+cat > "$WORK/theme.sh" <<'__KOKOMUX_THEME__'
+# kokomux: colours. Sourced by `kokoro` and built into the installer (bash).
+# shellcheck shell=bash disable=SC2034  # the colours are used by whoever sources this
+#
+#   theme_apply [screen]   set the colours below for the terminal (or, with
+#                          "screen", for a full-screen view, which may paint
+#                          its own background)
+#   theme_detect           ask the terminal what its colours are (OSC 10/11)
+#   theme_grad N           GRAD: N colours from violet to cyan (the logo)
+#
+# One palette for dark and light, derived from the terminal's own background:
+# every grey is the background moved part of the way towards the text colour,
+# in steps of the golden ratio (φ = 1.618…). Each step is φ times the one
+# before it, so the levels read as evenly spaced, and there are only five:
+#
+#   φ⁻¹  .618  D      secondary text: hints, labels, what's still to be read
+#   φ⁻²  .382  LINE   rules, the progress bar's track
+#   φ⁻³  .236  GHOST  the logo's texture; PSEL, a selected row on a panel
+#   φ⁻⁴  .146  SURF   buttons and panels; SEL, a selected row (accent-tinted)
+#   ½          PAST   what's already been heard: it recedes, but stays legible
+#
+# The accents (violet ACC, sky ACC2, GRN, RED, YEL) come in a dark and a light
+# set, each checked against the backgrounds of popular terminal themes
+# (tests/test_theme.py): text ≥ 10:1, accents and secondary text ≈ 4.5:1 or
+# better. The word being spoken (HL) sits on the background moved φ⁻² of the
+# way towards the accent: soft, but clearly lit.
+#
+# KOKORO_THEME picks: auto (follow the terminal), dark or light. A full-screen
+# view on a terminal of the other kind paints its own background; plain
+# command-line output always follows the terminal, since it can't.
+
+THEME_STEPS=(1000 618 382 236 146 90)            # φ⁻ⁿ, in thousandths
+# name:   background  text    violet  sky     green   red     amber   cyan (logo end)
+THEME_DARK=(16151d    e8e6f0  b69cff  7cd0f5  86d39a  ff7a7a  efc764  9ff0ec)
+THEME_LIGHT=(fbfaf8   1c1b22  6438c9  0b67a0  21743a  c0262d  855300  0f7c86)
+THEME_TERM_BG=""; THEME_TERM_FG=""    # the terminal's colours as rrggbb (asked, or remembered)
+THEME_ASKED=0                         # 1 once theme_detect has asked, this run
+THEME_MODE=dark; THEME_PAINT=0; THEME_TERM_MODE=""; THEME_TRUE=0; THEME_ON=0
+THEME_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/kokomux/theme"
+
+# --------------------------------------------------------------- colour maths
+# Colours are rrggbb strings; results come back in REPLY (no subshells: this
+# runs every time kokoro starts).
+
+theme_mix() {    # theme_mix A B T: A moved T thousandths of the way to B
+  local a=$1 b=$2 t=$3 i x y out=""
+  for i in 0 2 4; do
+    x=$(( 16#${a:i:2} )) y=$(( 16#${b:i:2} ))
+    printf -v out '%s%02x' "$out" $(( x + ((y - x) * t + ((y - x) * t >= 0 ? 500 : -500)) / 1000 ))
+  done
+  REPLY=$out
+}
+
+theme_luma() {   # theme_luma RGB: perceived brightness, 0 to 255
+  REPLY=$(( (2126 * 16#${1:0:2} + 7152 * 16#${1:2:2} + 722 * 16#${1:4:2}) / 10000 ))
+}
+
+theme_sgr() {    # theme_sgr 38|48 RGB: the SGR parameters for that colour (REPLY)
+  local r=$(( 16#${2:0:2} )) g=$(( 16#${2:2:2} )) b=$(( 16#${2:4:2} ))
+  if [ "$THEME_TRUE" = 1 ]; then REPLY="$1;2;$r;$g;$b"; return 0; fi
+  # The nearest of the 256 colours: the 6×6×6 cube or the 24 greys.
+  local -a lv=(0 95 135 175 215 255)
+  local ri gi bi k v d1 d2 grey
+  for k in r g b; do
+    v=${!k}; if [ "$v" -lt 48 ]; then v=0; elif [ "$v" -lt 115 ]; then v=1; else v=$(( (v - 35) / 40 )); fi
+    printf -v "${k}i" '%s' "$v"
+  done
+  d1=$(( (r - lv[ri]) ** 2 + (g - lv[gi]) ** 2 + (b - lv[bi]) ** 2 ))
+  grey=$(( (r + g + b) / 3 )); k=$(( grey > 238 ? 23 : (grey < 8 ? 0 : (grey - 3) / 10) ))
+  v=$(( 8 + 10 * k ))
+  d2=$(( (r - v) ** 2 + (g - v) ** 2 + (b - v) ** 2 ))
+  if [ "$d2" -lt "$d1" ]; then REPLY="$1;5;$(( 232 + k ))"; else REPLY="$1;5;$(( 16 + 36 * ri + 6 * gi + bi ))"; fi
+}
+
+theme_fg() { theme_sgr 38 "$1"; REPLY=$'\033['"$REPLY"m; }
+theme_bg() { theme_sgr 48 "$1"; REPLY=$'\033['"$REPLY"m; }
+
+# --------------------------------------------------------------- the terminal
+
+theme_truecolor() {
+  case "${KOKORO_TRUECOLOR:-}" in 1) return 0 ;; 0) return 1 ;; esac
+  case "${COLORTERM:-}" in truecolor|24bit) return 0 ;; esac
+  [ -n "${TERMUX_VERSION:-}" ] && return 0                  # Termux has 24-bit colour
+  case "${TERM_PROGRAM:-}" in iTerm.app|WezTerm|vscode|ghostty) return 0 ;; esac
+  case "${TERM:-}" in *-direct|xterm-kitty|alacritty|foot*|wezterm) return 0 ;; esac
+  return 1
+}
+
+theme_detect() { # ask the terminal for its background and text colours
+  # OSC 11 and 10 ask; DA1 (which every terminal answers) marks the end of the
+  # replies, so a terminal that doesn't know OSC 11 costs no waiting.
+  local fd saved="" buf="" c n=0 hex x wait=1 got=0
+  THEME_ASKED=1
+  [ -t 2 ] || return 1
+  { exec {fd}<>/dev/tty; } 2>/dev/null || return 1
+  saved="$(stty -g <&"$fd" 2>/dev/null)" || saved=""
+  stty -echo -icanon <&"$fd" 2>/dev/null || true
+  printf '\033]11;?\033\\\033]10;?\033\\\033[c' >&"$fd"
+  while [ "$n" -lt 160 ] && IFS= read -r -s -n1 -t "$wait" -u "$fd" c; do
+    buf+=$c; n=$(( n + 1 )) wait=0.2                    # the first reply may take a moment
+    [[ "$buf" =~ $'\033'\[\?[0-9\;]*c$ ]] && break
+  done
+  [ -n "$saved" ] && stty "$saved" <&"$fd" 2>/dev/null
+  exec {fd}>&-
+  for x in 11 10; do
+    [[ "$buf" =~ \]$x\;rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+) ]] || continue
+    hex=""
+    for c in "${BASH_REMATCH[@]:1:3}"; do              # 1 to 4 hex digits per channel
+      [ "${#c}" = 1 ] && c="$c$c"
+      hex+="${c:0:2}"
+    done
+    hex=${hex,,}
+    if [ "$x" = 11 ]; then THEME_TERM_BG=$hex got=1; else THEME_TERM_FG=$hex; fi
+  done
+  [ "$got" = 1 ] || return 1                          # no answer: what we remembered stands
+  # Remember it, so plain command-line output can follow the terminal too.
+  if [ "$(cat "$THEME_CACHE" 2>/dev/null)" != "$THEME_TERM_BG $THEME_TERM_FG" ]; then
+    mkdir -p "${THEME_CACHE%/*}" 2>/dev/null && printf '%s %s\n' "$THEME_TERM_BG" "$THEME_TERM_FG" > "$THEME_CACHE" 2>/dev/null
+  fi
+  return 0
+}
+
+theme_term() {   # THEME_TERM_MODE (dark, light or "") and THEME_TERM_BG, from what we know
+  local f="" bgi
+  if [ -z "$THEME_TERM_BG" ] && [ -f "$THEME_CACHE" ]; then
+    read -r f _ < "$THEME_CACHE" 2>/dev/null || f=""
+    [[ "$f" =~ ^[0-9a-f]{6}$ ]] && THEME_TERM_BG=$f
+  fi
+  THEME_TERM_MODE=""
+  if [ -n "$THEME_TERM_BG" ]; then
+    theme_luma "$THEME_TERM_BG"; if [ "$REPLY" -ge 128 ]; then THEME_TERM_MODE=light; else THEME_TERM_MODE=dark; fi
+  elif [[ "${COLORFGBG:-}" =~ ([0-9]+)$ ]]; then          # "15;0": text white, background black
+    bgi=${BASH_REMATCH[1]}
+    if [ "$bgi" = 7 ] || [ "$bgi" -ge 9 ]; then THEME_TERM_MODE=light; else THEME_TERM_MODE=dark; fi
+  fi
+}
+
+# --------------------------------------------------------------- the palette
+
+theme_off() {
+  R="" B="" D="" PAST="" LINE="" GHOST="" ACC="" ACC2="" GRN="" RED="" YEL=""
+  HL="" SURF="" SEL="" PSEL="" BASE="" ACC_SGR="" D_SGR=""
+  THEME_ON=0
+}
+
+theme_apply() {  # theme_apply [screen]
+  local want=${KOKORO_THEME:-auto} screen=${1:-} bg fg
+  local -a p
+  case "$want" in dark|light) ;; *) want=auto ;; esac
+  theme_term
+  THEME_PAINT=0
+  if [ "$want" != auto ] && [ "$screen" = screen ]; then
+    THEME_MODE=$want
+    [ "$THEME_TERM_MODE" = "$want" ] || THEME_PAINT=1           # paint our own canvas
+  elif [ -n "$THEME_TERM_MODE" ]; then THEME_MODE=$THEME_TERM_MODE
+  elif [ "$want" != auto ]; then THEME_MODE=$want                # the best guess we have
+  else THEME_MODE=dark; fi
+  if [ "$THEME_MODE" = light ]; then p=("${THEME_LIGHT[@]}"); else p=("${THEME_DARK[@]}"); fi
+  # The greys are made from the real background when we know it, and always
+  # lead towards the palette's own text colour, so they keep their contrast
+  # even with a low-contrast terminal theme.
+  bg=${p[0]} fg=${p[1]}
+  [ "$THEME_PAINT" = 0 ] && [ -n "$THEME_TERM_BG" ] && [ "$THEME_TERM_MODE" = "$THEME_MODE" ] && bg=$THEME_TERM_BG
+  THEME_BG=$bg THEME_FG=$fg THEME_ACC=${p[2]} THEME_END=${p[7]}
+  if theme_truecolor; then THEME_TRUE=1; else THEME_TRUE=0; fi
+
+  R=$'\033[0m' B=$'\033[1m' BASE=""
+  if [ "$THEME_PAINT" = 1 ]; then
+    theme_bg "$bg"; BASE=$REPLY; theme_fg "$fg"; BASE+=$REPLY
+    R+=$BASE                                    # a reset goes back to our canvas
+  fi
+  theme_mix "$bg" "$fg" "${THEME_STEPS[1]}"; theme_fg "$REPLY"; D=$REPLY
+  D_SGR=${D#$'\033['}; D_SGR=${D_SGR%m}
+  theme_mix "$bg" "$fg" 500;                  theme_fg "$REPLY"; PAST=$REPLY
+  theme_mix "$bg" "$fg" "${THEME_STEPS[2]}"; theme_fg "$REPLY"; LINE=$REPLY
+  theme_mix "$bg" "$fg" "${THEME_STEPS[3]}"; theme_fg "$REPLY"; GHOST=$REPLY
+  theme_mix "$bg" "$fg" "${THEME_STEPS[4]}"; theme_bg "$REPLY"; SURF=$REPLY
+  local tint; theme_mix "$fg" "${p[2]}" "${THEME_STEPS[1]}"; tint=$REPLY
+  theme_mix "$bg" "$tint" "${THEME_STEPS[4]}"; theme_bg "$REPLY"; SEL=$REPLY
+  theme_mix "$bg" "$tint" "${THEME_STEPS[3]}"; theme_bg "$REPLY"; PSEL=$REPLY
+  theme_mix "$bg" "${p[2]}" "${THEME_STEPS[2]}"; theme_bg "$REPLY"; HL=$REPLY
+  theme_fg "$fg"; HL+=$REPLY
+  theme_fg "${p[2]}"; ACC=$REPLY; ACC_SGR=${ACC#$'\033['}; ACC_SGR=${ACC_SGR%m}
+  theme_fg "${p[3]}"; ACC2=$REPLY
+  theme_fg "${p[4]}"; GRN=$REPLY
+  theme_fg "${p[5]}"; RED=$REPLY
+  theme_fg "${p[6]}"; YEL=$REPLY
+  THEME_ON=1
+}
+
+theme_grad() {   # theme_grad N: GRAD, N colours from the accent to the logo's cyan
+  local n=$1 k
+  GRAD=()
+  for (( k = 0; k < n; k++ )); do
+    theme_mix "$THEME_ACC" "$THEME_END" $(( n > 1 ? k * 1000 / (n - 1) : 0 ))
+    theme_fg "$REPLY"; GRAD+=("$REPLY")
+  done
+}
+
+theme_name() {   # what the settings menu shows beside "Colours"
+  case "${KOKORO_THEME:-auto}" in
+    dark) REPLY="Dark" ;; light) REPLY="Light" ;;
+    *) REPLY="Auto" ;;
+  esac
+}
+__KOKOMUX_THEME__
+
 cat > "$WORK/setup.sh" <<'__KOKOMUX_SETUP__'
 # kokomux: runs inside the "kokoro" Debian container (as root), one phase
 # per call, from install.sh:  bash setup.sh apt|pip|models|tidy
@@ -2216,7 +2706,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
 # localhost (fast); otherwise each call starts the container (slower).
 set -euo pipefail
 
-KOKOMUX_VERSION="0.8.2"
+KOKOMUX_VERSION="0.9.0"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -2239,6 +2729,7 @@ KOKORO_DEFAULTS=(
   KOKORO_WORDS_OFFSET_MS=100    # play-audio's start-up delay, so the highlight isn't early
   KOKORO_NOTIFY=1               # a notification with pause / next / again buttons (Termux:API)
   KOKORO_TUI=1                  # -p on a terminal opens the full-screen reader (0: inline)
+  KOKORO_THEME=auto             # colours: auto (follow the terminal), dark or light
 )
 for kv in "${KOKORO_DEFAULTS[@]}"; do declare "$kv"; done
 KOKORO_REPO_RAW=https://raw.githubusercontent.com/Anesu/kokomux/main
@@ -2268,13 +2759,25 @@ esac
 # Messages go to stderr. Colours and live status only on a terminal, so
 # scripts and pipes get plain, quiet output.
 
+# The colours (theme.sh) follow the terminal: a dark or light palette, made
+# from its own background where it has told us what that is.
 LIVE=0
 if [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then LIVE=1; fi
-if [ "$LIVE" = 1 ]; then
+THEME_MODE=dark THEME_PAINT=0 THEME_ON=0 THEME_ASKED=0   # (theme.sh sets these properly)
+THEME_LIB="$PREFIX/share/kokomux/theme.sh"
+# shellcheck source=src/theme.sh
+[ -f "$THEME_LIB" ] && . "$THEME_LIB"
+# shellcheck disable=SC2034  # the screens and the player use them
+if [ "$LIVE" = 1 ] && declare -F theme_apply >/dev/null; then
+  theme_apply
+elif [ "$LIVE" = 1 ]; then                    # theme.sh missing (a half-finished update)
   R=$'\033[0m' B=$'\033[1m' D=$'\033[2m' ACC=$'\033[38;5;141m' ACC2=$'\033[38;5;117m'
   GRN=$'\033[38;5;114m' RED=$'\033[38;5;203m' YEL=$'\033[38;5;221m'
+  PAST=$'\033[38;5;245m' LINE=$D GHOST=$'\033[38;5;237m' HL=$'\033[48;5;61m\033[38;5;231m'
+  SURF=$'\033[48;5;236m' SEL=$'\033[48;5;237m' PSEL=$'\033[48;5;238m' BASE="" ACC_SGR="38;5;141" D_SGR=2
 else
-  R="" B="" D="" ACC="" ACC2="" GRN="" RED="" YEL=""
+  R="" B="" D="" ACC="" ACC2="" GRN="" RED="" YEL="" PAST="" LINE="" GHOST="" HL=""
+  SURF="" SEL="" PSEL="" BASE="" ACC_SGR="" D_SGR=""
 fi
 SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
 frame=0
@@ -2609,7 +3112,7 @@ case "${1:-}" in
   --list-voices)
     status "Loading voices"
     flags=(--width "$(cols)" --default "$KOKORO_VOICE")
-    [ "$LIVE" = 1 ] && [ -t 1 ] && flags+=(--color)
+    [ "$LIVE" = 1 ] && [ -t 1 ] && flags+=(--color --accent "$ACC_SGR" --muted "$D_SGR")
     errf="$(mktemp "$PREFIX/tmp/kokoro-err.XXXXXX")"
     out="$(proot-distro login "$DISTRO" -- "$PY" "$ENGINE" voices "${flags[@]}" 2>"$errf")" ||
       die "Couldn't list the voices." "$(tail -n 1 "$errf"; rm -f "$errf")"
@@ -2942,6 +3445,7 @@ kokoro_command() {
   mkdir -p "$PREFIX/share/kokomux"
   cp "$WORK/tui.sh" "$PREFIX/share/kokomux/tui.sh"         # the full-screen screens
   cp "$WORK/player.sh" "$PREFIX/share/kokomux/player.sh"   # playing a text
+  cp "$WORK/theme.sh" "$PREFIX/share/kokomux/theme.sh"     # the colours
 
   local conf="$HOME/.config/kokoro/config"
   if [ ! -f "$conf" ]; then
@@ -2973,6 +3477,11 @@ KOKORO_NOTIFY=1
 # -p on a terminal opens the full-screen reader (Space pauses, arrows skip, q
 # stops; click or tap the buttons). Set to 0 to keep the inline view.
 KOKORO_TUI=1
+
+# Colours: auto follows your terminal's own (dark or light). dark or light
+# uses that palette in the full-screen views, with its own background if the
+# terminal is the other kind.
+KOKORO_THEME=auto
 CFG
   fi
 

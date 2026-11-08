@@ -30,6 +30,7 @@ KOKORO_DEFAULTS=(
   KOKORO_WORDS_OFFSET_MS=100    # play-audio's start-up delay, so the highlight isn't early
   KOKORO_NOTIFY=1               # a notification with pause / next / again buttons (Termux:API)
   KOKORO_TUI=1                  # -p on a terminal opens the full-screen reader (0: inline)
+  KOKORO_THEME=auto             # colours: auto (follow the terminal), dark or light
 )
 for kv in "${KOKORO_DEFAULTS[@]}"; do declare "$kv"; done
 KOKORO_REPO_RAW=https://raw.githubusercontent.com/Anesu/kokomux/main
@@ -59,13 +60,25 @@ esac
 # Messages go to stderr. Colours and live status only on a terminal, so
 # scripts and pipes get plain, quiet output.
 
+# The colours (theme.sh) follow the terminal: a dark or light palette, made
+# from its own background where it has told us what that is.
 LIVE=0
 if [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then LIVE=1; fi
-if [ "$LIVE" = 1 ]; then
+THEME_MODE=dark THEME_PAINT=0 THEME_ON=0 THEME_ASKED=0   # (theme.sh sets these properly)
+THEME_LIB="$PREFIX/share/kokomux/theme.sh"
+# shellcheck source=src/theme.sh
+[ -f "$THEME_LIB" ] && . "$THEME_LIB"
+# shellcheck disable=SC2034  # the screens and the player use them
+if [ "$LIVE" = 1 ] && declare -F theme_apply >/dev/null; then
+  theme_apply
+elif [ "$LIVE" = 1 ]; then                    # theme.sh missing (a half-finished update)
   R=$'\033[0m' B=$'\033[1m' D=$'\033[2m' ACC=$'\033[38;5;141m' ACC2=$'\033[38;5;117m'
   GRN=$'\033[38;5;114m' RED=$'\033[38;5;203m' YEL=$'\033[38;5;221m'
+  PAST=$'\033[38;5;245m' LINE=$D GHOST=$'\033[38;5;237m' HL=$'\033[48;5;61m\033[38;5;231m'
+  SURF=$'\033[48;5;236m' SEL=$'\033[48;5;237m' PSEL=$'\033[48;5;238m' BASE="" ACC_SGR="38;5;141" D_SGR=2
 else
-  R="" B="" D="" ACC="" ACC2="" GRN="" RED="" YEL=""
+  R="" B="" D="" ACC="" ACC2="" GRN="" RED="" YEL="" PAST="" LINE="" GHOST="" HL=""
+  SURF="" SEL="" PSEL="" BASE="" ACC_SGR="" D_SGR=""
 fi
 SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
 frame=0
@@ -400,7 +413,7 @@ case "${1:-}" in
   --list-voices)
     status "Loading voices"
     flags=(--width "$(cols)" --default "$KOKORO_VOICE")
-    [ "$LIVE" = 1 ] && [ -t 1 ] && flags+=(--color)
+    [ "$LIVE" = 1 ] && [ -t 1 ] && flags+=(--color --accent "$ACC_SGR" --muted "$D_SGR")
     errf="$(mktemp "$PREFIX/tmp/kokoro-err.XXXXXX")"
     out="$(proot-distro login "$DISTRO" -- "$PY" "$ENGINE" voices "${flags[@]}" 2>"$errf")" ||
       die "Couldn't list the voices." "$(tail -n 1 "$errf"; rm -f "$errf")"

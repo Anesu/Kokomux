@@ -1,5 +1,5 @@
 # kokomux: the player. Sourced by `kokoro` (bash) once a listening run is set up.
-# shellcheck shell=bash disable=SC2034,SC2154  # shares its globals with kokoro
+# shellcheck shell=bash disable=SC2034,SC2153,SC2154  # shares its globals with kokoro
 #
 #   play_line WAV IDX     plays one part: the inline view or the full-screen
 #                         reader (via the view API below), word highlights,
@@ -8,7 +8,7 @@
 #                         restart the reading at a part (jump_to)
 #
 # Expects from kokoro: the run's globals (tmpd, play, ui, show_words, voice,
-# speed, lang, name, kind, source, text, book_id, start, i), the colours,
+# speed, lang, name, kind, source, text, book_id, start, i), the colours (HL),
 # status/status_clear, tick, now_ms, write_job and run_engine.
 
 # ------------------------------------------------------------ the line being heard
@@ -20,7 +20,7 @@
 # A line taller than the screen is shown as a window of rows that follows the
 # lit word, then printed in full when it ends.
 
-HL=$'\033[48;5;61m\033[38;5;231m'   # the soft highlight
+# The soft highlight is HL, from the theme: the background moved φ⁻² towards the accent.
 blk_lines=(); blk_offs=(); view_top=0; view_h=0
 w_s=(); w_e=(); w_a=(); w_b=(); w_state=none
 TERM_ROWS=24

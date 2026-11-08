@@ -26,14 +26,22 @@ done
 
 # ================================================================ look & feel
 
+# The colours: the same palette as kokoro (theme.sh, built in below), made
+# from the terminal's own background, which we ask it for once (and remember,
+# so kokoro's messages match from the start).
+# shellcheck disable=SC2034  # it also sets the colours only kokoro's screens use
+{
+#@EMBED theme.sh
+}
+
 FANCY=0   # colours + spinners, only on a real terminal
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then FANCY=1; fi
 if [ "$FANCY" = 1 ]; then
-  R=$'\033[0m' B=$'\033[1m' D=$'\033[2m'
-  ACC=$'\033[38;5;141m' ACC2=$'\033[38;5;117m'
-  GRN=$'\033[38;5;114m' RED=$'\033[38;5;203m' YEL=$'\033[38;5;221m'
+  KOKORO_THEME="$(sed -n 's/^KOKORO_THEME=\([a-z]*\).*/\1/p' "$HOME/.config/kokoro/config" 2>/dev/null | tail -n 1)"
+  [ -t 0 ] && { theme_detect || true; }
+  theme_apply
 else
-  R="" B="" D="" ACC="" ACC2="" GRN="" RED="" YEL=""
+  theme_off
 fi
 SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
 
@@ -79,7 +87,7 @@ show_cursor() {
 }
 
 banner() {
-  local c=(135 141 147 153 159 195) i=0 line
+  local i=0 line
   local big=(
 '██╗  ██╗ ██████╗ ██╗  ██╗ ██████╗ ███╗   ███╗██╗   ██╗██╗  ██╗'
 '██║ ██╔╝██╔═══██╗██║ ██╔╝██╔═══██╗████╗ ████║██║   ██║╚██╗██╔╝'
@@ -92,18 +100,19 @@ banner() {
 '░█▀▄░█░█░█▀▄░█░█░█░█░█░█░▄▀▄'
 '░▀░▀░▀▀▀░▀░▀░▀▀▀░▀░▀░▀▀▀░▀░▀')
   blank
+  GRAD=("" "" "" "" "" "")
   if [ "$COLS" -ge 66 ]; then
+    [ "$FANCY" = 1 ] && theme_grad 6              # violet to cyan, one colour a line
     for line in "${big[@]}"; do
-      if [ "$FANCY" = 1 ]; then printf '  \033[38;5;%sm%s%s\n' "${c[i]}" "$line" "$R"; else say "  $line"; fi
+      printf '  %s%s%s\n' "${GRAD[i]}" "$line" "$R"
       i=$((i + 1))
     done
   else
+    [ "$FANCY" = 1 ] && theme_grad 3
     for line in "${small[@]}"; do
-      # the ░ texture in dark grey so the letters stand out
-      if [ "$FANCY" = 1 ]; then
-        line="${line//░/$'\033[38;5;237m'░$'\033[38;5;'"${c[i * 2]}"m}"
-        printf '  \033[38;5;%sm%s%s\n' "${c[i * 2]}" "$line" "$R"
-      else say "  $line"; fi
+      # the ░ texture recedes so the letters stand out
+      [ "$FANCY" = 1 ] && line="${line//░/$GHOST░${GRAD[i]}}"
+      printf '  %s%s%s\n' "${GRAD[i]}" "$line" "$R"
       i=$((i + 1))
     done
   fi
@@ -351,6 +360,10 @@ cat > "$WORK/player.sh" <<'__KOKOMUX_PLAYER__'
 #@EMBED player.sh
 __KOKOMUX_PLAYER__
 
+cat > "$WORK/theme.sh" <<'__KOKOMUX_THEME__'
+#@EMBED theme.sh
+__KOKOMUX_THEME__
+
 cat > "$WORK/setup.sh" <<'__KOKOMUX_SETUP__'
 #@EMBED setup-container.sh
 __KOKOMUX_SETUP__
@@ -409,6 +422,7 @@ kokoro_command() {
   mkdir -p "$PREFIX/share/kokomux"
   cp "$WORK/tui.sh" "$PREFIX/share/kokomux/tui.sh"         # the full-screen screens
   cp "$WORK/player.sh" "$PREFIX/share/kokomux/player.sh"   # playing a text
+  cp "$WORK/theme.sh" "$PREFIX/share/kokomux/theme.sh"     # the colours
 
   local conf="$HOME/.config/kokoro/config"
   if [ ! -f "$conf" ]; then
@@ -440,6 +454,11 @@ KOKORO_NOTIFY=1
 # -p on a terminal opens the full-screen reader (Space pauses, arrows skip, q
 # stops; click or tap the buttons). Set to 0 to keep the inline view.
 KOKORO_TUI=1
+
+# Colours: auto follows your terminal's own (dark or light). dark or light
+# uses that palette in the full-screen views, with its own background if the
+# terminal is the other kind.
+KOKORO_THEME=auto
 CFG
   fi
 

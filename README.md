@@ -66,7 +66,7 @@ kokoro --stop                             # stop playback
 
 ## The reader and the home screen
 
-On a terminal, `kokoro -p` opens a full-screen reader. Across the top are the title, voice and speed. In the middle is a reading column, with what you've heard above it, the part being read marked with a bar and the spoken word lit, and what's coming next dimmed below. At the bottom are a progress bar and a row of buttons. The column stays at a comfortable reading width, so it works on a phone held upright and just as well on a wide Samsung DeX or tablet screen. It follows the window when you resize it.
+On a terminal, `kokoro -p` opens a full-screen reader. Across the top are the title, voice and speed. In the middle is a reading column, with what you've heard above it, the part being read marked with a bar and the spoken word lit, and what's coming next dimmed below. The part being read sits on the golden line, 38% of the way down, where the eye naturally rests. At the bottom are a progress bar and a row of buttons. The column stays at a comfortable reading width, so it works on a phone held upright and just as well on a wide Samsung DeX or tablet screen. It follows the window when you resize it.
 
 <p>
   <img src="docs/reader-wide.png" width="68%" alt="The reader on a wide screen: header, centred reading column with the spoken word highlighted, progress bar and buttons">
@@ -100,9 +100,37 @@ Run `kokoro` on its own to open the **home screen**. It lists the books and long
 | v | choose a voice (type to filter, Space to hear it) |
 | s | settings |
 
-<p><img src="docs/home.png" width="80%" alt="The home screen: books in progress with progress bars, and one-key actions"></p>
+<p>
+  <img src="docs/home.png" width="49%" alt="The home screen on a dark terminal: books in progress with progress bars, and one-key actions">
+  <img src="docs/home-light.png" width="49%" alt="The same home screen on a light terminal">
+</p>
 
 Prefer the old inline view? Set `KOKORO_TUI=0`. The keys still work there. Scripts and pipes get plain output as before.
+
+## Colours: dark and light
+
+kokomux fits your terminal's own colours, whether it's dark or light. When a screen opens, it asks the terminal for its background colour (most terminals, Termux included, answer at once) and builds the palette from it. Your colour scheme, whether that's Termux's black, Solarized, Dracula or a paper-white light theme, gets matching greys rather than a fixed set that suits only some of them. It remembers the answer, so the plain `kokoro` messages match too.
+
+<p>
+  <img src="docs/reader-wide.png" width="49%" alt="The reader on a dark terminal">
+  <img src="docs/reader-light.png" width="49%" alt="The reader on a light terminal: deeper accents, and a lavender highlight on the spoken word">
+</p>
+
+The palette follows a few design rules:
+
+- **Greys in golden-ratio steps.** Every grey is your background moved part of the way towards the text colour: 61.8% for secondary text, 38.2% for rules and the progress track, 23.6% for texture, and 14.6% for buttons and the selected row. Each step is φ (1.618) times the next, so the levels look evenly spaced, and there are only a handful of them.
+- **Readable on every background.** Text has at least 7:1 contrast, and accents and secondary text about 4.5:1 (the WCAG guidelines), on 15 popular dark and light terminal themes. `tests/test_theme.py` checks this.
+- **Two accent sets.** Lighter violet and sky blue on dark backgrounds, deeper ones on light. The spoken word sits on a soft accent wash, with what you've heard fading slightly behind it.
+- **Golden proportions in the layout.** The line being read sits 38.2% of the way down. The home screen's free space is split 1 : φ above and below, the optical centre. Settings split their width into labels and values the same way.
+
+**Colours** in the settings (or `KOKORO_THEME` in the settings file) chooses:
+
+| Setting | Does |
+|---|---|
+| Auto | follow the terminal (the default) |
+| Dark or Light | always use that palette in the full-screen views, painting its own background if the terminal is the other kind |
+
+Without 24-bit colour, the nearest of the terminal's 256 colours is used. `NO_COLOR` turns colours off.
 
 ## Listening to long texts and books
 
@@ -151,7 +179,7 @@ Before 0.8, a separate speech recogniser (Whistle) listened to each line to find
 `kokoro --settings` (or **s** on the home screen) opens the settings menu. Move with ↑↓ or the mouse wheel. Change a value with ← and →, or with Enter, a click, or a second click. A line at the bottom says what the selected setting does. Every change is saved at once, with a ✓ Saved in the corner.
 
 <p>
-  <img src="docs/settings.png" width="49%" alt="The settings menu: voice, speed slider, language, toggles for the reader, word highlighting and notifications, and the background server">
+  <img src="docs/settings.png" width="49%" alt="The settings menu: voice, speed slider, language, toggles for the reader, the colours, word highlighting and notifications, and the background server">
   <img src="docs/voices.png" width="49%" alt="The voice picker, filtered to British female voices">
 </p>
 
@@ -162,6 +190,7 @@ Before 0.8, a separate speech recogniser (Whistle) listened to each line to find
   - **Save files as:** the default file name.
 - **Reading:**
   - **Full-screen reader:** on or off.
+  - **Colours:** Auto, Dark or Light (see [Colours](#colours-dark-and-light)).
   - **Light up words:** on or off.
   - **Highlight timing:** in steps of 20 ms, for when the highlight runs ahead of or behind the voice.
 - **While listening:** notification controls on or off.
@@ -200,7 +229,7 @@ kokoro --uninstall   # remove the container, the command, settings and helper sc
 Kokoro's Python packages (`onnxruntime`, `espeakng-loader`, `soundfile`) only ship builds for standard Linux (glibc). Termux uses Android's own C library, so they can't run there directly. The installer therefore creates a small Debian container called `kokoro` with `proot-distro`, and runs Kokoro inside it. The parts:
 
 - **`kokoro`** (Termux side): reads your text, starts or uses the server, and hands each run to the player.
-- **`player.sh` and `tui.sh`** (Termux side): play the audio with `play-audio`, and draw the reader, home screen and settings.
+- **`player.sh`, `tui.sh` and `theme.sh`** (Termux side): play the audio with `play-audio`, and draw the reader, home screen and settings in colours made from the terminal's own.
 - **`engine.py`** (inside Debian): splits the text into sentences and runs Kokoro. With `-p` it hands back audio one chunk at a time, so playback starts after the first sentence.
 - **`words.py`** (inside Debian): turns Kokoro's per-sound timings into word timings, for the highlight.
 - **Sharing files:** the two sides exchange text and audio through `$PREFIX/tmp`, which the container sees as `/tmp`.
@@ -227,10 +256,12 @@ The files in `src/` are the source. `./build.sh` bundles them into the single `i
 | `src/kokoro` | the `kokoro` command (Termux side) |
 | `src/player.sh` | playing a text: highlights, controls, bookmarks, chapters, sleep timer (Termux side) |
 | `src/tui.sh` | the full-screen reader, home screen and settings (Termux side) |
+| `src/theme.sh` | the colours: dark and light palettes built from the terminal's background (Termux side and installer) |
 | `src/engine.py` | Kokoro engine, server, web-page reader and model downloader (container side) |
 | `src/words.py` | word timings from Kokoro's per-sound timings (container side) |
 | `tests/test_words.py` | tests for word timings, on recorded Kokoro output: `python3 tests/test_words.py` |
 | `tests/test_books.py` | tests for reading EPUB, PDF and text: `python3 tests/test_books.py` |
+| `tests/test_theme.py` | tests for the colours: contrast on 15 terminal themes, the golden steps, asking the terminal: `python3 tests/test_theme.py` |
 | `src/setup-container.sh` | installs everything inside the container |
 | `src/install.sh` | installer template (UI, checks, steps) |
 | `VERSION` | the version stamped into both by `build.sh` |

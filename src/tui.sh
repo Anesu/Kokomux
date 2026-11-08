@@ -1,5 +1,5 @@
 # kokomux: the full-screen interface. Sourced by `kokoro` (bash).
-# shellcheck shell=bash disable=SC2034,SC2154  # shares its globals with kokoro
+# shellcheck shell=bash disable=SC2034,SC2153,SC2154  # shares its globals with kokoro
 #
 #   tui_home              the home screen: books in progress, and ways to start
 #   tui_open / tui_close  the reader: header, a centred reading column with the
@@ -11,9 +11,17 @@
 # where the terminal supports it, and redraws on resize. Mouse clicks and taps
 # are read as SGR mouse reports.
 #
-# Expects from kokoro: the colours (R B D ACC ACC2 GRN YEL HL), $tmpd, $KBD
-# (a read descriptor on /dev/tty), KEY (set by tick), and for the home screen
-# BOOKS, CONF, mark_get, KOKORO_VOICE and KOKORO_SPEED.
+# Colours come from theme.sh (R B D PAST LINE GHOST ACC ACC2 GRN HL SURF SEL
+# PSEL): when a screen opens it asks the terminal for its colours, so the greys
+# are made from its real background. Proportions follow the golden ratio: the
+# line being read sits φ⁻² (38.2%) of the way down the reading area, where the
+# eye rests; the home screen's free space is split 1 : φ above and below its
+# content (the optical centre, a little above the middle); settings split
+# their width φ⁻² : φ⁻¹ between labels and values.
+#
+# Expects from kokoro: the colours, $tmpd, $KBD (a read descriptor on
+# /dev/tty), KEY (set by tick), and for the home screen BOOKS, CONF, mark_get,
+# KOKORO_VOICE and KOKORO_SPEED.
 
 TUI=0; TUI_TTY=""; TUI_RESIZED=0
 TW=80; TH=24; CW=72; LM=4             # screen size; reading column width and margin
@@ -45,23 +53,38 @@ tui_cooked() {   # back to normal typing, for a prompt
   stty echo icanon 2>/dev/null </dev/tty || true
 }
 
-tui_open() {
-  [ "$TUI" = 1 ] && return 0
+tui_enter() {    # the alternate screen, raw keys, and the colours for a full screen
   TUI_TTY="$(stty -g 2>/dev/null </dev/tty)" || TUI_TTY=""
   printf '\033[?1049h' >&2
   tui_raw
   TUI=1
   trap 'TUI_RESIZED=1' WINCH
+  tui_theme
+}
+
+tui_theme() {    # ask the terminal its colours (once), then pick the palette
+  declare -F theme_apply >/dev/null || return 0
+  [ "$THEME_ON" = 1 ] || return 0                             # no colours (NO_COLOR)
+  [ "$THEME_ASKED" = 1 ] || theme_detect || true
+  theme_apply screen
+}
+
+tui_open() {
+  [ "$TUI" = 1 ] && return 0
+  tui_enter
   tui_size
   tui_draw
 }
 
 tui_close() {
   [ "$TUI" = 1 ] || return 0
-  printf '\033[?1000l\033[?1006l%s\033[?25h\033[?1049l' "$SYNC_OFF" >&2
+  printf '\033[0m\033[?1000l\033[?1006l%s\033[?25h\033[?1049l' "$SYNC_OFF" >&2
   [ -n "$TUI_TTY" ] && stty "$TUI_TTY" 2>/dev/null </dev/tty
   trap - WINCH
   TUI=0
+  # back to the terminal's own colours for what's printed after
+  [ "$THEME_PAINT" = 1 ] && declare -F theme_apply >/dev/null && theme_apply
+  return 0
 }
 
 tui_refresh() {  # after a resize: measure again and draw everything
@@ -72,6 +95,7 @@ tui_refresh() {  # after a resize: measure again and draw everything
 }
 
 rule() { local line; printf -v line '%*s' "$1" ''; printf '%s' "${line// /─}"; }
+golden() { REPLY=$(( $1 * 382 / 1000 )); }   # golden N: the smaller golden part of N (N/φ²)
 
 # ---------------------------------------------------------------- drawing
 
@@ -80,9 +104,9 @@ tui_header() {
   room=$(( TW - 14 - ${#info} ))
   title=$TUI_TITLE
   [ "${#title}" -gt "$room" ] && title="${title:0:$(( room > 1 ? room - 1 : 0 ))}…"
-  printf '\033[1;1H\033[2K  %skokomux%s  %s%s%s' "$ACC" "$R" "$B" "$title" "$R" >&2
+  printf '%s\033[1;1H\033[2K  %skokomux%s  %s%s%s' "$R" "$ACC" "$R" "$B" "$title" "$R" >&2
   printf '\033[1;%dH%s%s%s' $(( TW - ${#info} )) "$D" "$info" "$R" >&2
-  printf '\033[2;1H\033[2K%s%s%s' "$D" "$(rule "$TW")" "$R" >&2
+  printf '\033[2;1H\033[2K%s%s%s' "$LINE" "$(rule "$TW")" "$R" >&2
 }
 
 tui_wrap() {     # tui_wrap K: part K's text wrapped to the column, once
@@ -102,9 +126,11 @@ tui_text() {     # the reading column: what's been heard above, this part, what'
   local -a past=() now_rows=() offs=() next=() rows=()
   h=$(( bottom - top + 1 ))
   if [ "$TUI_PART" = 0 ] || ! tui_wrap "$TUI_PART"; then   # nothing to show yet
+    printf '%s' "$R" >&2
     for (( r = top; r <= bottom; r++ )); do printf '\033[%d;1H\033[2K' "$r" >&2; done
     local msg="${TUI_STATE:-Getting ready}"
-    printf '\033[%d;%dH%s%s%s %s%s%s' $(( top + h / 3 )) $(( (TW - ${#msg} - 2) / 2 )) \
+    golden "$h"
+    printf '\033[%d;%dH%s%s%s %s%s%s' $(( top + REPLY )) $(( (TW - ${#msg} - 2) / 2 )) \
       "$ACC" "${TUI_SYM:-·}" "$R" "$D" "$msg" "$R" >&2
     return 0
   fi
@@ -120,20 +146,20 @@ tui_text() {     # the reading column: what's been heard above, this part, what'
     mapfile -t rows <<< "${TUI_WRAP[$k]%$'\n'}"
     next+=("${rows[@]}")
   done
-  # This part starts a third of the way down, but the lit word always stays on screen.
+  # This part starts on the golden line, φ⁻² of the way down; the lit word always stays on screen.
   if [ "$TUI_A" -gt 0 ]; then
     while [ $(( hl + 1 )) -lt "${#offs[@]}" ] && [ "${offs[hl + 1]}" -le "$TUI_A" ]; do hl=$(( hl + 1 )); done
   fi
-  a=$(( top + h / 3 ))
+  golden "$h"; a=$(( top + REPLY ))
   [ $(( a + hl )) -le $(( bottom - 2 )) ] || a=$(( bottom - 2 - hl ))
   n=${#now_rows[@]}
-  printf '%s' "$SYNC_ON" >&2
+  printf '%s%s' "$SYNC_ON" "$R" >&2
   for (( r = top; r <= bottom; r++ )); do
     idx=$(( r - a ))
     printf '\033[%d;1H\033[2K\033[%dG' "$r" $(( LM + 1 )) >&2
     if [ "$idx" -lt 0 ]; then
       j=$(( ${#past[@]} + idx ))
-      [ "$j" -ge 0 ] && printf '\033[38;5;245m%s%s' "${past[j]}" "$R" >&2
+      [ "$j" -ge 0 ] && printf '%s%s%s' "$PAST" "${past[j]}" "$R" >&2
     elif [ "$idx" -lt "$n" ]; then
       printf '\033[%dG%s▎%s' $(( LM - 1 )) "$ACC" "$R" >&2   # marks the part being read
       printf '\033[%dG' $(( LM + 1 )) >&2
@@ -169,42 +195,59 @@ tui_progress() {
   TUI_BAR=(3 "$bw")
   filled=0; [ "$TUI_PARTS" -gt 0 ] && filled=$(( TUI_PART * bw / TUI_PARTS ))
   printf -v bar '%*s' "$filled" ''; bar=${bar// /━}
-  printf '\033[%d;1H\033[2K  %s%s%s' $(( TH - 3 )) "$ACC" "$bar" "$R" >&2
+  printf '%s\033[%d;1H\033[2K  %s%s%s' "$R" $(( TH - 3 )) "$ACC" "$bar" "$R" >&2
   printf -v bar '%*s' $(( bw - filled )) ''
-  printf '%s%s%s  %s' "$D" "${bar// /─}" "$R" "$label" >&2
+  printf '%s%s%s  %s' "$LINE" "${bar// /─}" "$R" "$label" >&2
 }
 
-tui_button() {   # tui_button ROW X KEY LABEL COMMAND: draw one, remember where it is; X advances
-  local text=" k $4 "                         # (the key glyph is one column, whatever its bytes)
-  printf '\033[%d;%dH\033[48;5;236m %s%s%s\033[48;5;236m %s \033[0m' "$1" "$BX" "$ACC2" "$3" "$R" "$4" >&2
-  TUI_BTN+=("$1 $BX $(( BX + ${#text} - 1 )) $5")
-  BX=$(( BX + ${#text} + 2 ))
+tui_button() {   # tui_button ROW KEY LABEL COMMAND: draw one at BX, remember where it is; BX advances by BGAP
+  local text=" k $3 "                         # (the key glyph is one column, whatever its bytes)
+  printf '\033[%d;%dH%s %s%s%s%s %s %s' "$1" "$BX" "$SURF" "$ACC2" "$2" "$R" "$SURF" "$3" "$R" >&2
+  TUI_BTN+=("$1 $BX $(( BX + ${#text} - 1 )) $4")
+  BX=$(( BX + ${#text} + BGAP ))
+}
+
+tui_buttons() {  # tui_buttons ROW "key|label|short|command"...: a row that always fits
+  # Full labels two columns apart; if that's too wide, one apart; then short labels.
+  local row=$1 spec k l s c w full=0 brief=0 n=$(( $# - 1 ))
+  shift
+  for spec in "$@"; do
+    IFS='|' read -r k l s c <<< "$spec"
+    full=$(( full + ${#l} + 4 )); brief=$(( brief + ${#s} + 4 ))
+  done
+  local short=0
+  BGAP=2
+  if [ $(( 2 + full + 2 * (n - 1) )) -gt "$TW" ]; then
+    BGAP=1; [ $(( 2 + full + n - 1 )) -gt "$TW" ] && short=1
+  fi
+  BX=3
+  for spec in "$@"; do
+    IFS='|' read -r k l s c <<< "$spec"
+    [ "$short" = 1 ] && l=$s
+    tui_button "$row" "$k" "$l" "$c"
+  done
 }
 
 tui_footer() {   # the buttons (keys and clicks), and what's happening on the right
-  local state room
+  local state room play=Pause
   TUI_BTN=()
-  printf '\033[%d;1H\033[2K\033[%d;1H\033[2K' $(( TH - 1 )) "$TH" >&2
-  BX=3
-  tui_button "$TH" "$BX" "␣" "$( [ "$TUI_PAUSED" = 1 ] && echo Play || echo Pause)" toggle
-  tui_button "$TH" "$BX" "←" Again again
-  tui_button "$TH" "$BX" "→" Next next
-  tui_button "$TH" "$BX" q Stop quit
+  printf '%s\033[%d;1H\033[2K\033[%d;1H\033[2K' "$R" $(( TH - 1 )) "$TH" >&2
+  [ "$TUI_PAUSED" = 1 ] && play=Play
+  tui_buttons "$TH" "␣|$play|$play|toggle" "←|Again|Back|again" "→|Next|Next|next" "q|Stop|Stop|quit"
   state="${TUI_SYM:+$TUI_SYM }$TUI_STATE${TUI_EXTRA:+ · $TUI_EXTRA}"
-  room=$(( TW - BX - 2 ))
+  room=$(( TW - BX - 2 + BGAP ))
   if [ "$room" -gt 6 ]; then
     [ "${#state}" -gt "$room" ] && state="${state:0:$(( room - 1 ))}…"
     printf '\033[%d;%dH%s%s%s' "$TH" $(( TW - ${#state} - 1 )) "$D" "$state" "$R" >&2
   fi
-  BX=3                                        # the second row: the rest
-  [ "$TUI_HAS_CHAPTERS" = 1 ] && tui_button $(( TH - 1 )) "$BX" c Chapters chapters
-  tui_button $(( TH - 1 )) "$BX" "−" Slower slower
-  tui_button $(( TH - 1 )) "$BX" "+" Faster faster
-  tui_button $(( TH - 1 )) "$BX" t Sleep sleep
+  local more=()                               # the second row: the rest
+  [ "$TUI_HAS_CHAPTERS" = 1 ] && more+=("c|Chapters|Chap|chapters")
+  more+=("−|Slower|Slow|slower" "+|Faster|Fast|faster" "t|Sleep|Sleep|sleep")
+  tui_buttons $(( TH - 1 )) "${more[@]}"
 }
 
 tui_draw() {
-  printf '%s\033[2J' "$SYNC_ON" >&2         # a full redraw clears what overlays left behind
+  printf '%s%s\033[2J' "$SYNC_ON" "$R" >&2  # a full redraw clears what overlays left behind
   tui_header; tui_text; tui_progress; tui_footer
   printf '%s' "$SYNC_OFF" >&2
 }
@@ -252,21 +295,21 @@ tui_chapters() { # tui_chapters CURRENT: pick a chapter over the reading area; C
     [ "$sel" -lt "$top" ] && top=$sel
     [ "$sel" -ge $(( top + view )) ] && top=$(( sel - view + 1 ))
     printf '%s' "$SYNC_ON" >&2
-    printf '\033[3;%dH\033[48;5;235m%*s\033[3;%dH %sChapters%s\033[48;5;235m' "$x0" "$w" "" "$x0" "$B" "$R" >&2
+    printf '\033[3;%dH%s%*s\033[3;%dH %sChapters%s%s' "$x0" "$SURF" "$w" "" "$x0" "$B" "$R" "$SURF" >&2
     rowsel=()
     for (( i = top, y = 4; y < 4 + view; i++, y++ )); do
-      printf '\033[%d;%dH\033[48;5;235m%*s' "$y" "$x0" "$w" "" >&2
+      printf '\033[%d;%dH%s%*s' "$y" "$x0" "$SURF" "$w" "" >&2
       [ "$i" -lt "${#CH_TITLE[@]}" ] || continue
       title=${CH_TITLE[i]}; [ "${#title}" -gt $(( w - 12 )) ] && title="${title:0:$(( w - 13 ))}…"
       if [ "$i" = "$sel" ]; then
-        printf '\033[%d;%dH\033[48;5;238m%*s\033[%d;%dH%s›%s\033[48;5;238m %-*s %spart %s\033[0m' "$y" "$x0" "$w" "" "$y" "$x0" \
-          "$ACC" "$R" $(( w - 12 )) "$title" "$D" "${CH_START[i]}" >&2
+        printf '\033[%d;%dH%s%*s\033[%d;%dH%s%s▎%s%s %-*s %spart %s%s' "$y" "$x0" "$PSEL" "$w" "" "$y" "$x0" \
+          "$PSEL" "$ACC" "$R" "$PSEL" $(( w - 12 )) "$title" "$D" "${CH_START[i]}" "$R" >&2
       else
-        printf '\033[%d;%dH\033[48;5;235m  %-*s %spart %s\033[0m' "$y" "$x0" $(( w - 12 )) "$title" "$D" "${CH_START[i]}" >&2
+        printf '\033[%d;%dH%s  %-*s %spart %s%s' "$y" "$x0" "$SURF" $(( w - 12 )) "$title" "$D" "${CH_START[i]}" "$R" >&2
       fi
       rowsel[$y]=$i
     done
-    printf '\033[%d;%dH\033[48;5;235m%*s\033[%d;%dH %s↑↓ Enter jump · Esc close%s\033[0m' $(( 4 + view )) "$x0" "$w" "" $(( 4 + view )) "$x0" "$D" "$R" >&2
+    printf '\033[%d;%dH%s%*s\033[%d;%dH %s↑↓ Enter jump · Esc close%s' $(( 4 + view )) "$x0" "$SURF" "$w" "" $(( 4 + view )) "$x0" "$D" "$R" >&2
     printf '%s' "$SYNC_OFF" >&2
     KEY=""; tick 0.5; [ -n "$KEY" ] || continue
     case "$KEY" in
@@ -284,7 +327,7 @@ tui_chapters() { # tui_chapters CURRENT: pick a chapter over the reading area; C
 
 tui_prompt() {   # tui_prompt LABEL [DEFAULT]: ask on the bottom line (with Tab completion)
   local ans=""
-  printf '%s\033[%d;1H\033[2K\033[%d;1H\033[2K' "$SYNC_OFF" $(( TH - 1 )) "$TH" >&2
+  printf '%s%s\033[%d;1H\033[2K\033[%d;1H\033[2K' "$SYNC_OFF" "$R" $(( TH - 1 )) "$TH" >&2
   tui_cooked
   printf '\033[%d;3H' "$TH" >&2
   IFS= read -e -r -p "$1 " -i "${2:-}" ans </dev/tty 2>&1 || ans=""
@@ -293,37 +336,44 @@ tui_prompt() {   # tui_prompt LABEL [DEFAULT]: ask on the bottom line (with Tab 
 }
 
 tui_home() {     # runs until something is chosen; prints the chosen kokoro arguments
-  local sel=0 marks=() key r i m title part parts pct bw bar row y
+  local sel=0 marks=() key r i m title part parts pct bw bar row y h free n
   local -A rowact=()
-  TUI_TTY="$(stty -g 2>/dev/null </dev/tty)" || TUI_TTY=""
-  printf '\033[?1049h' >&2; tui_raw; TUI=1
-  trap 'TUI_RESIZED=1' WINCH
+  tui_enter
   mapfile -t marks < <(ls -t "$BOOKS"/*.mark 2>/dev/null | head -n 6)
   HOME_CHOICE=()
   while IFS= read -rsn1 -t 0.05 -u "$KBD" _; do :; done   # drop keys typed before it opened
-  local clip_note=""
-  [ "$(cat "${CONF%/*}/termux-api" 2>/dev/null)" = yes ] || clip_note="  ${D}needs the Termux:API app${R}"
+  local api=0
+  [ "$(cat "${CONF%/*}/termux-api" 2>/dev/null)" = yes ] && api=1
   while :; do
     tui_size; rowact=()
-    printf '%s\033[2J' "$SYNC_ON" >&2
-    y=2
+    printf '%s%s\033[2J' "$SYNC_ON" "$R" >&2
+    # The content as one block, its free space split 1 : φ above and below:
+    # the optical centre, where a block looks centred rather than low.
+    n=${#marks[@]}; [ "$n" -gt 0 ] || n=1
+    if [ "$TH" -ge 22 ]; then h=6; else h=2; fi
+    h=$(( h + 1 + n + 1 + 1 + 6 ))
+    free=$(( TH - 2 - h )); [ "$free" -gt 0 ] || free=0
+    golden "$free"; y=$(( 1 + REPLY ))
     if [ "$TH" -ge 22 ]; then                     # the logo, when there's room for it
-      local c=(141 153 159) l=0 line
+      local l=0 line
+      theme_grad 3 2>/dev/null || GRAD=("$ACC" "$ACC" "$ACC2")
       for line in '░█░█░█▀█░█░█░█▀█░█▄█░█░█░█░█' '░█▀▄░█░█░█▀▄░█░█░█░█░█░█░▄▀▄' '░▀░▀░▀▀▀░▀░▀░▀▀▀░▀░▀░▀▀▀░▀░▀'; do
-        line="${line//░/$'\033[38;5;237m'░$'\033[38;5;'"${c[l]}"m}"
-        printf '\033[%d;%dH\033[38;5;%sm%s%s' "$y" $(( (TW - 28) / 2 )) "${c[l]}" "$line" "$R" >&2
+        line="${line//░/$GHOST░${GRAD[l]}}"         # the ░ texture recedes, the letters stand out
+        printf '\033[%d;%dH%s%s%s' "$y" $(( (TW - 28) / 2 )) "${GRAD[l]}" "$line" "$R" >&2
         y=$(( y + 1 )); l=$(( l + 1 ))
       done
       printf '\033[%d;%dH%sKokoro text-to-speech%s' $(( y + 1 )) $(( (TW - 21) / 2 )) "$D" "$R" >&2
       y=$(( y + 3 ))
     else
-      printf '\033[%d;3H%skokomux%s  %sKokoro text-to-speech%s' "$y" "$ACC" "$R" "$D" "$R" >&2
+      printf '\033[%d;%dH%skokomux%s  %sKokoro text-to-speech%s' "$y" "$LM" "$ACC" "$R" "$D" "$R" >&2
       y=$(( y + 2 ))
     fi
     local x0=$LM
     printf '\033[%d;%dH%sContinue listening%s' "$y" "$x0" "$B" "$R" >&2; y=$(( y + 1 ))
     if [ "${#marks[@]}" = 0 ]; then
-      printf '\033[%d;%dH%sNothing in progress yet. Long texts and books are remembered here.%s' "$y" "$x0" "$D" "$R" >&2
+      r="Nothing in progress yet. Long texts and books are remembered here."
+      [ "${#r}" -gt "$CW" ] && r="Nothing in progress yet."
+      printf '\033[%d;%dH%s%s%s' "$y" "$x0" "$D" "$r" "$R" >&2
       y=$(( y + 1 ))
     fi
     for i in "${!marks[@]}"; do
@@ -331,26 +381,28 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
       [ "${parts:-0}" -gt 0 ] 2>/dev/null || parts=1
       pct=$(( 100 * (part - 1) / parts )); bw=12
       printf -v bar '%*s' $(( pct * bw / 100 )) ''; bar="$ACC${bar// /━}$R"
-      local rest; printf -v rest '%*s' $(( bw - pct * bw / 100 )) ''; bar+="$D${rest// /─}$R"
-      local room=$(( CW - 30 )); [ "${#title}" -gt "$room" ] && title="${title:0:$(( room - 1 ))}…"
-      if [ "$i" = "$sel" ]; then row=$'\033[48;5;237m'; else row=""; fi
+      local rest; printf -v rest '%*s' $(( bw - pct * bw / 100 )) ''; bar+="$LINE${rest// /─}$R"
+      local room=$(( CW - 23 )); [ "${#title}" -gt "$room" ] && title="${title:0:$(( room - 1 ))}…"
+      local mk=" "; row=""
+      if [ "$i" = "$sel" ]; then row=$SEL; mk="$ACC▎"; fi
       bar="${bar//$R/$R$row}"            # keep the selected row's background across the bar
-      printf '\033[%d;%dH%s %s%d%s  %-*s %s %s%3d%%%s \033[0m' "$y" "$x0" "$row" "$ACC2" $(( i + 1 )) "$R$row" \
-        "$room" "$title" "$bar$row" "$D" "$pct" "$R$row" >&2
+      printf '\033[%d;%dH%s%s%s%s%d%s  %-*s %s %s%3d%%%s %s' "$y" "$x0" "$row" "$mk" "$R$row" \
+        "$ACC2" $(( i + 1 )) "$R$row" "$room" "$title" "$bar$row" "$D" "$pct" "$R$row" "$R" >&2
       rowact[$y]="mark:$i"; y=$(( y + 1 ))
     done
     y=$(( y + 1 ))
+    local clip_note=""; [ "$api" = 1 ] || clip_note="  ${D}needs the Termux:API app${R}"
     printf '\033[%d;%dH%sStart something new%s' "$y" "$x0" "$B" "$R" >&2; y=$(( y + 1 ))
     for spec in "c|Read the clipboard$clip_note|clip" "f|Open a file  ${D}text, EPUB or PDF${R}|file" \
                 "u|Read a web page|url" "t|Type something to hear|text" \
-                "v|Voice  ${D}$KOKORO_VOICE · ${KOKORO_SPEED}×${R}|voice" "s|Settings  ${D}speed, highlighting, notifications…${R}|settings"; do
+                "v|Voice  ${D}$KOKORO_VOICE · ${KOKORO_SPEED}×${R}|voice" "s|Settings  ${D}speed, colours, highlighting…${R}|settings"; do
       IFS='|' read -r key r cmd <<< "$spec"
       printf '\033[%d;%dH %s%s%s  %s' "$y" "$x0" "$ACC2" "$key" "$R" "$r" >&2
       rowact[$y]=$cmd; y=$(( y + 1 ))
     done
     if [ "$TW" -ge 64 ]; then r="↑↓ choose · Enter play · click or tap anything · q quit"
     else r="↑↓ · Enter play · tap · q quit"; fi
-    printf '\033[%d;3H%s%s%s' "$TH" "$D" "$r" "$R" >&2
+    printf '\033[%d;%dH%s%s%s' "$TH" "$LM" "$D" "$r" "$R" >&2
     printf '%s' "$SYNC_OFF" >&2
 
     KEY=""; tick 1; [ -n "$KEY" ] || continue
@@ -432,6 +484,7 @@ TUI_SETTINGS=(
   "out|Save files as|The file name used when you save without -o. The ending picks the format: .wav .mp3 .ogg or .flac."
   "#Reading"
   "KOKORO_TUI|Full-screen reader|Open the full-screen reader when you listen on a terminal. Off: show the text below the command instead."
+  "theme|Colours|Auto follows your terminal's own colours. Dark or Light uses that palette on these screens, with its own background if your terminal is the other kind."
   "KOKORO_WORDS|Light up words|Highlight each word as it's spoken, using the timings Kokoro reports as it speaks, in every language."
   "offset|Highlight timing|Moves the highlight relative to the voice. Raise it if the highlight runs ahead, lower it if it lags."
   "#While listening"
@@ -459,6 +512,12 @@ setting_value() {  # what the row shows on the right for setting $1
     lang)  printf '‹ %s%s%s ›' "$ACC2" "$KOKORO_LANG" "$R"
            [ "$SET_NARROW" = 1 ] || printf '  %s%s%s' "$D" "${TUI_LANG_NAME[$KOKORO_LANG]:-}" "$R" ;;
     out)   printf '%s' "$KOKORO_OUT" ;;
+    theme) theme_name 2>/dev/null || REPLY=Auto
+           printf '‹ %s%s%s ›' "$ACC2" "$REPLY" "$R"
+           if [ "$SET_NARROW" = 0 ]; then
+             if [ "${KOKORO_THEME:-auto}" = auto ]; then printf '  %s%s terminal%s' "$D" "${THEME_MODE^}" "$R"
+             elif [ "$THEME_PAINT" = 1 ]; then printf '  %sits own background%s' "$D" "$R"; fi
+           fi ;;
     offset) printf '‹ %+d ms ›' "$KOKORO_WORDS_OFFSET_MS" ;;
     idle)  if [ "$KOKORO_IDLE_MINUTES" = 0 ]; then printf '‹ never ›'; else printf '‹ %s min ›' "$KOKORO_IDLE_MINUTES"; fi ;;
     port)  printf '%s' "$KOKORO_PORT" ;;
@@ -485,6 +544,12 @@ setting_change() { # setting_change ID STEP: ←/→ (-1/+1); 0 means Enter, a c
       for i in "${!TUI_LANGS[@]}"; do [ "${TUI_LANGS[i]}" = "$KOKORO_LANG" ] && break; done
       [ "$step" = 0 ] && step=1
       tui_save KOKORO_LANG "${TUI_LANGS[$(( (i + step + ${#TUI_LANGS[@]}) % ${#TUI_LANGS[@]} ))]}" ;;
+    theme)                                    # auto → dark → light, shown at once
+      local themes=(auto dark light)
+      for i in "${!themes[@]}"; do [ "${themes[i]}" = "${KOKORO_THEME:-auto}" ] && break; done
+      [ "$step" = 0 ] && step=1
+      tui_save KOKORO_THEME "${themes[$(( (i + step + 3) % 3 ))]}"
+      tui_theme ;;
     out)
       tui_prompt "Save files as:" "$KOKORO_OUT"
       if [[ "$ANSWER" =~ ^[^/[:space:]]+\.(wav|mp3|ogg|flac)$ ]]; then tui_save KOKORO_OUT "$ANSWER"
@@ -510,7 +575,7 @@ setting_change() { # setting_change ID STEP: ←/→ (-1/+1); 0 means Enter, a c
       fi ;;
     edit)
       [ "$step" = 0 ] || return 0
-      tui_cooked; printf '\033[?1049l' >&2
+      tui_cooked; printf '\033[0m\033[?1049l' >&2
       "${EDITOR:-nano}" "$CONF" </dev/tty >/dev/tty 2>&1 || true
       # shellcheck source=/dev/null
       [ -f "$CONF" ] && . "$CONF"
@@ -522,14 +587,13 @@ tui_settings() { # the settings menu; works on its own or from the home screen
   local own=0 sel=0 top=0 key rows=() i n n_this=0 y=0 r id label desc val first=4 last view lw=26
   local -A rowsel=()
   SAVED_AT=0; SETTINGS_NOTE=""
-  if [ "$TUI" != 1 ]; then
-    own=1; TUI_TTY="$(stty -g 2>/dev/null </dev/tty)" || TUI_TTY=""
-    printf '\033[?1049h' >&2; tui_raw; TUI=1; trap 'TUI_RESIZED=1' WINCH
-  fi
+  if [ "$TUI" != 1 ]; then own=1; tui_enter; fi
   local items=(); for r in "${TUI_SETTINGS[@]}"; do [ "${r:0:1}" = "#" ] || items+=("${r%%|*}"); done
   while :; do
     tui_size
-    SET_NARROW=0; lw=26; [ "$CW" -lt 64 ] && { SET_NARROW=1; lw=25; }
+    # labels and values share the width φ⁻² : φ⁻¹, with room for the longest label
+    SET_NARROW=0; [ "$CW" -lt 64 ] && SET_NARROW=1
+    golden "$CW"; lw=$(( REPLY > 25 ? REPLY : 25 ))
     # what the selected setting does, wrapped: the bottom of the screen is laid out around it
     for r in "${TUI_SETTINGS[@]}"; do [ "${r%%|*}" = "${items[sel]}" ] && desc=${r##*|}; done
     [ -n "$SETTINGS_NOTE" ] && desc="$SETTINGS_NOTE"
@@ -544,13 +608,13 @@ tui_settings() { # the settings menu; works on its own or from the home screen
     [ "$y" -lt "$top" ] && top=$(( y > 0 && ${rows[y-1]:0:1} == "#" ? y - 1 : y ))
     [ "$y" -ge $(( top + view )) ] && top=$(( y - view + 1 ))
     [ "$y" -le 1 ] && top=0
-    printf '%s\033[2J' "$SYNC_ON" >&2
+    printf '%s%s\033[2J' "$SYNC_ON" "$R" >&2
     printf '\033[1;1H  %skokomux%s  %sSettings%s' "$ACC" "$R" "$B" "$R" >&2
     now_ms
     if [ "$SAVED_AT" -gt 0 ] && [ $(( NOW - SAVED_AT )) -lt 1500 ]; then
       printf '\033[1;%dH%s✓ Saved%s' $(( TW - 9 )) "$GRN" "$R" >&2
     fi
-    printf '\033[2;1H%s%s%s' "$D" "$(rule "$TW")" "$R" >&2
+    printf '\033[2;1H%s%s%s' "$LINE" "$(rule "$TW")" "$R" >&2
     rowsel=(); n=0
     for i in "${!rows[@]}"; do
       r=${rows[i]}
@@ -564,8 +628,8 @@ tui_settings() { # the settings menu; works on its own or from the home screen
         IFS='|' read -r id label desc <<< "$r"
         val="$(setting_value "$id")"
         if [ "$n_this" = "$sel" ]; then
-          printf '\033[%d;%dH\033[48;5;237m%*s\033[%d;%dH%s›%s\033[48;5;237m %s' "$y" "$LM" "$CW" "" "$y" "$LM" "$ACC" "$R" "$label" >&2
-          printf '\033[%d;%dH\033[48;5;237m%s\033[0m' "$y" $(( LM + lw )) "${val//$R/$R$'\033[48;5;237m'}" >&2
+          printf '\033[%d;%dH%s%*s\033[%d;%dH%s▎%s%s %s' "$y" "$LM" "$SEL" "$CW" "" "$y" "$LM" "$ACC" "$R" "$SEL" "$label" >&2
+          printf '\033[%d;%dH%s%s%s' "$y" $(( LM + lw )) "$SEL" "${val//$R/$R$SEL}" "$R" >&2
         else
           printf '\033[%d;%dH  %s\033[%d;%dH%s' "$y" "$LM" "$label" "$y" $(( LM + lw )) "$val" >&2
         fi
@@ -576,7 +640,7 @@ tui_settings() { # the settings menu; works on its own or from the home screen
     [ "$top" -gt 0 ] && printf '\033[%d;%dH%s▲ more%s' $(( first - 1 )) $(( LM + CW - 6 )) "$D" "$R" >&2
     [ $(( top + view )) -lt "${#rows[@]}" ] && printf '\033[%d;%dH%s▼ more%s' $(( last + 1 )) $(( LM + CW - 6 )) "$D" "$R" >&2
     y=$(( TH - ${#dl[@]} - 1 ))
-    printf '\033[%d;1H%s%s%s' "$y" "$D" "$(rule "$TW")" "$R" >&2
+    printf '\033[%d;1H%s%s%s' "$y" "$LINE" "$(rule "$TW")" "$R" >&2
     for r in "${dl[@]}"; do y=$(( y + 1 )); printf '\033[%d;%dH%s' "$y" "$LM" "$r" >&2; done
     if [ "$TW" -ge 72 ]; then r="↑↓ choose · ←→ change · Enter edit · Space hear voice · q done"
     else r="↑↓ · ←→ change · Enter · q done"; fi
@@ -613,24 +677,24 @@ tui_voices() {   # the voice picker: type to filter, Space to hear, Enter to cho
     [ "$sel" -ge "${#list[@]}" ] && sel=$(( ${#list[@]} > 0 ? ${#list[@]} - 1 : 0 ))
     [ "$sel" -lt "$top" ] && top=$sel
     [ "$sel" -ge $(( top + view )) ] && top=$(( sel - view + 1 ))
-    printf '%s\033[2J\033[1;1H  %skokomux%s  %sChoose a voice%s' "$SYNC_ON" "$ACC" "$R" "$B" "$R" >&2
+    printf '%s%s\033[2J\033[1;1H  %skokomux%s  %sChoose a voice%s' "$SYNC_ON" "$R" "$ACC" "$R" "$B" "$R" >&2
     printf '\033[1;%dH%s%s%s' $(( TW - 20 )) "$D" "${#list[@]} of ${#TUI_VOICES[@]} voices" "$R" >&2
-    printf '\033[2;1H%s%s%s' "$D" "$(rule "$TW")" "$R" >&2
+    printf '\033[2;1H%s%s%s' "$LINE" "$(rule "$TW")" "$R" >&2
     printf '\033[3;%dH%sFilter:%s %s%s▏' "$LM" "$D" "$R" "$filter" "$ACC" >&2; printf '%s' "$R" >&2
     rowsel=(); prev=""
     for (( i = top, y = 5; i < ${#list[@]} && y <= TH - 3; i++, y++ )); do
       v=${list[i]}; lang=${TUI_VOICE_LANG[${v:0:1}]:-}; g=female; [ "${v:1:1}" = m ] && g=male
       local mark=" "; [ "$v" = "$KOKORO_VOICE" ] && mark="$GRN✓$R"
       if [ "$i" = "$sel" ]; then
-        printf '\033[%d;%dH\033[48;5;237m%*s\033[%d;%dH%s›%s\033[48;5;237m %s %s%-16s\033[48;5;237m %s%s · %s\033[0m' \
-          "$y" "$LM" "$CW" "" "$y" "$LM" "$ACC" "$R" "$mark" "$ACC2" "$v" "$R" "${TUI_LANG_NAME[$lang]:-}" "$g" >&2
+        printf '\033[%d;%dH%s%*s\033[%d;%dH%s▎%s%s %s%s %s%-16s%s %s%s · %s%s' \
+          "$y" "$LM" "$SEL" "$CW" "" "$y" "$LM" "$ACC" "$R" "$SEL" "${mark//$R/$R$SEL}" "$SEL" "$ACC2" "$v" "$R$SEL" "$D" "${TUI_LANG_NAME[$lang]:-}" "$g" "$R" >&2
       else
         printf '\033[%d;%dH  %s %-16s %s%s · %s%s' "$y" "$LM" "$mark" "$v" "$D" "${TUI_LANG_NAME[$lang]:-}" "$g" "$R" >&2
       fi
       rowsel[$y]=$i
     done
     [ "${#list[@]}" = 0 ] && printf '\033[5;%dH%sNo voice matches "%s".%s' "$LM" "$D" "$filter" "$R" >&2
-    printf '\033[%d;1H%s%s%s' $(( TH - 1 )) "$D" "$(rule "$TW")" "$R" >&2
+    printf '\033[%d;1H%s%s%s' $(( TH - 1 )) "$LINE" "$(rule "$TW")" "$R" >&2
     if [ "$TW" -ge 72 ]; then g="type to filter · ↑↓ choose · Space hear it · Enter use it · Esc back"
     else g="type · ↑↓ · Space hear · Enter use · Esc"; fi
     printf '\033[%d;%dH%s%s%s%s' "$TH" "$LM" "$D" "$g" "$R" "$SYNC_OFF" >&2

@@ -634,11 +634,16 @@ LANGS = {"a": ("American English", "en-us"), "b": ("British English", "en-gb"),
          "p": ("Brazilian Portuguese", "pt-br"), "z": ("Mandarin Chinese", "cmn")}
 
 
-def print_voices(names, width, default):
+def sgr(params, fallback):
+    """An SGR escape from kokoro's theme ("38;2;182;156;255"), or the fallback."""
+    return f"\033[{params}m" if params and all(c in "0123456789;" for c in params) else fallback
+
+
+def print_voices(names, width, default, accent="", muted=""):
     """Group voices by language and gender, wrapped to the terminal width.
-    Colour only when stdout is a terminal."""
+    Colour only when stdout is a terminal, in kokoro's theme colours."""
     tty = (sys.stdout.isatty() or "--color" in sys.argv) and not os.environ.get("NO_COLOR")
-    bold, dim, acc, off = ("\033[1m", "\033[2m", "\033[38;5;141m", "\033[0m") if tty else ("",) * 4
+    bold, dim, acc, off = ("\033[1m", sgr(muted, "\033[2m"), sgr(accent, "\033[38;5;141m"), "\033[0m") if tty else ("",) * 4
     width = max(30, min(width, 100))
     groups = {}
     for n in names:
@@ -685,6 +690,8 @@ def main():
     v.add_argument("--width", type=int, default=60)
     v.add_argument("--default", default="")
     v.add_argument("--color", action="store_true", help="colour even when piped")
+    v.add_argument("--accent", default="", help="SGR parameters for the accent colour")
+    v.add_argument("--muted", default="", help="SGR parameters for secondary text")
     sub.add_parser("download")
     a = p.parse_args()
 
@@ -700,7 +707,7 @@ def main():
         if a.plain:
             print("\n".join(names))
         else:
-            print_voices(names, a.width, a.default)
+            print_voices(names, a.width, a.default, a.accent, a.muted)
     elif a.cmd == "download":
         download()
 
