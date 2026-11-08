@@ -213,7 +213,7 @@ jump_to() {      # jump_to PART
   start=$target; i=$target; was_parts=0          # (a part in this run's own numbering)
   write_job
   run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
-  if [ "$ui" = tui ]; then tui_hist=(); TUI_PART=0; TUI_WRAP=(); TUI_OFFS=(); TUI_INFO="$(voice_label "$voice") · ${speed}×"; tui_draw; fi
+  if [ "$ui" = tui ]; then tui_hist=(); TUI_PART=0; TUI_WRAP=(); TUI_OFFS=(); TUI_INFO="$(voice_label "$voice") · ${speed}×"; TUI_SPEED=$speed; tui_draw; fi
 }
 
 # Commands that change where or how it reads (from a key, a click or the menu).
@@ -237,6 +237,24 @@ listen_cmd() {   # listen_cmd CMD PART
                   if [ "$CH" -ge 0 ] && [ "$at" -gt "${CH_START[CH]}" ]; then JUMP=${CH_START[CH]}   # start of this one
                   elif [ "$CH" -gt 0 ]; then JUMP=${CH_START[CH - 1]}; fi ;;
     seek:*) JUMP=${cmd#seek:} ;;
+    menu)                                       # the menu: some choices are the player's to carry out
+      [ "$ui" = tui ] || return 0
+      tui_menu
+      case "$MENU_CMD" in
+        settings|voice|chapters) listen_cmd "$MENU_CMD" "$at" ;;
+        "") ;;
+        *) CMD_PENDING=$MENU_CMD ;;
+      esac ;;
+    settings|voice)                             # change things mid-listen: a new voice, speed or language
+      [ "$ui" = tui ] || return 0              # picks up at this part
+      local before after
+      before="$(voice_mix)|$KOKORO_SPEED|$KOKORO_LANG"
+      if [ "$cmd" = settings ]; then tui_settings; else tui_voices; fi
+      after="$(voice_mix)|$KOKORO_SPEED|$KOKORO_LANG"
+      if [ "$after" != "$before" ]; then
+        voice="$(voice_mix)"; speed=$KOKORO_SPEED; lang=$KOKORO_LANG; JUMP=$at
+      fi
+      tui_draw ;;
     *) return 1 ;;
   esac
   return 0
@@ -250,6 +268,8 @@ listen_cmd() {   # listen_cmd CMD PART
 
 MPV_PID=""; MPV_SOCK=""; MPV_IN=""; MPV_OUT=""; MPV_CARRY=""
 MPV_T=0; MPV_POS=-1; MPV_N=0       # seconds into the current part; playlist index; entries queued
+MPV_MAX=-1                         # the furthest playlist index reached (parts played while a menu was open)
+CMD_PENDING=""                     # a command chosen in the menu, for the player to carry out
 declare -A MPV_IDX=()              # part -> its playlist index
 MPV_PART=()                        # playlist index -> part
 
@@ -279,7 +299,8 @@ mpv_pump() {     # take in what mpv has reported since last time
       line=$MPV_CARRY$line; MPV_CARRY=""
       case "$line" in
         *'"name":"playback-time"'*) if [[ "$line" =~ \"data\":([0-9.]+) ]]; then MPV_T=${BASH_REMATCH[1]}; fi ;;
-        *'"name":"playlist-pos"'*) if [[ "$line" =~ \"data\":(-?[0-9]+) ]]; then MPV_POS=${BASH_REMATCH[1]}; fi ;;
+        *'"name":"playlist-pos"'*) if [[ "$line" =~ \"data\":(-?[0-9]+) ]]; then
+                                     MPV_POS=${BASH_REMATCH[1]}; [ "$MPV_POS" -gt "$MPV_MAX" ] && MPV_MAX=$MPV_POS; fi ;;
       esac
     else
       MPV_CARRY+=$line             # half a line: the rest comes next time
@@ -298,7 +319,7 @@ mpv_queue() {    # mpv_queue PART WAV: add a part to the playlist (it plays at o
 }
 mpv_stop() {     # empty the playlist (a jump starts again from a new part)
   [ -n "$MPV_PID" ] && mpv_send '"stop"'
-  MPV_IDX=(); MPV_PART=(); MPV_N=0; MPV_POS=-1; MPV_T=0
+  MPV_IDX=(); MPV_PART=(); MPV_N=0; MPV_POS=-1; MPV_T=0; MPV_MAX=-1
   return 0
 }
 mpv_quit() {
@@ -306,6 +327,21 @@ mpv_quit() {
   [ -n "$MPV_SOCK" ] && rm -f "$MPV_SOCK"
   MPV_PID=""
   return 0
+}
+
+player_bg() {    # keep mpv's playlist fed (also from tick, while a menu or settings is open)
+  local k f
+  mpv_pump
+  [ "$MPV_N" -gt 0 ] || return 0
+  k=$(( MPV_PART[MPV_N - 1] + 1 ))
+  printf -v f '%s/stream/%04d.wav' "$tmpd" "$k"
+  if [ -f "$f" ] && ! sleep_due "$k"; then mpv_queue "$k" "$f"; fi   # (not past where the sleep timer stops)
+  return 0
+}
+
+go_home() {      # stop (keeping the place) and open the home screen
+  [ "${KOKORO_QUEUE:-0}" = 1 ] && exit "$QUIT_RC"          # (from the queue: just stop it)
+  trap - EXIT; cleanup; exec "$0"
 }
 
 play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause / next / again
@@ -317,24 +353,22 @@ play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause
   mpv_start
   [ -n "${MPV_IDX[$i]+x}" ] || mpv_queue "$i" "$wav"
   idx=${MPV_IDX[$i]}
+  mpv_pump
+  # Already heard (it played on while a menu was open): on to the next.
+  if [ "$idx" -lt "$MPV_MAX" ] || { [ "$idx" = "$MPV_MAX" ] && [ "$MPV_POS" = -1 ]; }; then return 0; fi
+  TICK_BG=player_bg
   view_part "$i" "$base"
   in_line=1
   echo playing > "$PLAYER_STATE"
   # Nothing in this loop starts a process: it runs ~30 times a second on a phone.
   while :; do
-    mpv_pump
-    # The next part goes in the playlist as soon as it's made, so there's no gap
-    # (unless the sleep timer stops before it).
+    player_bg                                 # the next part goes in the playlist as soon as it's made
     k=$(( i + 1 ))
-    if [ -z "${MPV_IDX[$k]+x}" ]; then
-      printf -v f '%s/stream/%04d.wav' "$tmpd" "$k"
-      [ -f "$f" ] && ! sleep_due "$k" && mpv_queue "$k" "$f"
-    fi
     if [ "$MPV_POS" = "$idx" ]; then started=1
     elif [ "$started" = 1 ] || { [ "$MPV_POS" -gt "$idx" ] 2>/dev/null; }; then break   # on to the next, or done
     else waited=$(( waited + 1 )); [ "$waited" -lt 300 ] || break; fi                  # (mpv never got to it)
-    cmd=""                                    # kokoro --pause / --next / --again, or a key or click
-    if [ -f "$CONTROL" ]; then read -r cmd < "$CONTROL" || cmd=""; rm -f "$CONTROL"; fi
+    cmd=$CMD_PENDING; CMD_PENDING=""         # the menu's choice, kokoro --pause / --next / --again, or a key or click
+    if [ -z "$cmd" ] && [ -f "$CONTROL" ]; then read -r cmd < "$CONTROL" || cmd=""; rm -f "$CONTROL"; fi
     if [ -z "$cmd" ] && [ -n "$KEY" ]; then key_cmd; cmd=$CMD; fi
     if [ -n "$cmd" ]; then
       case "$cmd" in
@@ -350,6 +384,7 @@ play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause
         again) mpv_send '"seek",0,"absolute"'; mpv_send '"set_property","pause",false'
                paused=0; cur=-1; lit=-2; last=""; continue ;;
         quit)  exit "$QUIT_RC" ;;                 # the bookmark is kept; cleanup says where
+        home)  go_home ;;
         *)     if listen_cmd "$cmd" "$i"; then
                  last=""
                  [ -n "$JUMP" ] && break      # jump_to empties the playlist
@@ -388,6 +423,6 @@ play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause
     if [ "$label|playing" != "$last" ]; then view_state "Playing" "$label" "▶"; last="$label|playing"; fi
     tick 0.03
   done
-  in_line=0
+  TICK_BG=""; in_line=0
   view_part_end
 }

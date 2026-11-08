@@ -289,7 +289,7 @@ stop_playback() {
 # gone and bash crashes (seen with bash 5.2). So during the wait the signal only
 # sets a flag, and tick exits once read has returned.
 
-STOP=""; IN_TICK=0; KEY=""; CMD=""; KBD=""; KEYS_TTY=""
+STOP=""; IN_TICK=0; KEY=""; CMD=""; KBD=""; KEYS_TTY=""; TICK_BG=""
 exec {TICK}<> <(:)                    # read -t on this is a sleep with no process
 now_ms() { local t=${EPOCHREALTIME//[!0-9]/}; NOW=$(( t / 1000 )); }   # no subshell: called every frame
 keys_on() {      # read keys from the terminal, unechoed (restored on exit)
@@ -303,6 +303,7 @@ keys_off() { [ -n "$KEYS_TTY" ] && stty "$KEYS_TTY" 2>/dev/null </dev/tty; KEYS_
 tick() {
   local c rest=""
   [ -n "${FRAME:-}" ] && flush          # the frame drawn since the last wait, in one write
+  [ -n "${TICK_BG:-}" ] && "$TICK_BG"    # the player keeping mpv fed, while a menu is open
   IN_TICK=1; KEY=""
   if [ -n "$KBD" ]; then
     if IFS= read -rsn1 -d '' -t "$1" -u "$KBD" KEY && [ "$KEY" = $'\033' ]; then
@@ -329,6 +330,9 @@ key_cmd() {      # what KEY asks for (or a clicked button): see the player for e
     -|_) CMD=slower ;;
     t|T) CMD="sleep" ;;
     c|C) CMD=chapters ;;
+    m|M) CMD=menu ;;
+    s|S) CMD=settings ;;
+    v|V) CMD=voice ;;
     ']') CMD=next_chapter ;;
     '[') CMD=prev_chapter ;;
     $'\033[<'*M) [ "${ui:-}" = tui ] && tui_click "$KEY" ;;
@@ -819,7 +823,7 @@ WAKE=0                                          # an audiobook can take a while:
 if [ "$ext" = m4b ] && command -v termux-wake-lock >/dev/null && termux-wake-lock >/dev/null 2>&1; then WAKE=1; fi
 run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
 if [ "$ui" = tui ]; then
-  TUI_TITLE=$name; TUI_INFO="$(voice_label "$voice") · ${speed}×"; tui_open
+  TUI_TITLE=$name; TUI_INFO="$(voice_label "$voice") · ${speed}×"; TUI_SPEED=$speed; tui_open
 fi
 
 i=$start
@@ -845,6 +849,8 @@ while :; do
     if [ -n "$KEY" ]; then
       key_cmd; [ "$CMD" = quit ] && exit "$QUIT_RC"
       [ -n "$CMD" ] && listen_cmd "$CMD" "$i" && [ -n "$JUMP" ] && { jump_to "$JUMP"; JUMP=""; }
+      case "$CMD_PENDING" in quit) exit "$QUIT_RC" ;; home) go_home ;; esac   # (chosen in the menu)
+      CMD_PENDING="${CMD_PENDING/toggle/}"
     fi
   fi
 done

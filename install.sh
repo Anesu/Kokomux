@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.15.2"
+KOKOMUX_VERSION="0.15.3"
 DISTRO=kokoro
 
 ASSUME_YES=0; VERBOSE=0
@@ -1870,10 +1870,11 @@ cat > "$WORK/tui.sh" <<'__KOKOMUX_TUI__'
 
 TUI=0; TUI_TTY=""; TUI_RESIZED=0
 TW=80; TH=24; CW=72; LM=4             # screen size; reading column width and margin
+FT_CTRL=24; FT_TRANS=22; FT_BAR=20; FT_INFO=19; FT_TEXT=17   # the footer's rows (tui_size)
 declare -A TUI_WRAP=() TUI_OFFS=()    # each part's text wrapped to the column, by part
 tui_hist=()                           # parts already heard, oldest first
 TUI_PART=0; TUI_PARTS=0; TUI_A=0; TUI_B=0
-TUI_STATE=""; TUI_EXTRA=""; TUI_SYM=""; TUI_PAUSED=0; TUI_TITLE=""; TUI_INFO=""
+TUI_STATE=""; TUI_EXTRA=""; TUI_SYM=""; TUI_PAUSED=0; TUI_TITLE=""; TUI_INFO=""; TUI_SPEED=1.0
 TUI_BTN=()                            # clickable buttons: "row x0 x1 command"
 TUI_CHAPTER=""; TUI_HAS_CHAPTERS=0; TUI_BAR=(3 10)   # the progress bar's first column and width
 SYNC_ON=$'\033[?2026h'; SYNC_OFF=$'\033[?2026l'
@@ -1883,8 +1884,16 @@ tui_size() {
   local size
   size="$(stty size 2>/dev/null </dev/tty)" || size=""
   if [[ "$size" =~ ^([0-9]+)\ ([0-9]+)$ ]]; then TH=${BASH_REMATCH[1]} TW=${BASH_REMATCH[2]}; fi
+  tui_layout
+}
+
+tui_layout() {   # the reading column and the footer's rows, for a TW×TH screen
   CW=$(( TW - 6 < 76 ? TW - 6 : 76 )); [ "$CW" -ge 20 ] || CW=20
   LM=$(( (TW - CW) / 2 ))
+  # The footer's rows, bottom up (a row's gap between the transport and the quiet
+  # controls when the screen has room, for thumbs).
+  FT_CTRL=$TH; FT_TRANS=$(( TH - 1 )); [ "$TH" -ge 20 ] && FT_TRANS=$(( TH - 2 ))
+  FT_BAR=$(( FT_TRANS - 2 )); FT_INFO=$(( FT_BAR - 1 )); FT_TEXT=$(( FT_INFO - 2 ))
   TUI_WRAP=(); TUI_OFFS=()
 }
 
@@ -1983,7 +1992,7 @@ tui_far() {      # tui_far NEAR DIST SCALE: REPLY = the tone DIST rows away (SCA
 }
 
 tui_text() {     # the reading column: what's been heard above, this part, what's next below
-  local top=4 bottom=$(( TH - 5 )) h k j n r idx a hl=0 s ease=1000 last=0 lvl LC_ALL=C
+  local top=4 bottom=$FT_TEXT h k j n r idx a hl=0 s ease=1000 last=0 lvl LC_ALL=C
   local -a past=() now_rows=() offs=() next=() rows=()
   h=$(( bottom - top + 1 ))
   if [ "$TUI_PART" = 0 ] || ! tui_wrap "$TUI_PART"; then   # nothing to show yet
@@ -2076,66 +2085,87 @@ tui_ahead() {    # tui_ahead TEXT DIST: words still to come, DIST bytes after th
   out '%s' "$R"
 }
 
-tui_progress() {
-  local label bar bw filled ch=$TUI_CHAPTER room
-  if [ "$TUI_PARTS" -gt 1 ]; then label="$TUI_PART/$TUI_PARTS"; else label=""; fi
-  if [ -n "$ch" ]; then                       # the chapter, as long as the bar keeps some room
-    room=$(( TW / 3 )); [ "${#ch}" -gt "$room" ] && ch="${ch:0:$(( room - 1 ))}…"
-    label="$ch · $label"
-  fi
-  bw=$(( TW - 6 - ${#label} )); [ "$bw" -ge 4 ] || bw=4
+# The footer, bottom up: a quiet row (speed, sleep, chapters, menu), the
+# transport (again, play or pause, next), a gap, the progress bar, and a line
+# saying what's happening and where. Rows are centred, and fit any width.
+
+tui_progress() { # the bar across the screen (tap it to jump there)
+  local bar bw filled
+  bw=$(( TW - 4 )); [ "$bw" -ge 4 ] || bw=4
   TUI_BAR=(3 "$bw")
   filled=0; [ "$TUI_PARTS" -gt 0 ] && filled=$(( TUI_PART * bw / TUI_PARTS ))
   printf -v bar '%*s' "$filled" ''; bar=${bar// /━}
-  out '%s\033[%d;1H\033[2K  %s%s%s' "$R" $(( TH - 3 )) "$ACC" "$bar" "$R"
+  out '%s\033[%d;1H\033[K\033[3G%s%s' "$R" "$FT_BAR" "$ACC" "$bar"
   printf -v bar '%*s' $(( bw - filled )) ''
-  out '%s%s%s  %s' "$LINE" "${bar// /─}" "$R" "$label"
+  out '%s%s%s' "$LINE" "${bar// /─}" "$R"
 }
 
-tui_button() {   # tui_button ROW KEY LABEL COMMAND: draw one at BX, remember where it is; BX advances by BGAP
-  local text=" k $3 "                         # (the key glyph is one column, whatever its bytes)
-  out '\033[%d;%dH%s %s%s%s%s %s %s' "$1" "$BX" "$SURF" "$ACC2" "$2" "$R" "$SURF" "$3" "$R"
-  TUI_BTN+=("$1 $BX $(( BX + ${#text} - 1 )) $4")
-  BX=$(( BX + ${#text} + BGAP ))
-}
-
-tui_buttons() {  # tui_buttons ROW "key|label|short|command"...: a row that always fits
-  # Full labels two columns apart; if that's too wide, one apart; then short labels.
-  local row=$1 spec k l s c w full=0 brief=0 n=$(( $# - 1 ))
-  shift
-  for spec in "$@"; do
-    IFS='|' read -r k l s c <<< "$spec"
-    full=$(( full + ${#l} + 4 )); brief=$(( brief + ${#s} + 4 ))
-  done
-  local short=0
-  BGAP=2
-  if [ $(( 2 + full + 2 * (n - 1) )) -gt "$TW" ]; then
-    BGAP=1; [ $(( 2 + full + n - 1 )) -gt "$TW" ] && short=1
+tui_info() {     # what's happening on the left, the chapter and part on the right
+  local state where="" ch=$TUI_CHAPTER room
+  state="$TUI_STATE${TUI_EXTRA:+ · $TUI_EXTRA}"
+  [ "$TUI_PARTS" -gt 1 ] && where="$TUI_PART of $TUI_PARTS"
+  room=$(( TW - 4 - ${#state} - 4 - ${#TUI_SYM} - ${#where} - 3 ))
+  if [ -n "$ch" ] && [ "$room" -gt 6 ]; then
+    [ "${#ch}" -gt "$room" ] && ch="${ch:0:$(( room - 1 ))}…"
+    where="$ch · $where"
   fi
-  BX=3
-  for spec in "$@"; do
-    IFS='|' read -r k l s c <<< "$spec"
-    [ "$short" = 1 ] && l=$s
-    tui_button "$row" "$k" "$l" "$c"
+  out '%s\033[%d;1H\033[K\033[3G%s%s%s %s%s%s' "$R" "$FT_INFO" "$ACC" "${TUI_SYM:-·}" "$R" "$D" "$state" "$R"
+  [ -n "$where" ] && out '\033[%d;%dH%s%s%s' "$FT_INFO" $(( TW - ${#where} - 1 )) "$D" "$where" "$R"
+  return 0
+}
+
+tui_transport() { # again · play/pause · next, equal widths, centred; play/pause stands out
+  local row=$FT_TRANS w=11 gap=3 x i lab cmd bg play="‖  Pause"
+  [ "$TUI_PAUSED" = 1 ] && play="▶  Play"
+  local labels=("‹  Again" "$play" "Next  ›") cmds=(again toggle next)
+  [ $(( 3 * w + 2 * gap )) -le $(( TW - 2 )) ] || gap=1
+  x=$(( (TW - 3 * w - 2 * gap) / 2 + 1 ))
+  out '%s\033[%d;1H\033[K' "$R" "$row"
+  for i in 0 1 2; do
+    lab=${labels[i]} cmd=${cmds[i]} bg=$SURF
+    [ "$i" = 1 ] && bg=$PSEL
+    out '\033[%d;%dH%s%*s\033[%d;%dH%s%s%s%s' "$row" "$x" "$bg" "$w" "" "$row" $(( x + (w - ${#lab}) / 2 )) \
+      "$bg" "$( [ "$i" = 1 ] && printf '%s' "$B")" "$lab" "$R"
+    TUI_BTN+=("$row $x $(( x + w - 1 )) $cmd")
+    x=$(( x + w + gap ))
   done
 }
 
-tui_footer() {   # the buttons (keys and clicks), and what's happening on the right
-  local state room play=Pause
+tui_controls() { # − speed +, sleep, chapters, menu: quiet, and centred
+  local row=$FT_CTRL x gap=4 total=0 i spec lab cmd col sl
+  sleep_label 2>/dev/null || SLEEP_LABEL=""
+  sl=${SLEEP_LABEL:-☾ Sleep}
+  # each: label|command|colour (A: the accent, for what's switched on)
+  local items=("−|slower|" "${TUI_SPEED}×|-|A" "+|faster|" "$sl|sleep|$( [ -n "$SLEEP_LABEL" ] && echo A)")
+  [ "$TUI_HAS_CHAPTERS" = 1 ] && items+=("Chapters|chapters|")
+  items+=("≡  Menu|menu|")
+  for spec in "${items[@]}"; do lab=${spec%%|*}; total=$(( total + ${#lab} )); done
+  # the speed group sits tight (− 1.0× +); the rest are gap apart
+  local n=$(( ${#items[@]} - 3 ))
+  while [ "$gap" -gt 1 ] && [ $(( total + 4 + gap * n )) -gt $(( TW - 2 )) ]; do gap=$(( gap - 1 )); done
+  if [ $(( total + 4 + gap * n )) -gt $(( TW - 2 )) ]; then
+    items=("${items[@]//Chapters|/Ch|}"); items=("${items[@]//≡  Menu|/≡|}"); items=("${items[@]//☾ Sleep|/☾|}")
+    total=0; for spec in "${items[@]}"; do lab=${spec%%|*}; total=$(( total + ${#lab} )); done
+  fi
+  x=$(( (TW - total - 4 - gap * n) / 2 + 1 ))
+  out '%s\033[%d;1H\033[K' "$R" "$row"
+  for i in "${!items[@]}"; do
+    IFS='|' read -r lab cmd col <<< "${items[i]}"
+    if [ "$col" = A ]; then col=$ACC2; elif [ "$cmd" = slower ] || [ "$cmd" = faster ]; then col=$ACC2; else col=$D; fi
+    out '\033[%d;%dH%s%s%s' "$row" "$x" "$col" "$lab" "$R"
+    # (taps land on a cell or two around each, a finger is wider than a letter)
+    [ "$cmd" != - ] && TUI_BTN+=("$row $(( x - 1 )) $(( x + ${#lab} )) $cmd")
+    if [ "$i" -lt 2 ]; then x=$(( x + ${#lab} + 2 )); else x=$(( x + ${#lab} + gap )); fi
+  done
+}
+
+tui_footer() {   # what's happening, the transport and the quiet controls
   TUI_BTN=()
-  out '%s\033[%d;1H\033[2K\033[%d;1H\033[2K' "$R" $(( TH - 1 )) "$TH"
-  [ "$TUI_PAUSED" = 1 ] && play=Play
-  tui_buttons "$TH" "␣|$play|$play|toggle" "←|Again|Back|again" "→|Next|Next|next" "q|Stop|Stop|quit"
-  state="${TUI_SYM:+$TUI_SYM }$TUI_STATE${TUI_EXTRA:+ · $TUI_EXTRA}"
-  room=$(( TW - BX - 2 + BGAP ))
-  if [ "$room" -gt 6 ]; then
-    [ "${#state}" -gt "$room" ] && state="${state:0:$(( room - 1 ))}…"
-    out '\033[%d;%dH%s%s%s' "$TH" $(( TW - ${#state} - 1 )) "$D" "$state" "$R"
-  fi
-  local more=()                               # the second row: the rest
-  [ "$TUI_HAS_CHAPTERS" = 1 ] && more+=("c|Chapters|Chap|chapters")
-  more+=("−|Slower|Slow|slower" "+|Faster|Fast|faster" "t|Sleep|Sleep|sleep")
-  tui_buttons $(( TH - 1 )) "${more[@]}"
+  local r
+  for (( r = FT_INFO + 1; r < FT_CTRL; r++ )); do [ "$r" = "$FT_BAR" ] || out '%s\033[%d;1H\033[K' "$R" "$r"; done
+  tui_info
+  tui_transport
+  tui_controls
 }
 
 tui_draw() {
@@ -2174,7 +2204,7 @@ tui_click() {    # tui_click REPORT: a left click or tap on a button or the prog
     if [ "$y" = "$row" ] && [ "$x" -ge "$x0" ] && [ "$x" -le "$x1" ]; then CMD=$cmd; return 0; fi
   done
   # the progress bar: jump to that point (by part)
-  if [ "$y" = $(( TH - 3 )) ] && [ "$TUI_PARTS" -gt 1 ] && [ "$x" -ge "${TUI_BAR[0]}" ] && [ "$x" -lt $(( TUI_BAR[0] + TUI_BAR[1] )) ]; then
+  if [ "$y" = "$FT_BAR" ] && [ "$TUI_PARTS" -gt 1 ] && [ "$x" -ge "${TUI_BAR[0]}" ] && [ "$x" -lt $(( TUI_BAR[0] + TUI_BAR[1] )) ]; then
     CMD="seek:$(( 1 + (x - TUI_BAR[0]) * TUI_PARTS / TUI_BAR[1] ))"
   fi
 }
@@ -2220,6 +2250,53 @@ tui_chapters() { # tui_chapters CURRENT: pick a chapter over the reading area; C
       $'\033[<0;'*M) [[ "$KEY" =~ \;([0-9]+)M$ ]] && i=${rowsel[${BASH_REMATCH[1]}]:-} && [ -n "$i" ] && { CHOSEN=$i; break; } ;;
       $'\033'|q|c) break ;;
     esac
+  done
+  tui_draw
+}
+
+tui_menu() {     # the reader's menu (m): MENU_CMD = what to do ("" if closed without choosing)
+  local sel=0 i y w x0 top n label key val cmd dirty=1
+  local -a items
+  local -A rowsel=()
+  MENU_CMD=""
+  while :; do
+    sleep_label
+    items=("Settings|s||settings" "Voice|v|$(voice_label "$voice")|voice")
+    [ "$TUI_HAS_CHAPTERS" = 1 ] && items+=("Chapters|c|$TUI_CHAPTER|chapters")
+    items+=("Sleep timer|t|${SLEEP_LABEL:-off}|sleep" "Home screen|||home" "Stop|q|keeps your place|quit")
+    n=${#items[@]}
+    if [ "$dirty" = 1 ] || [ "$TUI_RESIZED" = 1 ]; then
+      TUI_RESIZED=0; dirty=0; tui_size
+      w=$(( CW < 46 ? CW : 46 )); x0=$(( (TW - w) / 2 + 1 ))
+      golden $(( FT_TEXT - 3 - n - 2 )); top=$(( 3 + REPLY ))  # on the golden line of the space above the footer
+      out '%s\033[%d;%dH%s%*s\033[%d;%dH  %sMenu%s%s' "$R" "$top" "$x0" "$SURF" "$w" "" "$top" "$x0" "$B" "$R" "$SURF"
+      rowsel=()
+      for (( i = 0; i < n; i++ )); do
+        IFS='|' read -r label key val cmd <<< "${items[i]}"
+        y=$(( top + 1 + i ))
+        local bg=$SURF mk=" "
+        [ "$i" = "$sel" ] && { bg=$PSEL; mk="$ACC▎$R$PSEL"; }
+        [ "${#val}" -gt $(( w - 22 )) ] && val="${val:0:$(( w - 23 ))}…"
+        out '\033[%d;%dH%s%*s\033[%d;%dH%s%s %s' "$y" "$x0" "$bg" "$w" "" "$y" "$x0" "$bg" "$mk" "$label"
+        [ -n "$val" ] && out '\033[%d;%dH%s%s%s' "$y" $(( x0 + w - 4 - ${#val} )) "$D" "$val" "$R$bg"
+        [ -n "$key" ] && out '\033[%d;%dH%s%s%s' "$y" $(( x0 + w - 2 )) "$ACC2" "$key" "$R$bg"
+        rowsel[$y]=$i
+      done
+      out '\033[%d;%dH%s%*s\033[%d;%dH  %s↑↓ Enter · Esc close%s' $(( top + 1 + n )) "$x0" "$SURF" "$w" "" $(( top + 1 + n )) "$x0" "$D" "$R"
+    fi
+    KEY=""; tick 0.25; [ -n "$KEY" ] || continue
+    dirty=1; cmd=""
+    case "$KEY" in
+      $'\033[A'|$'\033OA'|k|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
+      $'\033[B'|$'\033OB'|j|$'\033[<65;'*M) [ "$sel" -lt $(( n - 1 )) ] && sel=$(( sel + 1 )) ;;
+      $'\n'|$'\r'|" ") cmd=${items[sel]##*|} ;;
+      $'\033[<0;'*M) [[ "$KEY" =~ \;([0-9]+)M$ ]] && i=${rowsel[${BASH_REMATCH[1]}]:-} && [ -n "$i" ] && cmd=${items[i]##*|} ;;
+      s) cmd=settings ;; v) cmd=voice ;; t) cmd="sleep" ;; q) cmd=quit ;;
+      c) [ "$TUI_HAS_CHAPTERS" = 1 ] && cmd=chapters ;;
+      $'\033'|m) break ;;
+    esac
+    if [ "$cmd" = sleep ]; then sleep_cycle; continue; fi    # (the menu stays, showing the new time)
+    [ -n "$cmd" ] && { MENU_CMD=$cmd; break; }
   done
   tui_draw
 }
@@ -2483,6 +2560,20 @@ setting_change() { # setting_change ID STEP: ←/→ (-1/+1); 0 means Enter, a c
       [ "$step" = 0 ] && step=1
       t=$(( $(blend_amount) + step * 10 ))
       [ "$t" -ge 10 ] && [ "$t" -le 90 ] && tui_save KOKORO_BLEND "${KOKORO_BLEND%%:*}:$t" ;;
+    speed)
+      if [ "$step" = 0 ]; then tui_prompt "Speed, 0.5 to 2.0:" "$KOKORO_SPEED"
+        [[ "$ANSWER" =~ ^(0\.[5-9][0-9]?|1(\.[0-9]{1,2})?|2(\.0+)?)$ ]] && tui_save KOKORO_SPEED "$ANSWER"
+      else t=$(( $(speed_tenths) + step )); [ "$t" -ge 5 ] && [ "$t" -le 20 ] && tui_save KOKORO_SPEED "$(( t / 10 )).$(( t % 10 ))"; fi ;;
+    lang)
+      for i in "${!TUI_LANGS[@]}"; do [ "${TUI_LANGS[i]}" = "$KOKORO_LANG" ] && break; done
+      [ "$step" = 0 ] && step=1
+      tui_save KOKORO_LANG "${TUI_LANGS[$(( (i + step + ${#TUI_LANGS[@]}) % ${#TUI_LANGS[@]} ))]}" ;;
+    theme)                                    # auto → dark → light, shown at once
+      local themes=(auto dark light)
+      for i in "${!themes[@]}"; do [ "${themes[i]}" = "${KOKORO_THEME:-auto}" ] && break; done
+      [ "$step" = 0 ] && step=1
+      tui_save KOKORO_THEME "${themes[$(( (i + step + 3) % 3 ))]}"
+      tui_theme ;;
     out)
       tui_prompt "Save files as:" "$KOKORO_OUT"
       if [[ "$ANSWER" =~ ^[^/[:space:]]+\.(wav|mp3|ogg|flac)$ ]]; then tui_save KOKORO_OUT "$ANSWER"
@@ -2903,7 +2994,7 @@ jump_to() {      # jump_to PART
   start=$target; i=$target; was_parts=0          # (a part in this run's own numbering)
   write_job
   run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
-  if [ "$ui" = tui ]; then tui_hist=(); TUI_PART=0; TUI_WRAP=(); TUI_OFFS=(); TUI_INFO="$(voice_label "$voice") · ${speed}×"; tui_draw; fi
+  if [ "$ui" = tui ]; then tui_hist=(); TUI_PART=0; TUI_WRAP=(); TUI_OFFS=(); TUI_INFO="$(voice_label "$voice") · ${speed}×"; TUI_SPEED=$speed; tui_draw; fi
 }
 
 # Commands that change where or how it reads (from a key, a click or the menu).
@@ -2927,6 +3018,24 @@ listen_cmd() {   # listen_cmd CMD PART
                   if [ "$CH" -ge 0 ] && [ "$at" -gt "${CH_START[CH]}" ]; then JUMP=${CH_START[CH]}   # start of this one
                   elif [ "$CH" -gt 0 ]; then JUMP=${CH_START[CH - 1]}; fi ;;
     seek:*) JUMP=${cmd#seek:} ;;
+    menu)                                       # the menu: some choices are the player's to carry out
+      [ "$ui" = tui ] || return 0
+      tui_menu
+      case "$MENU_CMD" in
+        settings|voice|chapters) listen_cmd "$MENU_CMD" "$at" ;;
+        "") ;;
+        *) CMD_PENDING=$MENU_CMD ;;
+      esac ;;
+    settings|voice)                             # change things mid-listen: a new voice, speed or language
+      [ "$ui" = tui ] || return 0              # picks up at this part
+      local before after
+      before="$(voice_mix)|$KOKORO_SPEED|$KOKORO_LANG"
+      if [ "$cmd" = settings ]; then tui_settings; else tui_voices; fi
+      after="$(voice_mix)|$KOKORO_SPEED|$KOKORO_LANG"
+      if [ "$after" != "$before" ]; then
+        voice="$(voice_mix)"; speed=$KOKORO_SPEED; lang=$KOKORO_LANG; JUMP=$at
+      fi
+      tui_draw ;;
     *) return 1 ;;
   esac
   return 0
@@ -2940,6 +3049,8 @@ listen_cmd() {   # listen_cmd CMD PART
 
 MPV_PID=""; MPV_SOCK=""; MPV_IN=""; MPV_OUT=""; MPV_CARRY=""
 MPV_T=0; MPV_POS=-1; MPV_N=0       # seconds into the current part; playlist index; entries queued
+MPV_MAX=-1                         # the furthest playlist index reached (parts played while a menu was open)
+CMD_PENDING=""                     # a command chosen in the menu, for the player to carry out
 declare -A MPV_IDX=()              # part -> its playlist index
 MPV_PART=()                        # playlist index -> part
 
@@ -2969,7 +3080,8 @@ mpv_pump() {     # take in what mpv has reported since last time
       line=$MPV_CARRY$line; MPV_CARRY=""
       case "$line" in
         *'"name":"playback-time"'*) if [[ "$line" =~ \"data\":([0-9.]+) ]]; then MPV_T=${BASH_REMATCH[1]}; fi ;;
-        *'"name":"playlist-pos"'*) if [[ "$line" =~ \"data\":(-?[0-9]+) ]]; then MPV_POS=${BASH_REMATCH[1]}; fi ;;
+        *'"name":"playlist-pos"'*) if [[ "$line" =~ \"data\":(-?[0-9]+) ]]; then
+                                     MPV_POS=${BASH_REMATCH[1]}; [ "$MPV_POS" -gt "$MPV_MAX" ] && MPV_MAX=$MPV_POS; fi ;;
       esac
     else
       MPV_CARRY+=$line             # half a line: the rest comes next time
@@ -2988,7 +3100,7 @@ mpv_queue() {    # mpv_queue PART WAV: add a part to the playlist (it plays at o
 }
 mpv_stop() {     # empty the playlist (a jump starts again from a new part)
   [ -n "$MPV_PID" ] && mpv_send '"stop"'
-  MPV_IDX=(); MPV_PART=(); MPV_N=0; MPV_POS=-1; MPV_T=0
+  MPV_IDX=(); MPV_PART=(); MPV_N=0; MPV_POS=-1; MPV_T=0; MPV_MAX=-1
   return 0
 }
 mpv_quit() {
@@ -2996,6 +3108,21 @@ mpv_quit() {
   [ -n "$MPV_SOCK" ] && rm -f "$MPV_SOCK"
   MPV_PID=""
   return 0
+}
+
+player_bg() {    # keep mpv's playlist fed (also from tick, while a menu or settings is open)
+  local k f
+  mpv_pump
+  [ "$MPV_N" -gt 0 ] || return 0
+  k=$(( MPV_PART[MPV_N - 1] + 1 ))
+  printf -v f '%s/stream/%04d.wav' "$tmpd" "$k"
+  if [ -f "$f" ] && ! sleep_due "$k"; then mpv_queue "$k" "$f"; fi   # (not past where the sleep timer stops)
+  return 0
+}
+
+go_home() {      # stop (keeping the place) and open the home screen
+  [ "${KOKORO_QUEUE:-0}" = 1 ] && exit "$QUIT_RC"          # (from the queue: just stop it)
+  trap - EXIT; cleanup; exec "$0"
 }
 
 play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause / next / again
@@ -3007,24 +3134,22 @@ play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause
   mpv_start
   [ -n "${MPV_IDX[$i]+x}" ] || mpv_queue "$i" "$wav"
   idx=${MPV_IDX[$i]}
+  mpv_pump
+  # Already heard (it played on while a menu was open): on to the next.
+  if [ "$idx" -lt "$MPV_MAX" ] || { [ "$idx" = "$MPV_MAX" ] && [ "$MPV_POS" = -1 ]; }; then return 0; fi
+  TICK_BG=player_bg
   view_part "$i" "$base"
   in_line=1
   echo playing > "$PLAYER_STATE"
   # Nothing in this loop starts a process: it runs ~30 times a second on a phone.
   while :; do
-    mpv_pump
-    # The next part goes in the playlist as soon as it's made, so there's no gap
-    # (unless the sleep timer stops before it).
+    player_bg                                 # the next part goes in the playlist as soon as it's made
     k=$(( i + 1 ))
-    if [ -z "${MPV_IDX[$k]+x}" ]; then
-      printf -v f '%s/stream/%04d.wav' "$tmpd" "$k"
-      [ -f "$f" ] && ! sleep_due "$k" && mpv_queue "$k" "$f"
-    fi
     if [ "$MPV_POS" = "$idx" ]; then started=1
     elif [ "$started" = 1 ] || { [ "$MPV_POS" -gt "$idx" ] 2>/dev/null; }; then break   # on to the next, or done
     else waited=$(( waited + 1 )); [ "$waited" -lt 300 ] || break; fi                  # (mpv never got to it)
-    cmd=""                                    # kokoro --pause / --next / --again, or a key or click
-    if [ -f "$CONTROL" ]; then read -r cmd < "$CONTROL" || cmd=""; rm -f "$CONTROL"; fi
+    cmd=$CMD_PENDING; CMD_PENDING=""         # the menu's choice, kokoro --pause / --next / --again, or a key or click
+    if [ -z "$cmd" ] && [ -f "$CONTROL" ]; then read -r cmd < "$CONTROL" || cmd=""; rm -f "$CONTROL"; fi
     if [ -z "$cmd" ] && [ -n "$KEY" ]; then key_cmd; cmd=$CMD; fi
     if [ -n "$cmd" ]; then
       case "$cmd" in
@@ -3040,6 +3165,7 @@ play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause
         again) mpv_send '"seek",0,"absolute"'; mpv_send '"set_property","pause",false'
                paused=0; cur=-1; lit=-2; last=""; continue ;;
         quit)  exit "$QUIT_RC" ;;                 # the bookmark is kept; cleanup says where
+        home)  go_home ;;
         *)     if listen_cmd "$cmd" "$i"; then
                  last=""
                  [ -n "$JUMP" ] && break      # jump_to empties the playlist
@@ -3078,7 +3204,7 @@ play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause
     if [ "$label|playing" != "$last" ]; then view_state "Playing" "$label" "▶"; last="$label|playing"; fi
     tick 0.03
   done
-  in_line=0
+  TICK_BG=""; in_line=0
   view_part_end
 }
 __KOKOMUX_PLAYER__
@@ -3374,7 +3500,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
 # localhost (fast); otherwise each call starts the container (slower).
 set -euo pipefail
 
-KOKOMUX_VERSION="0.15.2"
+KOKOMUX_VERSION="0.15.3"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -3656,7 +3782,7 @@ stop_playback() {
 # gone and bash crashes (seen with bash 5.2). So during the wait the signal only
 # sets a flag, and tick exits once read has returned.
 
-STOP=""; IN_TICK=0; KEY=""; CMD=""; KBD=""; KEYS_TTY=""
+STOP=""; IN_TICK=0; KEY=""; CMD=""; KBD=""; KEYS_TTY=""; TICK_BG=""
 exec {TICK}<> <(:)                    # read -t on this is a sleep with no process
 now_ms() { local t=${EPOCHREALTIME//[!0-9]/}; NOW=$(( t / 1000 )); }   # no subshell: called every frame
 keys_on() {      # read keys from the terminal, unechoed (restored on exit)
@@ -3670,6 +3796,7 @@ keys_off() { [ -n "$KEYS_TTY" ] && stty "$KEYS_TTY" 2>/dev/null </dev/tty; KEYS_
 tick() {
   local c rest=""
   [ -n "${FRAME:-}" ] && flush          # the frame drawn since the last wait, in one write
+  [ -n "${TICK_BG:-}" ] && "$TICK_BG"    # the player keeping mpv fed, while a menu is open
   IN_TICK=1; KEY=""
   if [ -n "$KBD" ]; then
     if IFS= read -rsn1 -d '' -t "$1" -u "$KBD" KEY && [ "$KEY" = $'\033' ]; then
@@ -3696,6 +3823,9 @@ key_cmd() {      # what KEY asks for (or a clicked button): see the player for e
     -|_) CMD=slower ;;
     t|T) CMD="sleep" ;;
     c|C) CMD=chapters ;;
+    m|M) CMD=menu ;;
+    s|S) CMD=settings ;;
+    v|V) CMD=voice ;;
     ']') CMD=next_chapter ;;
     '[') CMD=prev_chapter ;;
     $'\033[<'*M) [ "${ui:-}" = tui ] && tui_click "$KEY" ;;
@@ -4186,7 +4316,7 @@ WAKE=0                                          # an audiobook can take a while:
 if [ "$ext" = m4b ] && command -v termux-wake-lock >/dev/null && termux-wake-lock >/dev/null 2>&1; then WAKE=1; fi
 run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
 if [ "$ui" = tui ]; then
-  TUI_TITLE=$name; TUI_INFO="$(voice_label "$voice") · ${speed}×"; tui_open
+  TUI_TITLE=$name; TUI_INFO="$(voice_label "$voice") · ${speed}×"; TUI_SPEED=$speed; tui_open
 fi
 
 i=$start
@@ -4212,6 +4342,8 @@ while :; do
     if [ -n "$KEY" ]; then
       key_cmd; [ "$CMD" = quit ] && exit "$QUIT_RC"
       [ -n "$CMD" ] && listen_cmd "$CMD" "$i" && [ -n "$JUMP" ] && { jump_to "$JUMP"; JUMP=""; }
+      case "$CMD_PENDING" in quit) exit "$QUIT_RC" ;; home) go_home ;; esac   # (chosen in the menu)
+      CMD_PENDING="${CMD_PENDING/toggle/}"
     fi
   fi
 done

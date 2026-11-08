@@ -38,7 +38,7 @@ def draw(focus=1, a=41, b=49, ease_ms=None, extra=""):
         script = f"""
 now_ms() {{ local t=${{EPOCHREALTIME//[!0-9]/}}; NOW=$(( t / 1000 )); }}
 . {SRC}/theme.sh; theme_apply; . {SRC}/tui.sh
-tmpd={d}; TW=104 TH=34 CW=76 LM=14 TUI_FOCUS={focus}
+tmpd={d}; TW=104 TH=34; tui_layout; TUI_FOCUS={focus}
 tui_hist=(1 2 3 4); TUI_PART=5 TUI_PARTS=9 TUI_A={a} TUI_B={b}
 {ease} {extra}
 tui_text; flush; echo "ease_at=$TUI_EASE_AT" >&2   # (a frame is written in one go)

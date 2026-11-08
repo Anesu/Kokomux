@@ -93,7 +93,7 @@ kokoro --stop                             # stop playback
 
 On a terminal, `kokoro -p` opens a full-screen reader. Across the top are the title, voice and speed. In the middle is a reading column, with what you've heard above it, the part being read marked with a bar and the spoken word lit, and what's coming next dimmed below. The part being read sits on the golden line, 38% of the way down, where the eye naturally rests.
 
-**The focus effect.** Like a camera's depth of field, the text fades the further it is from the part being read, down to a faint ghost at the edges of the screen, so your eye stays on the line being spoken. Ahead of the voice, the next few words are in sharpest focus and the rest of the sentence settles behind them. When a part ends, it eases out of focus over about a third of a second as the next one comes in. The fade follows the golden ratio: a quarter of a golden step for every half-line or so, never fainter than 14.6% of the way from the background to the text. A terminal can't blur text, so the effect works with brightness alone. If you'd rather see everything evenly, turn off **Focus effect** in the settings (or set `KOKORO_FOCUS=0`). At the bottom are a progress bar and a row of buttons. The column stays at a comfortable reading width, so it works on a phone held upright and just as well on a wide Samsung DeX or tablet screen. It follows the window when you resize it.
+**The focus effect.** Like a camera's depth of field, the text fades the further it is from the part being read, down to a faint ghost at the edges of the screen, so your eye stays on the line being spoken. Ahead of the voice, the next few words are in sharpest focus and the rest of the sentence settles behind them. When a part ends, it eases out of focus over about a third of a second as the next one comes in. The fade follows the golden ratio: a quarter of a golden step for every half-line or so, never fainter than 14.6% of the way from the background to the text. A terminal can't blur text, so the effect works with brightness alone. If you'd rather see everything evenly, turn off **Focus effect** in the settings (or set `KOKORO_FOCUS=0`). At the bottom: what's happening, a progress bar, the play controls, and a quieter row with the speed, sleep timer, chapters and menu. The column stays at a comfortable reading width, so it works on a phone held upright and just as well on a wide Samsung DeX or tablet screen. It follows the window when you resize it.
 
 <p>
   <img src="docs/reader-wide.png" width="68%" alt="The reader on a wide screen: header, centred reading column with the spoken word highlighted, progress bar and buttons">
@@ -102,15 +102,20 @@ On a terminal, `kokoro -p` opens a full-screen reader. Across the top are the ti
 
 | Key | Click or tap | Does |
 |---|---|---|
-| Space | **Pause** / **Play** | pause, or carry on |
-| → | **Next** | skip to the next part |
-| ← | **Again** | hear this part again |
-| q or Esc | **Stop** | stop, keeping your place |
+| Space | **‖ Pause** / **▶ Play** | pause mid-word, or carry on from there |
+| → | **Next ›** | skip to the next part |
+| ← | **‹ Again** | hear this part again |
+| − and + | **−** / **+** either side of the speed | change the speed while it plays, in steps of 0.1× |
+| t | **☾ Sleep** | sleep timer: 15, 30 or 60 minutes, or the end of the chapter |
 | c | **Chapters** | the book's chapters: pick one to jump there (EPUBs) |
 | [ and ] | | the previous or next chapter |
-| − and + | **Slower** / **Faster** | change the speed while it plays, in steps of 0.1× |
-| t | **Sleep** | sleep timer: 15, 30 or 60 minutes, or the end of the chapter |
+| m | **≡ Menu** | settings, voice, chapters, sleep timer, the home screen, stop |
+| s | | settings, without leaving the book |
+| v | | choose a voice |
+| q or Esc | Menu → **Stop** | stop, keeping your place |
 | | the progress bar | click or tap it to jump to that point |
+
+Above the bar, a line says what's happening (playing, paused, how much of the book is made) and where you are (chapter, part). Playback carries on while the menu or settings are open; a new voice, speed or language starts again at the part you're on.
 
 When the sleep timer runs out, the part being read finishes and playback stops, keeping your place. The reader shows the chapter you're in beside the progress bar.
 
