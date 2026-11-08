@@ -39,8 +39,8 @@ class FakeKokoro:
     def get_voice_style(self, name):
         return np.full((510, 1, 256), STYLES[name], dtype=np.float32)
 
-    def create(self, text, voice, speed=1.0, lang="en-us"):
-        self.calls.append((text, voice, lang))
+    def create(self, text, voice, speed=1.0, lang="en-us", is_phonemes=False):
+        self.calls.append((text, voice, lang) + (("phonemes",) if is_phonemes else ()))
         return np.full(len(text) * PER_CHAR, 0.5, dtype=np.float32), RATE
 
 
@@ -207,6 +207,48 @@ def test_a_bookmark_from_older_parts_lands_in_the_same_place():
         assert abs(first - (1 + parts // 2)) <= 1
     finally:
         shutil.rmtree(jobdir)
+
+
+class Token:
+    def __init__(self, text, phonemes):
+        self.text, self.phonemes = text, phonemes
+
+
+class FakeMisaki:
+    """Reads each word as its own name in capitals, splitting "don't" the way spaCy does."""
+    def __call__(self, text):
+        toks = []
+        for w in text.replace("n't", " n't").split():
+            core = w.strip(".,;?!")
+            if core:
+                toks.append(Token(core, core.upper()))
+            for p in w[len(core):] if w.startswith(core) else "":
+                toks.append(Token(p, p))
+        return " ".join(t.phonemes for t in toks), toks
+
+
+def test_dictionary_sounds_per_word_follow_the_highlighted_words():
+    ps, per = engine.dictionary_phonemes(FakeMisaki(), "Well, don't read it.")
+    assert ps.startswith("WELL") and per == ["WELL", "DON'T", "READ", "IT"]
+
+
+@needs_audio
+def test_dictionary_pronunciation_for_english_only():
+    old = dict(engine._g2p)
+    engine._g2p.update({False: FakeMisaki(), True: FakeMisaki()})
+    try:
+        jobdir, made = run("Well, read it.", pronunciation="dictionary")
+        shutil.rmtree(jobdir)
+        assert made[engine.MODEL].calls[0][0] == "WELL , READ IT ." and made[engine.MODEL].calls[0][-1] == "phonemes"
+        jobdir, made = run("Bonjour.", pronunciation="dictionary", lang="fr-fr")
+        shutil.rmtree(jobdir)
+        assert made[engine.MODEL].calls[0][0] == "Bonjour." and made[engine.MODEL].calls[0][-1] != "phonemes"
+        jobdir, made = run("Well, read it.", pronunciation="standard")
+        shutil.rmtree(jobdir)
+        assert made[engine.MODEL].calls[0][0] == "Well, read it."
+    finally:
+        engine._g2p.clear()
+        engine._g2p.update(old)
 
 
 if __name__ == "__main__":

@@ -538,6 +538,7 @@ TUI_SETTINGS=(
   "speed|Speed|How fast it reads, from 0.5× to 2×. Use ← and → to change it in steps of 0.1."
   "lang|Language|How words are pronounced. Choosing a voice sets this to match; change it to read another language."
   "quality|Voice quality|Standard is the 92 MB model: quick, and light on the battery. High is the same voice at full precision (a 326 MB download): cleaner, but each sentence takes longer to make."
+  "pronunciation|English pronunciation|Standard uses espeak, built in. Dictionary uses misaki, the tool Kokoro was trained with: it gets words like read, record and \$42.50 right (an extra 260 MB). English voices only."
   "out|Save files as|The file name used when you save without -o. The ending picks the format: .wav .mp3 .ogg or .flac."
   "#Reading"
   "KOKORO_TUI|Full-screen reader|Open the full-screen reader when you listen on a terminal. Off: show the text below the command instead."
@@ -575,6 +576,11 @@ setting_value() {  # what the row shows on the right for setting $1
       if [ "$KOKORO_QUALITY" = high ]; then printf '‹ %sHigh%s ›' "$ACC2" "$R"; t="326 MB"
         hq_ready || t="not downloaded yet"
       else printf '‹ %sStandard%s ›' "$ACC2" "$R"; t="92 MB"; fi
+      [ "$SET_NARROW" = 1 ] || printf '  %s%s%s' "$D" "$t" "$R" ;;
+    pronunciation)
+      if [ "$KOKORO_PRONUNCIATION" = dictionary ]; then printf '‹ %sDictionary%s ›' "$ACC2" "$R"
+        t="misaki"; dict_ready || t="not installed yet"
+      else printf '‹ %sStandard%s ›' "$ACC2" "$R"; t="espeak"; fi
       [ "$SET_NARROW" = 1 ] || printf '  %s%s%s' "$D" "$t" "$R" ;;
     speed)
       local w=15; [ "$SET_NARROW" = 1 ] && w=9
@@ -647,6 +653,21 @@ setting_change() { # setting_change ID STEP: ←/→ (-1/+1); 0 means Enter, a c
       [ "$step" = 0 ] && step=1
       tui_save KOKORO_THEME "${themes[$(( (i + step + 3) % 3 ))]}"
       tui_theme ;;
+    pronunciation)
+      if [ "$KOKORO_PRONUNCIATION" = dictionary ]; then
+        tui_save KOKORO_PRONUNCIATION standard
+        dict_ready && SETTINGS_NOTE="Standard. The dictionary stays installed: kokoro --pronunciation standard can remove it."
+      elif dict_ready; then tui_save KOKORO_PRONUNCIATION dictionary
+      else
+        tui_prompt "Install the pronunciation dictionary now (about 260 MB)? (y/N)"
+        [[ "$ANSWER" =~ ^[Yy] ]] || return 0
+        tui_cooked; printf '\033[0m\033[?1049l' >&2              # the install, in the open
+        "$0" --pronunciation dictionary </dev/tty >/dev/tty 2>&1 || true
+        read -r -p "Press Enter to go back to the settings. " _ </dev/tty || true
+        printf '\033[?1049h' >&2; tui_raw
+        if dict_ready; then tui_save KOKORO_PRONUNCIATION dictionary
+        else SETTINGS_NOTE="The install didn't finish. Choose Dictionary again to retry."; fi
+      fi ;;
     out)
       tui_prompt "Save files as:" "$KOKORO_OUT"
       if [[ "$ANSWER" =~ ^[^/[:space:]]+\.(wav|mp3|ogg|flac)$ ]]; then tui_save KOKORO_OUT "$ANSWER"

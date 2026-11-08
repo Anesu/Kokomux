@@ -65,6 +65,16 @@ kokoro --stop                             # stop playback
 ## Better-sounding speech
 
 - **Voice quality.** kokomux normally uses the 8-bit version of Kokoro (92 MB). It's quick and light on the battery, but it can sound faintly buzzy. `kokoro --quality high` downloads the full-precision model (326 MB) and switches to it, for a cleaner voice. Each sentence then takes longer to make, so try it on your phone and see whether playback keeps up. `kokoro --quality standard` switches back, and offers to delete the big model. It's also in the settings, as **Voice quality**.
+- **English pronunciation.** Kokoro normally turns text into sounds with espeak, which gets some English words wrong. `kokoro --pronunciation dictionary` installs misaki, the dictionary-based tool Kokoro was trained with, and uses it for English (American and British). It picks the right reading from the sentence:
+
+  | | espeak | dictionary |
+  |---|---|---|
+  | "I **read** the book yesterday" | "reed" | "red" |
+  | "please **record** the record" | "REC-ord" both times | "re-CORD", then "REC-ord" |
+  | "**wind** the clock" | "wind", as in breeze | "wynd" |
+  | "$42.50" | "dollar forty-two point five zero" | "forty-two dollars and fifty cents" |
+
+  It's an extra 260 MB (spaCy and its small English model, no PyTorch) and takes a few minutes to install. It adds a few seconds when Kokoro starts, but almost nothing per sentence. Words it doesn't know still go to espeak, and other languages always use espeak. Word highlighting works the same. `kokoro --pronunciation standard` switches back, and offers to remove it. It's also in the settings, as **English pronunciation**.
 - **Blend voices.** Mix two (or up to four) voices into one of your own: `-v af_heart:70+bf_emma:30` is 70% `af_heart` and 30% `bf_emma`, and `af_heart+af_bella` is half and half. In the settings, **Blend with** picks the second voice and **Blend amount** sets how much of it you hear (10% to 90%). Press Space on either to hear the mix. `af_heart` and `af_bella` are Kokoro's strongest voices, so they make a good base.
 - **Smooth joins.** A long text is read in parts of a few whole sentences each (up to 360 characters), never across a paragraph. Each part ends with a pause that fits where it is: 0.25 s after a sentence, as Kokoro pauses inside a part, then longer after a paragraph (0.65 s) and a chapter (1.06 s). Those are golden-ratio steps. The edges of each part are softened by a few milliseconds, so they can't click. Saved files get the same pauses.
 - **Text made speakable.** Before reading, kokomux tidies what's meant for the eye:
@@ -207,6 +217,7 @@ Before 0.8, a separate speech recogniser (Whistle) listened to each line to find
   - **Speed:** a slider from 0.5× to 2×.
   - **Language:** cycle through Kokoro's nine languages.
   - **Voice quality:** Standard, or High, which offers to download the full-precision model (see [Better-sounding speech](#better-sounding-speech)).
+  - **English pronunciation:** Standard (espeak), or Dictionary (misaki), which offers to install it.
   - **Save files as:** the default file name.
 - **Reading:**
   - **Full-screen reader:** on or off.
@@ -252,6 +263,7 @@ Kokoro's Python packages (`onnxruntime`, `espeakng-loader`, `soundfile`) only sh
 - **`kokoro`** (Termux side): reads your text, starts or uses the server, and hands each run to the player.
 - **`player.sh`, `tui.sh` and `theme.sh`** (Termux side): play the audio with `play-audio`, and draw the reader, home screen and settings in colours made from the terminal's own.
 - **`engine.py`** (inside Debian): splits the text into sentences and runs Kokoro. With `-p` it hands back audio one chunk at a time, so playback starts after the first sentence.
+- **misaki** (inside Debian, optional): with **English pronunciation: Dictionary**, turns English into sounds the way Kokoro was trained, using spaCy to tell a noun from a verb.
 - **`words.py`** (inside Debian): turns Kokoro's per-sound timings into word timings, for the highlight.
 - **Sharing files:** the two sides exchange text and audio through `$PREFIX/tmp`, which the container sees as `/tmp`.
 

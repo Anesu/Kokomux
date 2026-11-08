@@ -21,7 +21,7 @@ CFG
     apt-get update
     apt-get install -y --no-install-recommends python3 python3-venv ca-certificates
     ;;
-  pip)
+  pip)   # setup.sh pip [standard|dictionary]: dictionary also keeps misaki for English
     mkdir -p "$APP"
     [ -x "$APP/venv/bin/python" ] || python3 -m venv "$APP/venv"
     "$APP/venv/bin/pip" install --upgrade pip
@@ -29,8 +29,17 @@ CFG
     "$APP/venv/bin/pip" install --upgrade kokoro-onnx soundfile pypdf | tee /tmp/kokoro-setup/.pip
     # Before 0.8, Whistle (cactus-compute) timed the words; Kokoro does that itself now.
     # It and the packages only it needed are removed (about 54 MB).
+    # (tqdm, click, anyio and h11 stay when the pronunciation dictionary is installed: spaCy needs them.)
+    shared="tqdm click anyio h11"
+    compgen -G "$APP/venv/lib/python3*/site-packages/misaki" >/dev/null && shared=""
+    # shellcheck disable=SC2086
     "$APP/venv/bin/pip" uninstall -y cactus-compute pillow huggingface-hub hf-xet fsspec filelock \
-      tqdm pyyaml click anyio h11 httpcore2 httpx2 truststore 2>/dev/null || true
+      pyyaml httpcore2 httpx2 truststore $shared 2>/dev/null || true
+    if [ "${2:-}" = dictionary ]; then   # the same packages as kokoro --pronunciation dictionary
+      "$APP/venv/bin/pip" install --upgrade "misaki>=0.7.4,<0.8" num2words "spacy>=3.8,<3.9" \
+        "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" \
+        | tee -a /tmp/kokoro-setup/.pip
+    fi
     grep -q '^Successfully installed' /tmp/kokoro-setup/.pip || printf 'up to date' > "$SRC/.note"
     cp "$SRC/engine.py" "$SRC/words.py" "$APP/"
     rm -f "$APP/speak.py"   # from older versions

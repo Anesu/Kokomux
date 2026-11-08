@@ -12,7 +12,7 @@ or through the background server:
   engine.py forget-high                     delete the full-precision model
 
 A job folder holds `job` (key=value lines: voice, speed, lang, and optionally
-quality, url, out, stream, words, start, of, gap_ms) and `in.txt` (the text,
+quality, pronunciation, url, out, stream, words, start, of, gap_ms) and `in.txt` (the text,
 unless url is set). A voice can be a blend: af_heart:70+bf_emma:30. Output goes into
 the same folder: `out.<ext>` for a saved file, and with stream=1 one WAV per
 chunk in `stream/0001.wav`, `stream/0002.wav`, ... followed by `stream/end`.
@@ -128,6 +128,50 @@ def voice_style(engine, spec):
     import numpy as np
     style = sum((w / total) * np.asarray(engine.get_voice_style(n), dtype=np.float32) for n, w in weights)
     return style.astype(np.float32)
+
+
+# --- pronunciation ------------------------------------------------------------
+# Kokoro turns text into sounds with espeak. For English it can instead use misaki,
+# the dictionary-based tool Kokoro was trained with: it reads "I read it
+# yesterday", "record the record" and "$42.50" the way people say them. It's an
+# optional extra (spaCy and an English model, about 260 MB: kokoro --pronunciation
+# dictionary). Without it, or for other languages, espeak it is.
+PRONUNCIATIONS = ("standard", "dictionary")
+_g2p = {}
+_g2p_lock = threading.Lock()
+
+
+def g2p_for(lang, pronunciation):
+    """misaki's English G2P for this job, or None to use espeak (load once, then keep)."""
+    if pronunciation != "dictionary" or lang not in ("en-us", "en-gb"):
+        return None
+    british = lang == "en-gb"
+    with _g2p_lock:
+        if british not in _g2p:
+            try:
+                from misaki import en, espeak
+                # Words it doesn't know go to espeak, the copy kokoro-onnx already set up.
+                _g2p[british] = en.G2P(trf=False, british=british, fallback=espeak.EspeakFallback(british=british))
+            except Exception as e:      # not installed, or its English model is missing
+                log(f"Dictionary pronunciation isn't available ({e.__class__.__name__}: {e}); using espeak.")
+                _g2p[british] = None
+        return _g2p[british]
+
+
+def dictionary_phonemes(g2p, text):
+    """A part's sounds from misaki, and each highlighted word's own sounds, taken from the
+    same reading of the sentence (so "read" is "red" in both), for lining up its timing."""
+    import words
+    ps, tokens = g2p(text)
+    spans, pos = [], 0
+    for t in tokens:                    # where misaki's tokens ("Do", "n't") sit in the text
+        at = text.find(t.text, pos)
+        if at < 0:
+            continue
+        spans.append((at, at + len(t.text), t.phonemes or ""))
+        pos = at + len(t.text)
+    per = ["".join(p for s, e, p in spans if s < b and e > a) for a, b in words._tokens(text)]
+    return (ps or "").replace("❓", "").strip(), per
 
 
 def phonemize_many(words, lang, engine=None):
@@ -594,6 +638,9 @@ def run_job(path):
         log("The high-quality model isn't downloaded (kokoro --quality high); using the standard one.")
 
     voice = voice_style(engine, job.get("voice", "af_heart"))
+    pronunciation = job.get("pronunciation", "standard")
+    if pronunciation not in PRONUNCIATIONS:
+        raise JobError(f"Pronunciation must be one of: {', '.join(PRONUNCIATIONS)}")
     try:
         speed = float(job.get("speed", "1.0"))
     except ValueError:
@@ -601,6 +648,7 @@ def run_job(path):
     if not 0.5 <= speed <= 2.0:
         raise JobError("Speed must be between 0.5 and 2.0")
     lang = job.get("lang", "en-us")
+    g2p = g2p_for(lang, pronunciation)
 
     out = job.get("out")
     if out:
@@ -666,10 +714,23 @@ def run_job(path):
                 raise JobError("Cancelled")
             _write_atomic(os.path.join(jobdir, "progress"), f"{i} {len(chunks)}\n")
             with SYNTH_LOCK:
+                ps, per = None, None
+                if g2p is not None:
+                    try:
+                        ps, per = dictionary_phonemes(g2p, chunk)
+                    except Exception as e:      # an odd part: espeak reads this one
+                        log(f"Dictionary pronunciation failed on part {i} ({e.__class__.__name__}); using espeak.")
+                        ps = None
                 if timed:
                     import words
-                    samples, rate, timings = engine.create_timed(chunk, voice=voice, speed=speed, lang=lang)
-                    marks = words.words_from_timings(chunk, timings, lambda ws: phonemize_many(ws, lang, engine))
+                    if ps:
+                        samples, rate, timings = engine.create_timed(ps, voice=voice, speed=speed, lang=lang, is_phonemes=True)
+                        marks = words.words_from_timings(chunk, timings, lambda ws: per)
+                    else:
+                        samples, rate, timings = engine.create_timed(chunk, voice=voice, speed=speed, lang=lang)
+                        marks = words.words_from_timings(chunk, timings, lambda ws: phonemize_many(ws, lang, engine))
+                elif ps:
+                    samples, rate = engine.create(ps, voice=voice, speed=speed, lang=lang, is_phonemes=True)
                 else:
                     samples, rate = engine.create(chunk, voice=voice, speed=speed, lang=lang)
             samples = edges(samples, rate)
@@ -727,7 +788,7 @@ def _write_atomic(path, text):
 
 # ------------------------------------------------------------------ server
 
-def serve(port, idle, quality="standard"):
+def serve(port, idle, quality="standard", pronunciation="standard"):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import parse_qs, urlparse
 
@@ -735,6 +796,7 @@ def serve(port, idle, quality="standard"):
     SERVING = True
     log("Loading model...")
     tts(quality)
+    g2p_for("en-us", pronunciation)     # (a few seconds: worth doing before the first job)
     token = secrets.token_hex(16)
     state = {"last": time.time(), "busy": 0}
 
@@ -925,6 +987,8 @@ def main():
     s.add_argument("--port", type=int, default=8880)
     s.add_argument("--idle", type=int, default=1800, help="stop after this many idle seconds (0 = never)")
     s.add_argument("--quality", choices=QUALITIES, default="standard", help="the model to load first")
+    s.add_argument("--pronunciation", choices=PRONUNCIATIONS, default="standard",
+                   help="dictionary: load misaki for English up front")
     v = sub.add_parser("voices")
     v.add_argument("--plain", action="store_true", help="one name per line")
     v.add_argument("--width", type=int, default=60)
@@ -944,7 +1008,7 @@ def main():
         except JobError as e:
             sys.exit(f"Error: {e}")
     elif a.cmd == "serve":
-        serve(a.port, a.idle, a.quality)
+        serve(a.port, a.idle, a.quality, a.pronunciation)
     elif a.cmd == "voices":
         names = sorted(tts().get_voices())
         if a.plain:
