@@ -190,7 +190,9 @@ step() {
     if [ "$VERBOSE" = 1 ]; then
       set +e; ( "$@" ) 2>&1 < /dev/null | tee -a "$LOG"; rc=${PIPESTATUS[0]}; set -e
     else
-      ( "$@" ) >> "$LOG" 2>&1 < /dev/null || rc=$?
+      # Not `( ... ) || rc=$?`: that would switch off set -e inside the step, so a
+      # step could pass here and fail on a terminal (where it runs as below).
+      set +e; ( set -e; "$@" ) >> "$LOG" 2>&1 < /dev/null; rc=$?; set -e
     fi
   fi
 
@@ -464,9 +466,15 @@ voice_test() {
   if command -v termux-clipboard-get >/dev/null && timeout 4 termux-clipboard-get >/dev/null 2>&1; then
     touch "$WORK/.api"
   fi
-  local root
+  # The container's size, for the summary. Only a nicety: du complains about the
+  # odd file it can't read inside a proot container, and that mustn't fail the step.
+  local root size
   for root in "$PREFIX/var/lib/proot-distro/containers/$DISTRO" "$PREFIX/var/lib/proot-distro/installed-rootfs/$DISTRO"; do
-    if [ -d "$root" ]; then du -sm "$root" 2>/dev/null | cut -f1 > "$WORK/.size"; break; fi
+    if [ -d "$root" ]; then
+      size="$(du -sm "$root" 2>/dev/null | cut -f1)" || true
+      [ -n "$size" ] && echo "$size" > "$WORK/.size"
+      break
+    fi
   done
   note "sounds good"
 }
