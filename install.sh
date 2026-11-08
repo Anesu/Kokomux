@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.15.0"
+KOKOMUX_VERSION="0.15.1"
 DISTRO=kokoro
 
 ASSUME_YES=0; VERBOSE=0
@@ -405,7 +405,8 @@ step() {
       el=$(( SECONDS - t0 ))
       local tm=""; [ "$el" -ge 3 ] && tm=" $(human_time "$el")"
       room=$(( W - 9 - ${#tag} - ${#title} - ${#tm} ))   # stay off the last column
-      printf '\r\033[K  %s%s%s %s%s%s %s%s  %s%s%s%s' "$ACC" "${SPIN[i % 10]}" "$R" "$D" "$tag" "$R" \
+      # (with line wrapping off while it's drawn: a line too long for the screen is cut, not wrapped)
+      printf '\033[?7l\r\033[K  %s%s%s %s%s%s %s%s  %s%s%s%s\033[?7h' "$ACC" "${SPIN[i % 10]}" "$R" "$D" "$tag" "$R" \
         "$B$title" "$R" "$(step_detail "$room")" "$D" "$tm" "$R"
       i=$((i + 1)); sleep 0.12
     done
@@ -3344,7 +3345,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
 # localhost (fast); otherwise each call starts the container (slower).
 set -euo pipefail
 
-KOKOMUX_VERSION="0.15.0"
+KOKOMUX_VERSION="0.15.1"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -4227,7 +4228,13 @@ __KOKOMUX_WRAPPER__
 
 termux_packages() {
   local apt_opts=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+  export DEBIAN_FRONTEND=noninteractive
+  # Finish anything an earlier run left half set up, then bring Termux up to date:
+  # new packages (mpv, ffmpeg) installed onto older libraries can't be configured.
+  dpkg --configure -a --force-confdef --force-confold || true
   pkg update "${apt_opts[@]}"
+  apt-get "${apt_opts[@]}" --fix-broken install || true
+  pkg upgrade "${apt_opts[@]}"
   # mpv plays (gaplessly), socat talks to it, ffmpeg makes audiobooks.
   pkg install "${apt_opts[@]}" proot-distro curl mpv socat ffmpeg termux-api
   pkg uninstall -y play-audio >/dev/null 2>&1 || true     # (before 0.15)
@@ -4366,7 +4373,7 @@ voice_test() {
 [ "$MODE" = update ] && blank
 hide_cursor
 step "Termux packages" \
-  "Termux couldn't download packages. Pick another mirror with termux-change-repo, then run pkg upgrade." \
+  "Termux couldn't install its packages. Run: dpkg --configure -a && pkg upgrade, then the installer again. If downloads fail, pick another mirror with termux-change-repo." \
   termux_packages
 step "Debian container" \
   "Check that you have enough free space and a steady connection." \
