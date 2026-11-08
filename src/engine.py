@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+"""kokomux engine. Runs inside the "kokoro" Debian container.
+
+The `kokoro` command in Termux writes a job folder under /tmp/kokoro.XXXXXX
+(Termux's $PREFIX/tmp, shared with the container) and runs it either one-off
+or through the background server:
+
+  engine.py job /tmp/kokoro.XXXXXX/job      run one job
+  engine.py serve [--port N] [--idle SECS]  keep the model loaded, serve jobs
+  engine.py voices                          list voice names
+  engine.py download                        fetch model files (resumable)
+
+A job folder holds `job` (key=value lines: voice, speed, lang, and optionally
+url, out, stream) and `in.txt` (the text, unless url is set). Output goes into
+the same folder: `out.<ext>` for a saved file, and with stream=1 one WAV per
+chunk in `stream/0001.wav`, `stream/0002.wav`, ... followed by `stream/end`.
+"""
+import argparse
+import hmac
+import os
+import re
+import secrets
+import sys
+import threading
+import time
+import urllib.request
+from html.parser import HTMLParser
+
+APP = os.path.dirname(os.path.abspath(__file__))
+MODELS = os.path.join(APP, "models")
+MODEL = os.path.join(MODELS, "kokoro-v1.0.int8.onnx")
+VOICES = os.path.join(MODELS, "voices-v1.0.bin")
+MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
+SERVER_DIR = "/tmp/kokoro-server"
+JOB_DIR_RE = re.compile(r"^/tmp/kokoro\.[A-Za-z0-9]+$")
+FORMATS = ("wav", "mp3", "ogg", "flac")
+USER_AGENT = "Mozilla/5.0 (Linux; Android) kokomux"
+MAX_CHUNK = 200  # characters per synthesis chunk
+SERVING = False
+
+
+class JobError(Exception):
+    """A problem with the request itself (bad voice, empty text...)."""
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+# ------------------------------------------------------------------ model
+
+_tts = None
+_tts_lock = threading.Lock()
+
+
+def tts():
+    global _tts
+    with _tts_lock:
+        if _tts is None:
+            from kokoro_onnx import Kokoro
+            _tts = Kokoro(MODEL, VOICES)
+    return _tts
+
+
+# ------------------------------------------------------------------ text
+
+def split_text(text):
+    """Split into chunks: a short first one (so playback starts quickly), then
+    sentences grouped up to MAX_CHUNK characters."""
+    pieces = [p.strip() for p in re.split(r"(?<=[.!?…;:])\s+|\s*\n\s*", text)]
+    pieces = [p for p in pieces if re.search(r"\w", p)]
+    chunks, cur = [], ""
+    for p in pieces:
+        if not cur:
+            cur = p
+        elif (not chunks and len(cur) < 40) or (chunks and len(cur) + len(p) < MAX_CHUNK):
+            cur += " " + p
+        else:
+            chunks.append(cur)
+            cur = p
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+class _Extractor(HTMLParser):
+    """Pull readable text out of a web page: paragraphs, headings, list items.
+    Skips menus, sidebars, tables and citations, prefers <article>/<main>
+    content when there's enough of it, and stops at "References" etc."""
+    SKIP_TAGS = {"script", "style", "noscript", "nav", "header", "footer", "aside",
+                 "form", "svg", "button", "select", "template", "iframe", "table",
+                 "figure", "sup", "math"}
+    # Whole words from class/id/role names that mark non-article parts.
+    SKIP_WORDS = {
+        "nav", "navbar", "navbox", "navigation", "menu", "footer", "sidebar",
+        "comment", "comments", "share", "sharing", "social", "related",
+        "reference", "references", "reflist", "infobox", "toc", "hatnote",
+        "metadata", "editsection", "ad", "ads", "advert", "advertisement",
+        "cookie", "cookies", "banner", "breadcrumb", "breadcrumbs", "subscribe",
+        "newsletter", "caption", "thumb", "promo", "popup", "modal", "noprint"}
+    NEVER_SKIP = {"html", "body", "main", "article"}
+    VOID = {"br", "img", "input", "meta", "link", "hr", "source", "wbr", "area", "col"}
+    BLOCK = {"p", "h1", "h2", "h3", "h4", "li", "blockquote", "pre", "dd"}
+    HEADINGS = {"h1", "h2", "h3", "h4"}
+    END_SECTIONS = {"references", "see also", "external links", "further reading",
+                    "notes", "bibliography", "sources", "citations", "footnotes",
+                    "related articles", "comments"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.skip_tag, self.skip_depth = None, 0
+        self.article = 0
+        self.block = None
+        self.buf = []
+        self.blocks = []  # (in_article, text)
+        self.title = ""
+        self.in_title = False
+        self.done = False
+
+    def handle_starttag(self, tag, attrs):
+        if self.skip_tag:
+            if tag == self.skip_tag:
+                self.skip_depth += 1
+            return
+        if tag in self.VOID:
+            if tag == "br":
+                self.buf.append(" ")
+            return
+        a = dict(attrs)
+        hint = f"{a.get('class') or ''} {a.get('id') or ''} {a.get('role') or ''}"
+        words = set(re.split(r"[^a-z]+", hint.lower()))
+        if tag in self.SKIP_TAGS or (tag not in self.NEVER_SKIP and words & self.SKIP_WORDS):
+            self.skip_tag, self.skip_depth = tag, 1
+        elif tag in ("article", "main"):
+            self.article += 1
+        elif tag == "title":
+            self.in_title = True
+        elif tag in self.BLOCK:
+            self._flush()
+            self.block = tag
+
+    def handle_endtag(self, tag):
+        if self.skip_tag:
+            if tag == self.skip_tag:
+                self.skip_depth -= 1
+                if self.skip_depth == 0:
+                    self.skip_tag = None
+            return
+        if tag in ("article", "main") and self.article:
+            self.article -= 1
+        elif tag == "title":
+            self.in_title = False
+        elif tag in self.BLOCK:
+            self._flush()
+
+    def handle_data(self, data):
+        if self.in_title:
+            self.title += data
+        elif not self.skip_tag and self.block and not self.done:
+            self.buf.append(data)
+
+    def _flush(self):
+        t = re.sub(r"\[\s*(?:\d+|[a-z]|edit|citation needed|note \d+)\s*\]", "", "".join(self.buf), flags=re.I)
+        t = re.sub(r"\s+", " ", t.replace("¶", "")).strip()
+        if t and not self.done:
+            if self.block in self.HEADINGS and t.lower().strip(" :") in self.END_SECTIONS:
+                self.done = True
+            else:
+                self.blocks.append((self.article > 0, t))
+        self.buf = []
+        self.block = None
+
+    def text(self):
+        self._flush()
+        art = [t for a, t in self.blocks if a]
+        use = art if sum(map(len, art)) > 500 else [t for _, t in self.blocks]
+        # Headings and list items often lack a full stop; end each block so it
+        # gets its own pause.
+        use = [t if t[-1] in ".!?…:;" else t + "." for t in use]
+        title = re.sub(r"\s+", " ", self.title).strip()
+        if title and (not use or title.split(" - ")[0].split(" | ")[0] not in use[0]):
+            use.insert(0, title + ".")
+        return "\n".join(use)
+
+
+def fetch_url(url):
+    if not re.match(r"^https?://", url):
+        raise JobError(f"Not a web address: {url}")
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            ctype = r.headers.get_content_type()
+            charset = r.headers.get_content_charset() or "utf-8"
+            body = r.read(5_000_000).decode(charset, errors="replace")
+    except Exception as e:  # noqa: BLE001 - report any network error plainly
+        raise JobError(f"Couldn't fetch {url}: {e}") from e
+    if ctype == "text/plain":
+        return body
+    if "html" not in ctype and "xml" not in ctype:
+        raise JobError(f"That link is {ctype}, not a web page")
+    ex = _Extractor()
+    ex.feed(body)
+    text = ex.text()
+    if not text.strip():
+        raise JobError("Couldn't find any readable text on that page")
+    return text
+
+
+# ------------------------------------------------------------------ jobs
+
+def read_job(path):
+    real = os.path.realpath(path)
+    jobdir = os.path.dirname(real)
+    if not JOB_DIR_RE.match(jobdir) or os.path.basename(real) != "job":
+        raise JobError(f"Refusing job outside /tmp/kokoro.*: {path}")
+    job = {}
+    with open(real, encoding="utf-8") as fh:
+        for line in fh:
+            key, sep, val = line.rstrip("\n").partition("=")
+            if sep:
+                job[key] = val
+    return jobdir, job
+
+
+def run_job(path):
+    import numpy as np
+    import soundfile as sf
+
+    t0 = time.time()
+    jobdir, job = read_job(path)
+    engine = tts()
+
+    voice = job.get("voice", "af_heart")
+    if voice not in engine.get_voices():
+        raise JobError(f"Unknown voice '{voice}'. See: kokoro --list-voices")
+    try:
+        speed = float(job.get("speed", "1.0"))
+    except ValueError:
+        raise JobError("Speed must be a number, e.g. 1.2") from None
+    if not 0.5 <= speed <= 2.0:
+        raise JobError("Speed must be between 0.5 and 2.0")
+    lang = job.get("lang", "en-us")
+
+    out = job.get("out")
+    if out:
+        if "/" in out or out.rsplit(".", 1)[-1] not in FORMATS:
+            raise JobError(f"Output must be one of: {', '.join(FORMATS)}")
+        out = os.path.join(jobdir, out)
+
+    stream = None
+    if job.get("stream") == "1":
+        stream = os.path.join(jobdir, "stream")
+        os.makedirs(stream, exist_ok=True)
+
+    try:
+        if job.get("url"):
+            log(f"Fetching {job['url']}")
+            text = fetch_url(job["url"])
+        else:
+            with open(os.path.join(jobdir, "in.txt"), encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+            bad = text.count("\ufffd") + text.count("\x00")
+            if text and bad > max(3, len(text) // 100):
+                raise JobError("That doesn't look like text (is it a PDF, image or other binary file?)")
+        chunks = split_text(text)
+        if not chunks:
+            raise JobError("No text to read")
+
+        parts, rate, total = [], 24000, 0.0
+        for i, chunk in enumerate(chunks, 1):
+            # The kokoro command deletes its job folder when it exits or is
+            # stopped, so a vanished folder means nobody is waiting any more.
+            if not os.path.isdir(jobdir) or (stream and not os.path.isdir(stream)):
+                raise JobError("Cancelled")
+            if len(chunks) > 1 and not stream and not SERVING:
+                log(f"  part {i}/{len(chunks)}")
+            samples, rate = engine.create(chunk, voice=voice, speed=speed, lang=lang)
+            total += len(samples) / rate
+            if stream:
+                tmp = os.path.join(stream, f"{i:04d}.tmp.wav")
+                sf.write(tmp, samples, rate)
+                os.replace(tmp, os.path.join(stream, f"{i:04d}.wav"))
+            if out:
+                parts.append(samples)
+                parts.append(np.zeros(int(rate * 0.2), dtype=samples.dtype))
+        if out:
+            sf.write(out, np.concatenate(parts[:-1]), rate)
+    finally:
+        if stream and os.path.isdir(stream):
+            open(os.path.join(stream, "end"), "w").close()
+
+    return f"Made {total:.1f}s of audio in {time.time() - t0:.1f}s"
+
+
+# ------------------------------------------------------------------ server
+
+def serve(port, idle):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    global SERVING
+    SERVING = True
+    log("Loading model...")
+    tts()
+    token = secrets.token_hex(16)
+    job_lock = threading.Lock()
+    state = {"last": time.time(), "busy": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def _reply(self, code, text):
+            body = (text + "\n").encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _authorized(self):
+            given = self.headers.get("X-Kokoro-Token", "")
+            if hmac.compare_digest(given, token):
+                return True
+            self._reply(403, "bad token")
+            return False
+
+        def do_GET(self):
+            if urlparse(self.path).path == "/health" and self._authorized():
+                self._reply(200, "ok")
+            elif urlparse(self.path).path != "/health":
+                self._reply(404, "not found")
+
+        def do_POST(self):
+            if not self._authorized():
+                return
+            url = urlparse(self.path)
+            if url.path == "/shutdown":
+                self._reply(200, "bye")
+                threading.Thread(target=httpd.shutdown, daemon=True).start()
+                return
+            if url.path != "/job":
+                self._reply(404, "not found")
+                return
+            path = parse_qs(url.query).get("path", [""])[0]
+            state["busy"] += 1
+            try:
+                with job_lock:
+                    msg = run_job(path)
+                self._reply(200, msg)
+            except JobError as e:
+                self._reply(400, f"Error: {e}")
+            except Exception as e:  # noqa: BLE001 - send the error to the client
+                self._reply(500, f"Error: {type(e).__name__}: {e}")
+            finally:
+                state["busy"] -= 1
+                state["last"] = time.time()
+
+        def log_message(self, fmt, *args):
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    httpd.daemon_threads = True
+
+    # Publish the token only once we're listening. $PREFIX/tmp is private to
+    # Termux, so other apps on the phone can't use the server.
+    os.makedirs(SERVER_DIR, exist_ok=True)
+    tok = os.path.join(SERVER_DIR, "token")
+    with open(tok + ".tmp", "w") as fh:
+        fh.write(f"{port} {token}\n")
+    os.chmod(tok + ".tmp", 0o600)
+    os.replace(tok + ".tmp", tok)
+
+    def watch_idle():
+        while True:
+            time.sleep(15)
+            if idle and not state["busy"] and time.time() - state["last"] > idle:
+                log(f"Idle for {idle // 60} min, stopping")
+                httpd.shutdown()
+                return
+
+    threading.Thread(target=watch_idle, daemon=True).start()
+    log(f"Ready on 127.0.0.1:{port}")
+    try:
+        httpd.serve_forever()
+    finally:
+        try:
+            with open(tok) as fh:
+                if token in fh.read():
+                    os.remove(tok)
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------------ download
+
+def download():
+    os.makedirs(MODELS, exist_ok=True)
+    for name in ("kokoro-v1.0.int8.onnx", "voices-v1.0.bin"):
+        dest = os.path.join(MODELS, name)
+        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            print(f"{name}: already downloaded")
+            continue
+        part = dest + ".part"
+        for attempt in range(1, 6):
+            have = os.path.getsize(part) if os.path.exists(part) else 0
+            req = urllib.request.Request(MODEL_URL + name, headers={"User-Agent": USER_AGENT})
+            if have:
+                req.add_header("Range", f"bytes={have}-")
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    if have and r.status != 206:
+                        have = 0  # server ignored the range; start over
+                    size = have + int(r.headers.get("Content-Length", 0))
+                    with open(part, "ab" if have else "wb") as fh:
+                        done, shown = have, -1
+                        while block := r.read(1 << 20):
+                            fh.write(block)
+                            done += len(block)
+                            pct = done * 100 // size if size else 0
+                            if pct // 10 != shown:
+                                shown = pct // 10
+                                print(f"{name}: {pct}% of {size >> 20} MB", flush=True)
+                os.replace(part, dest)
+                break
+            except OSError as e:
+                print(f"{name}: download interrupted ({e}), retry {attempt}/5", flush=True)
+                time.sleep(2 * attempt)
+        else:
+            sys.exit(f"Couldn't download {name}. Run the installer again to resume.")
+
+
+# ------------------------------------------------------------------ main
+
+def main():
+    p = argparse.ArgumentParser(prog="engine.py")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    j = sub.add_parser("job")
+    j.add_argument("path")
+    s = sub.add_parser("serve")
+    s.add_argument("--port", type=int, default=8880)
+    s.add_argument("--idle", type=int, default=1800, help="stop after this many idle seconds (0 = never)")
+    sub.add_parser("voices")
+    sub.add_parser("download")
+    a = p.parse_args()
+
+    if a.cmd == "job":
+        try:
+            log(run_job(a.path))
+        except JobError as e:
+            sys.exit(f"Error: {e}")
+    elif a.cmd == "serve":
+        serve(a.port, a.idle)
+    elif a.cmd == "voices":
+        print("\n".join(sorted(tts().get_voices())))
+    elif a.cmd == "download":
+        download()
+
+
+if __name__ == "__main__":
+    main()
