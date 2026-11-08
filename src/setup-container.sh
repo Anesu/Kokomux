@@ -21,43 +21,28 @@ CFG
     apt-get update
     apt-get install -y --no-install-recommends python3 python3-venv ca-certificates
     ;;
-  pip)   # setup.sh pip [standard|dictionary]: dictionary also keeps misaki for English
+  pip)
     mkdir -p "$APP"
     [ -x "$APP/venv/bin/python" ] || python3 -m venv "$APP/venv"
     "$APP/venv/bin/pip" install --upgrade pip
-    # pypdf reads PDFs.
-    "$APP/venv/bin/pip" install --upgrade kokoro-onnx soundfile pypdf | tee /tmp/kokoro-setup/.pip
+    # pypdf reads PDFs. misaki turns English into sounds as Kokoro was trained, with
+    # spaCy's small English model (no PyTorch).
+    "$APP/venv/bin/pip" install --upgrade kokoro-onnx soundfile pypdf "misaki>=0.7.4,<0.8" num2words "spacy>=3.8,<3.9" \
+      "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" \
+      | tee /tmp/kokoro-setup/.pip
     # Before 0.8, Whistle (cactus-compute) timed the words; Kokoro does that itself now.
-    # It and the packages only it needed are removed (about 54 MB).
-    # (tqdm, click, anyio and h11 stay when the pronunciation dictionary is installed: spaCy needs them.)
-    shared="tqdm click anyio h11"
-    compgen -G "$APP/venv/lib/python3*/site-packages/misaki" >/dev/null && shared=""
-    # shellcheck disable=SC2086
+    # It and the packages only it needed are removed (spaCy needs tqdm, click, anyio and h11).
     "$APP/venv/bin/pip" uninstall -y cactus-compute pillow huggingface-hub hf-xet fsspec filelock \
-      pyyaml httpcore2 httpx2 truststore $shared 2>/dev/null || true
-    if [ "${2:-}" = dictionary ]; then   # the same packages as kokoro --pronunciation dictionary
-      # An extra: if it can't be installed, kokoro reads English with espeak, and
-      # kokoro --pronunciation dictionary tries again later.
-      "$APP/venv/bin/pip" install --upgrade "misaki>=0.7.4,<0.8" num2words "spacy>=3.8,<3.9" \
-        "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" \
-        2>&1 | tee -a /tmp/kokoro-setup/.pip || true
-    fi
+      pyyaml httpcore2 httpx2 truststore 2>/dev/null || true
     grep -q '^Successfully installed' /tmp/kokoro-setup/.pip || printf 'up to date' > "$SRC/.note"
     cp "$SRC/engine.py" "$SRC/words.py" "$APP/"
     rm -f "$APP/speak.py"   # from older versions
     ;;
-  models)   # setup.sh models [standard|high]: high also keeps the full-precision model
-    quality=${2:-standard}
-    if [ -s "$APP/models/kokoro-v1.0-timestamped.int8.onnx" ] && [ -s "$APP/models/voices-v1.0.bin" ] &&
-       { [ "$quality" != high ] || [ -s "$APP/models/kokoro-v1.0-timestamped.fp32.onnx" ]; }; then
+  models)
+    if [ -s "$APP/models/kokoro-v1.0-timestamped.fp32.onnx" ] && [ -s "$APP/models/voices-v1.0.bin" ]; then
       printf 'already downloaded' > "$SRC/.note"
     fi
     "$APP/venv/bin/python" -u "$APP/engine.py" download
-    # The full-precision model is an extra: if it doesn't arrive, kokoro uses the
-    # 8-bit one, and kokoro --quality high carries on with the download later.
-    if [ "$quality" = high ]; then
-      "$APP/venv/bin/python" -u "$APP/engine.py" download --quality high || echo "The high-quality model didn't finish downloading."
-    fi
     ;;
   tidy)
     apt-get clean

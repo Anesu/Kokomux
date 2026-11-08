@@ -8,11 +8,10 @@ or through the background server:
   engine.py job /tmp/kokoro.XXXXXX/job      run one job
   engine.py serve [--port N] [--idle SECS]  keep the model loaded, serve jobs
   engine.py voices                          list voice names
-  engine.py download [--quality high]       fetch model files (resumable)
-  engine.py forget-high                     delete the full-precision model
+  engine.py download                        fetch model files (resumable)
 
 A job folder holds `job` (key=value lines: voice, speed, lang, and optionally
-quality, pronunciation, url, out, stream, words, start, of, gap_ms) and `in.txt` (the text,
+url, out, stream, words, start, of, gap_ms) and `in.txt` (the text,
 unless url is set). A voice can be a blend: af_heart:70+bf_emma:30. Output goes into
 the same folder: `out.<ext>` for a saved file, and with stream=1 one WAV per
 chunk in `stream/0001.wav`, `stream/0002.wav`, ... followed by `stream/end`.
@@ -34,18 +33,12 @@ APP = os.path.dirname(os.path.abspath(__file__))
 if APP not in sys.path:
     sys.path.insert(0, APP)   # words.py lives beside this file
 MODELS = os.path.join(APP, "models")
-# Kokoro 82M v1.0, 8-bit, exported with a "durations" output: it reports when each
-# sound is spoken, which is what lights up each word. Pinned to a commit.
-MODEL = os.path.join(MODELS, "kokoro-v1.0-timestamped.int8.onnx")
+# Kokoro 82M v1.0 at full precision, exported with a "durations" output: it reports
+# when each sound is spoken, which is what lights up each word. Pinned to a commit.
+MODEL = os.path.join(MODELS, "kokoro-v1.0-timestamped.fp32.onnx")
 MODEL_SRC = ("https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX-timestamped/resolve/"
-             "dd4401a9add81ac692d20e240d22ec9dda82cc29/onnx/model_quantized.onnx")
-OLD_MODEL = os.path.join(MODELS, "kokoro-v1.0.int8.onnx")   # before 0.8: no timings
-# The same model at full precision: a cleaner voice (the 8-bit one can sound a
-# little buzzy), at 326 MB and more work per sentence. Downloaded on request.
-MODEL_HQ = os.path.join(MODELS, "kokoro-v1.0-timestamped.fp32.onnx")
-MODEL_HQ_SRC = ("https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX-timestamped/resolve/"
-                "dd4401a9add81ac692d20e240d22ec9dda82cc29/onnx/model.onnx")
-QUALITIES = ("standard", "high")
+             "dd4401a9add81ac692d20e240d22ec9dda82cc29/onnx/model.onnx")
+OLD_MODELS = [os.path.join(MODELS, f) for f in ("kokoro-v1.0.int8.onnx", "kokoro-v1.0-timestamped.int8.onnx")]
 # A voice, or several blended: "af_heart", "af_heart+af_bella", "af_heart:70+af_bella:30"
 VOICE_SPEC = re.compile(r"^[a-z]{2}_[a-z]+(?::\d{1,3})?(?:\+[a-z]{2}_[a-z]+(?::\d{1,3})?){0,3}$")
 VOICES = os.path.join(MODELS, "voices-v1.0.bin")
@@ -70,7 +63,6 @@ def log(msg):
 # ------------------------------------------------------------------ model
 
 _tts = None
-_tts_model = None
 _tts_lock = threading.Lock()
 # One synthesis at a time, across every job the server is running: espeak isn't
 # thread-safe, and the phone has only so much CPU. Held per part, not per job, so
@@ -78,26 +70,13 @@ _tts_lock = threading.Lock()
 SYNTH_LOCK = threading.Lock()
 
 
-def model_for(quality):
-    """The model file for a quality: the full-precision one only once it's downloaded."""
-    if quality == "high" and os.path.exists(MODEL_HQ):
-        return MODEL_HQ
-    return MODEL if os.path.exists(MODEL) else OLD_MODEL
-
-
-def tts(quality="standard"):
-    """Kokoro, loaded with the model for this quality. One model at a time: switching
-    lets the other go first, so a phone never holds both."""
-    global _tts, _tts_model
+def tts():
+    """Kokoro, loaded once."""
+    global _tts
     with _tts_lock:
-        model = model_for(quality)
-        if _tts is None or _tts_model != model:
+        if _tts is None:
             from kokoro_onnx import Kokoro
-            _tts = None
-            import gc
-            gc.collect()
-            _tts = Kokoro(model, VOICES)
-            _tts_model = model
+            _tts = Kokoro(MODEL, VOICES)
             # kokoro-onnx looks for an output called "duration"; this export calls it
             # "durations". It's the second output either way, which is what it reads.
             _tts.has_timings = len(_tts.sess.get_outputs()) > 1
@@ -131,30 +110,23 @@ def voice_style(engine, spec):
 
 
 # --- pronunciation ------------------------------------------------------------
-# Kokoro turns text into sounds with espeak. For English it can instead use misaki,
-# the dictionary-based tool Kokoro was trained with: it reads "I read it
-# yesterday", "record the record" and "$42.50" the way people say them. It's an
-# optional extra (spaCy and an English model, about 260 MB: kokoro --pronunciation
-# dictionary). Without it, or for other languages, espeak it is.
-PRONUNCIATIONS = ("standard", "dictionary")
+# English is turned into sounds by misaki, the dictionary-based tool Kokoro was
+# trained with: it reads "I read it yesterday", "record the record" and "$42.50"
+# the way people say them. Words it doesn't know, and other languages, go to espeak.
 _g2p = {}
 _g2p_lock = threading.Lock()
 
 
-def g2p_for(lang, pronunciation):
-    """misaki's English G2P for this job, or None to use espeak (load once, then keep)."""
-    if pronunciation != "dictionary" or lang not in ("en-us", "en-gb"):
+def g2p_for(lang):
+    """misaki's English G2P (loaded once per accent), or None for other languages."""
+    if lang not in ("en-us", "en-gb"):
         return None
     british = lang == "en-gb"
     with _g2p_lock:
         if british not in _g2p:
-            try:
-                from misaki import en, espeak
-                # Words it doesn't know go to espeak, the copy kokoro-onnx already set up.
-                _g2p[british] = en.G2P(trf=False, british=british, fallback=espeak.EspeakFallback(british=british))
-            except Exception as e:      # not installed, or its English model is missing
-                log(f"Dictionary pronunciation isn't available ({e.__class__.__name__}: {e}); using espeak.")
-                _g2p[british] = None
+            from misaki import en, espeak
+            # Words it doesn't know go to espeak, the copy kokoro-onnx already set up.
+            _g2p[british] = en.G2P(trf=False, british=british, fallback=espeak.EspeakFallback(british=british))
         return _g2p[british]
 
 
@@ -630,17 +602,9 @@ def run_job(path):
 
     t0 = time.time()
     jobdir, job = read_job(path)
-    quality = job.get("quality", "standard")
-    if quality not in QUALITIES:
-        raise JobError(f"Quality must be one of: {', '.join(QUALITIES)}")
-    engine = tts(quality)
-    if quality == "high" and model_for("high") != MODEL_HQ:
-        log("The high-quality model isn't downloaded (kokoro --quality high); using the standard one.")
+    engine = tts()
 
     voice = voice_style(engine, job.get("voice", "af_heart"))
-    pronunciation = job.get("pronunciation", "standard")
-    if pronunciation not in PRONUNCIATIONS:
-        raise JobError(f"Pronunciation must be one of: {', '.join(PRONUNCIATIONS)}")
     try:
         speed = float(job.get("speed", "1.0"))
     except ValueError:
@@ -648,7 +612,7 @@ def run_job(path):
     if not 0.5 <= speed <= 2.0:
         raise JobError("Speed must be between 0.5 and 2.0")
     lang = job.get("lang", "en-us")
-    g2p = g2p_for(lang, pronunciation)
+    g2p = g2p_for(lang)
 
     out = job.get("out")
     if out:
@@ -718,8 +682,8 @@ def run_job(path):
                 if g2p is not None:
                     try:
                         ps, per = dictionary_phonemes(g2p, chunk)
-                    except Exception as e:      # an odd part: espeak reads this one
-                        log(f"Dictionary pronunciation failed on part {i} ({e.__class__.__name__}); using espeak.")
+                    except Exception as e:      # a sentence misaki can't parse: espeak reads it
+                        log(f"misaki: part {i}: {e.__class__.__name__}: {e}")
                         ps = None
                 if timed:
                     import words
@@ -788,15 +752,15 @@ def _write_atomic(path, text):
 
 # ------------------------------------------------------------------ server
 
-def serve(port, idle, quality="standard", pronunciation="standard"):
+def serve(port, idle):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import parse_qs, urlparse
 
     global SERVING
     SERVING = True
     log("Loading model...")
-    tts(quality)
-    g2p_for("en-us", pronunciation)     # (a few seconds: worth doing before the first job)
+    tts()
+    g2p_for("en-us")                    # (a few seconds: done before the first job)
     token = secrets.token_hex(16)
     state = {"last": time.time(), "busy": 0}
 
@@ -884,12 +848,9 @@ def serve(port, idle, quality="standard", pronunciation="standard"):
 
 # ------------------------------------------------------------------ download
 
-def download(quality="standard"):
+def download():
     os.makedirs(MODELS, exist_ok=True)
-    files = [(MODEL, MODEL_SRC, "model"), (VOICES, VOICES_SRC, "voices")]
-    if quality == "high":
-        files.append((MODEL_HQ, MODEL_HQ_SRC, "high-quality"))
-    for dest, src, label in files:
+    for dest, src, label in ((MODEL, MODEL_SRC, "model"), (VOICES, VOICES_SRC, "voices")):
         name = os.path.basename(dest)
         if os.path.exists(dest) and os.path.getsize(dest) > 0:
             print(f"@@progress {label} 100 0 0")
@@ -923,8 +884,10 @@ def download(quality="standard"):
                 time.sleep(2 * attempt)
         else:
             sys.exit(f"Couldn't download {name}. Try again: it picks up where it stopped.")
-    if os.path.exists(OLD_MODEL):
-        os.remove(OLD_MODEL)   # the timestamped model replaces it (saves 88 MB)
+    for old in OLD_MODELS:     # the 8-bit models of earlier versions
+        for f in (old, old + ".part"):
+            if os.path.exists(f):
+                os.remove(f)
 
 
 # ------------------------------------------------------------------ voices
@@ -986,9 +949,6 @@ def main():
     s = sub.add_parser("serve")
     s.add_argument("--port", type=int, default=8880)
     s.add_argument("--idle", type=int, default=1800, help="stop after this many idle seconds (0 = never)")
-    s.add_argument("--quality", choices=QUALITIES, default="standard", help="the model to load first")
-    s.add_argument("--pronunciation", choices=PRONUNCIATIONS, default="standard",
-                   help="dictionary: load misaki for English up front")
     v = sub.add_parser("voices")
     v.add_argument("--plain", action="store_true", help="one name per line")
     v.add_argument("--width", type=int, default=60)
@@ -996,10 +956,7 @@ def main():
     v.add_argument("--color", action="store_true", help="colour even when piped")
     v.add_argument("--accent", default="", help="SGR parameters for the accent colour")
     v.add_argument("--muted", default="", help="SGR parameters for secondary text")
-    d = sub.add_parser("download")
-    d.add_argument("--quality", choices=QUALITIES, default="standard",
-                   help="high also fetches the full-precision model (326 MB)")
-    sub.add_parser("forget-high", help="delete the full-precision model")
+    sub.add_parser("download")
     a = p.parse_args()
 
     if a.cmd == "job":
@@ -1008,7 +965,7 @@ def main():
         except JobError as e:
             sys.exit(f"Error: {e}")
     elif a.cmd == "serve":
-        serve(a.port, a.idle, a.quality, a.pronunciation)
+        serve(a.port, a.idle)
     elif a.cmd == "voices":
         names = sorted(tts().get_voices())
         if a.plain:
@@ -1016,11 +973,7 @@ def main():
         else:
             print_voices(names, a.width, a.default, a.accent, a.muted)
     elif a.cmd == "download":
-        download(a.quality)
-    elif a.cmd == "forget-high":
-        for f in (MODEL_HQ, MODEL_HQ + ".part"):
-            if os.path.exists(f):
-                os.remove(f)
+        download()
 
 
 if __name__ == "__main__":

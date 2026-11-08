@@ -21,8 +21,6 @@ env_overrides=""
 KOKORO_DEFAULTS=(
   KOKORO_VOICE=af_heart         # see: kokoro --list-voices
   KOKORO_BLEND=                 # a second voice mixed in, and how much: af_bella:30 (empty: none)
-  KOKORO_QUALITY=high           # high (326 MB, full precision) or standard (the 92 MB 8-bit model)
-  KOKORO_PRONUNCIATION=dictionary  # English: dictionary (misaki, as Kokoro learned) or standard (espeak)
   KOKORO_SPEED=1.0              # 0.5 to 2.0
   KOKORO_LANG=en-us
   KOKORO_OUT=kokoro.wav         # file name when -o isn't given
@@ -43,15 +41,6 @@ KOKORO_REPO_RAW=https://raw.githubusercontent.com/Anesu/kokomux/main
 eval "$env_overrides"
 
 DISTRO=kokoro
-ROOTFS="$PREFIX/var/lib/proot-distro/installed-rootfs/$DISTRO"   # the container, seen from Termux
-MODEL_HQ="$ROOTFS/opt/kokoro/models/kokoro-v1.0-timestamped.fp32.onnx"
-# Dictionary pronunciation for English: misaki, with spaCy and its small English
-# model (no PyTorch). What's installed, and what's taken away again.
-DICT_PKGS=("misaki>=0.7.4,<0.8" num2words "spacy>=3.8,<3.9"
-  "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl")
-DICT_REMOVE=(misaki num2words docopt spacy spacy-legacy spacy-loggers thinc blis srsly cymem preshed murmurhash
-  wasabi weasel catalogue confection en-core-web-sm cloudpathlib smart-open typer rich pygments pydantic
-  pydantic-core markdown-it-py mdurl shellingham)
 PY=/opt/kokoro/venv/bin/python
 ENGINE=/opt/kokoro/engine.py
 SRV_DIR="$PREFIX/tmp/kokoro-server"
@@ -144,51 +133,6 @@ voice_label() {  # voice_label SPEC: "af_heart:70+af_bella:30" -> "af_heart + af
   while [[ "$s" =~ ^(.*):[0-9]+(.*)$ ]]; do s=${BASH_REMATCH[1]}${BASH_REMATCH[2]}; done
   printf '%s' "${s//+/ + }"
 }
-hq_ready() { [ -s "$MODEL_HQ" ]; }   # is the full-precision model on the phone?
-dict_ready() {   # is dictionary pronunciation installed?
-  compgen -G "$ROOTFS/opt/kokoro/venv/lib/python3*/site-packages/misaki/__init__.py" >/dev/null &&
-    compgen -G "$ROOTFS/opt/kokoro/venv/lib/python3*/site-packages/en_core_web_sm/__init__.py" >/dev/null
-}
-dict_install() { # install it into Kokoro's Python, showing what pip is up to
-  local line rc what
-  exec 3< <(proot-distro login "$DISTRO" -- "${PY%/python}/pip" install --no-cache-dir --progress-bar off \
-              "${DICT_PKGS[@]}" 2>&1; echo "@@rc $?")
-  while IFS= read -r line <&3; do
-    case "$line" in
-      "@@rc "*) rc=${line#@@rc } ;;
-      Collecting*|Downloading*) what=${line#* }; what=${what%% *}; what=${what##*/}
-        status "Installing the pronunciation dictionary" "getting ${what%%[<>=@-]*}" ;;
-      "Installing collected"*) status "Installing the pronunciation dictionary" "unpacking (a minute or two)" ;;
-      ERROR*|error*) [ -n "$line" ] && printf '%s\n' "$line" >&2 ;;
-    esac
-    [ "$LIVE" = 1 ] || printf '%s\n' "$line" >&2
-  done
-  exec 3<&-
-  status_clear
-  [ "${rc:-1}" = 0 ] && dict_ready
-}
-conf_set() {     # conf_set NAME VALUE: keep a setting in the settings file
-  mkdir -p "$CONF_DIR"; [ -f "$CONF" ] || : > "$CONF"
-  if grep -q "^$1=" "$CONF"; then sed -i "s|^$1=[^ #]*|$1=$2|" "$CONF"; else echo "$1=$2" >> "$CONF"; fi
-  printf -v "$1" '%s' "$2"
-}
-hq_download() {  # fetch the full-precision model, showing how far it's got; resumes if stopped
-  local line pct got total rc
-  exec 3< <(proot-distro login "$DISTRO" -- "$PY" -u "$ENGINE" download --quality high 2>&1; echo "@@rc $?")
-  while IFS= read -r line <&3; do
-    case "$line" in
-      "@@progress high-quality "*)
-        read -r _ _ pct got total <<< "$line"
-        status "Downloading the high-quality model" "$pct% · $got of $total MB" ;;
-      "@@rc "*) rc=${line#@@rc } ;;
-      "@@progress "*) ;;
-      *) [ "$LIVE" = 1 ] || printf '%s\n' "$line" >&2 ;;
-    esac
-  done
-  exec 3<&-
-  status_clear
-  [ "${rc:-1}" = 0 ] && hq_ready
-}
 human_size() {
   local b=$1
   if [ "$b" -ge 1048576 ]; then awk "BEGIN { printf \"%.1f MB\", $b / 1048576 }"
@@ -243,11 +187,9 @@ ROWS
 --list-voices|all 54 voices by language
 --status|server status and settings
 --settings|voice, speed, highlighting and more
---quality standard|the quicker 8-bit model; high: the default
---pronunciation standard|English with espeak; dictionary: the default
 --config|edit the settings file directly
 --serve / --stop-server|start or stop the server
---update|update kokomux and Kokoro
+--update [BRANCH]|update kokomux and Kokoro (from main, or a branch)
 --uninstall|remove kokomux
 ROWS
   printf '\n%sExamples%s\n' "$B" "$R"
@@ -274,8 +216,7 @@ start_server() {
   # Ignore Ctrl+C and hang-ups so the server outlives the command that started it.
   ( trap '' INT HUP
     exec nohup proot-distro login "$DISTRO" --shared-tmp -- \
-      "$PY" "$ENGINE" serve --port "$KOKORO_PORT" --idle "$((KOKORO_IDLE_MINUTES * 60))" --quality "$KOKORO_QUALITY" \
-        --pronunciation "$KOKORO_PRONUNCIATION"
+      "$PY" "$ENGINE" serve --port "$KOKORO_PORT" --idle "$((KOKORO_IDLE_MINUTES * 60))"
   ) > "$SRV_DIR/log" 2>&1 < /dev/null &
   local pid=$! n=0
   [ "$LIVE" = 1 ] || echo "Starting the Kokoro server..." >&2
@@ -424,58 +365,6 @@ case "${1:-}" in
     done_msg "Server ready." "port $(server_port) · stops after ${KOKORO_IDLE_MINUTES} min unused"
     exit 0 ;;
   --stop-server) stop_server; exit 0 ;;
-  --quality)
-    case "${2:-}" in
-      high)
-        if ! hq_ready; then
-          info "Downloading the high-quality model (326 MB). If it stops, run this again to carry on."
-          hq_download || die "The download didn't finish." "Run kokoro --quality high again: it picks up where it stopped."
-        fi
-        conf_set KOKORO_QUALITY high
-        done_msg "Voice quality: high." "Each sentence takes longer to make. kokoro --quality standard switches back." ;;
-      standard)
-        conf_set KOKORO_QUALITY standard
-        done_msg "Voice quality: standard."
-        if hq_ready && [ -t 0 ] && [ "${3:-}" != --keep ]; then
-          read -r -p "Delete the high-quality model to free 326 MB? [y/N] " ans
-          if [[ "$ans" =~ ^[Yy] ]]; then
-            proot-distro login "$DISTRO" -- "$PY" "$ENGINE" forget-high && done_msg "Deleted the high-quality model."
-          fi
-        fi ;;
-      "") info "Voice quality: $KOKORO_QUALITY$( [ "$KOKORO_QUALITY" = high ] && ! hq_ready && echo " (not downloaded yet)")"
-          printf '  %skokoro --quality high   a cleaner voice: the full-precision model (326 MB)%s\n' "$D" "$R" >&2
-          printf '  %skokoro --quality standard   the 92 MB model: quicker, lighter on the battery%s\n' "$D" "$R" >&2 ;;
-      *) die "Quality is standard or high." "kokoro --quality high, or kokoro --quality standard" ;;
-    esac
-    exit 0 ;;
-  --pronunciation)
-    case "${2:-}" in
-      dictionary)
-        if ! dict_ready; then
-          info "Installing the pronunciation dictionary for English (about 260 MB, a few minutes)."
-          dict_install || die "The install didn't finish." "Check your connection and run kokoro --pronunciation dictionary again."
-        fi
-        conf_set KOKORO_PRONUNCIATION dictionary
-        server_up && stop_server >/dev/null 2>&1     # it starts again with the dictionary loaded
-        done_msg "English pronunciation: dictionary." "Kokoro now reads English the way it learned it. kokoro --pronunciation standard switches back." ;;
-      standard)
-        conf_set KOKORO_PRONUNCIATION standard
-        done_msg "English pronunciation: standard (espeak)."
-        if dict_ready && [ -t 0 ] && [ "${3:-}" != --keep ]; then
-          read -r -p "Remove the dictionary to free about 260 MB? [y/N] " ans
-          if [[ "$ans" =~ ^[Yy] ]]; then
-            server_up && stop_server >/dev/null 2>&1
-            proot-distro login "$DISTRO" -- "${PY%/python}/pip" uninstall -y -q "${DICT_REMOVE[@]}" >/dev/null 2>&1 || true
-            dict_ready && die "Couldn't remove it." "Try again, or leave it: it does no harm."
-            done_msg "Removed the pronunciation dictionary."
-          fi
-        fi ;;
-      "") info "English pronunciation: $KOKORO_PRONUNCIATION$( [ "$KOKORO_PRONUNCIATION" = dictionary ] && ! dict_ready && echo " (not installed yet)")"
-          printf '  %skokoro --pronunciation dictionary   misaki, as Kokoro was trained: "read", "record" and prices said right%s\n' "$D" "$R" >&2
-          printf '  %skokoro --pronunciation standard     espeak, built in%s\n' "$D" "$R" >&2 ;;
-      *) die "Pronunciation is standard or dictionary." "kokoro --pronunciation dictionary, or kokoro --pronunciation standard" ;;
-    esac
-    exit 0 ;;
   --status)
     printf '%skokomux%s %sv%s%s\n\n' "$B" "$R" "$ACC" "$KOKOMUX_VERSION" "$R"
     if server_up; then
@@ -487,12 +376,6 @@ case "${1:-}" in
     fi
     idle="${KOKORO_IDLE_MINUTES} min"; [ "$KOKORO_IDLE_MINUTES" = 0 ] && idle="never"
     printf '    Voice     %s%s%s\n' "$ACC2" "$(voice_mix)" "$R"
-    if [ "$KOKORO_QUALITY" = high ] && ! hq_ready; then
-      printf '    Quality   high %s(not downloaded, so standard: kokoro --quality high)%s\n' "$D" "$R"
-    else printf '    Quality   %s\n' "$KOKORO_QUALITY"; fi
-    if [ "$KOKORO_PRONUNCIATION" = dictionary ] && ! dict_ready; then
-      printf '    English   dictionary %s(not installed, so standard: kokoro --pronunciation dictionary)%s\n' "$D" "$R"
-    else printf '    English   %s pronunciation\n' "$KOKORO_PRONUNCIATION"; fi
     printf '    Speed     %s\n' "$KOKORO_SPEED"
     printf '    Language  %s\n' "$KOKORO_LANG"
     printf '    Idle stop %s\n' "$idle"
@@ -516,16 +399,21 @@ case "${1:-}" in
   --config)
     [ -f "$CONF" ] || die "There's no settings file at $(tilde "$CONF")." "Run the installer again to create it."
     exec "${EDITOR:-nano}" "$CONF" ;;
-  --update)
-    server_up && stop_server >/dev/null 2>&1
+  --update)      # kokoro --update [BRANCH]: the installer from GitHub (main, or that branch)
+    branch=${2:-main}
+    [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die "\"$branch\" isn't a branch name."
     tmp="$(mktemp "$PREFIX/tmp/kokomux-install.XXXXXX")"
-    if curl -fsSL "$KOKORO_REPO_RAW/install.sh" -o "$tmp" 2>/dev/null; then
-      rc=0; bash "$tmp" --yes || rc=$?; rm -f "$tmp"; exit "$rc"
+    curl -fsSL "${KOKORO_REPO_RAW%/main}/$branch/install.sh" -o "$tmp" 2>/dev/null ||
+      { rm -f "$tmp"; die "Couldn't download the installer from the $branch branch."; }
+    new="$(sed -n 's/^KOKOMUX_VERSION="\(.*\)"$/\1/p' "$tmp" | head -n 1)"
+    # Never go backwards by accident: main can be behind the version installed from a branch.
+    if [ -z "${2:-}" ] && [ "$(printf '%s\n%s\n' "$new" "$KOKOMUX_VERSION" | sort -V | head -n 1)" = "$new" ] &&
+       [ "$new" != "$KOKOMUX_VERSION" ]; then
+      rm -f "$tmp"
+      die "main has v$new, older than this v$KOKOMUX_VERSION." "To install from a branch: kokoro --update BRANCH"
     fi
-    rm -f "$tmp"
-    printf '%s!%s Couldn'"'"'t download the latest installer %s(is the repo private?)%s\n' "$YEL" "$R" "$D" "$R" >&2
-    info "Updating Kokoro's Python packages only..."
-    exec proot-distro login "$DISTRO" -- "${PY%/python}/pip" install --no-cache-dir --upgrade kokoro-onnx soundfile ;;
+    server_up && stop_server >/dev/null 2>&1
+    rc=0; bash "$tmp" --yes || rc=$?; rm -f "$tmp"; exit "$rc" ;;
   --uninstall)
     printf '%s\n\n' "This removes the kokoro command, its Debian container, the voices, your settings and shortcuts." |
       fold -s -w "$(( $(cols) - 1 ))" >&2
@@ -709,8 +597,6 @@ write_job() {    # the job, for the engine (where it starts and how fast can cha
     echo "voice=$voice"
     echo "speed=$speed"
     echo "lang=$lang"
-    echo "quality=$KOKORO_QUALITY"
-    echo "pronunciation=$KOKORO_PRONUNCIATION"
     [ -n "$url" ] && echo "url=$url"
     echo "name=$name"
     [ "$start" -gt 1 ] && echo "start=$start"

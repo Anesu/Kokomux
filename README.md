@@ -18,19 +18,16 @@ While it reads aloud, kokomux shows the text and lights up each word as it's spo
 
 ## Install
 
-You need **Termux from F-Droid or GitHub** (the Play Store version is outdated), a 64-bit phone, and about **1.2 GB** of free space (600 MB with `--standard`, below). Then run this in Termux:
+You need **Termux from F-Droid or GitHub** (the Play Store version is outdated) and about **1.2 GB** of free space. Then run this in Termux:
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/Anesu/kokomux/main/install.sh && bash install.sh
 ```
 
-The installer checks your phone first (CPU, free space, connection), shows what it's going to do, and asks before starting. Then it works through seven steps with live progress, and keeps the phone awake until it's done. Installing takes 10–25 minutes. At the end it says hello out loud. Running it again is safe: it skips what's already done and updates the rest.
+The installer checks your phone first (CPU, free space, connection), shows what it's going to do, and asks before starting. Then it works through seven steps with live progress, and keeps the phone awake until it's done. Installing takes 10–20 minutes. At the end it says hello out loud. Running it again is safe: it skips what's already done and updates the rest.
 
 - `--yes` skips the question (for scripts).
 - `--verbose` shows everything the installer runs.
-- `--standard` installs the smaller setup (600 MB, quicker on older phones): the 8-bit model and espeak pronunciation, instead of the high-quality voice and English pronunciation dictionary. You can add those later (see [Better-sounding speech](#better-sounding-speech)).
-
-By default kokomux installs its best-sounding setup: the full-precision model and misaki for English. If your phone has room for kokomux but not for these, the installer says so and installs the smaller setup. If one of them doesn't download, the install still finishes, with the standard voice, and the last screen says how to try again.
 
 If a step fails, the installer shows what went wrong and how to fix it ([example](docs/install-error.png)). The full log is kept at `~/.cache/kokomux/install.log`. If you stop it with Ctrl+C, nothing breaks: run it again and it carries on.
 
@@ -65,19 +62,19 @@ kokoro --stop                             # stop playback
 
 **Voices:** the first two letters of a voice name tell you its accent and gender. `a` is American, `b` British, then `f` for female and `m` for male. Other languages have their own voices, such as `ef_dora` for Spanish and `ff_siwis` for French. `kokoro --list-voices` shows all 54.
 
-## Better-sounding speech
+## How it sounds this good
 
-- **Voice quality.** kokomux uses the full-precision Kokoro model (326 MB) by default, for the cleanest voice. On an older phone, each sentence may take longer to make than to hear, which leaves gaps while you listen. If so, `kokoro --quality standard` switches to the 8-bit model (92 MB), which is quicker and lighter on the battery but can sound faintly buzzy; it also offers to delete the big model. `kokoro --quality high` switches back, downloading the model if it isn't there. It's also in the settings, as **Voice quality**.
-- **English pronunciation.** By default, kokomux reads English with misaki, the dictionary-based tool Kokoro was trained with (American and British English). Without it, Kokoro turns text into sounds with espeak, which gets some English words wrong. misaki picks the right reading from the sentence:
+- **Full precision.** kokomux runs Kokoro's full-precision model (326 MB), not the 8-bit version, which can sound faintly buzzy.
+- **English pronunciation.** English (American and British) is turned into sounds by misaki, the dictionary-based tool Kokoro was trained with, rather than espeak, which gets some words wrong. misaki picks the right reading from the sentence:
 
-  | | espeak | dictionary |
+  | | espeak | misaki |
   |---|---|---|
   | "I **read** the book yesterday" | "reed" | "red" |
   | "please **record** the record" | "REC-ord" both times | "re-CORD", then "REC-ord" |
   | "**wind** the clock" | "wind", as in breeze | "wynd" |
   | "$42.50" | "dollar forty-two point five zero" | "forty-two dollars and fifty cents" |
 
-  It takes 260 MB (spaCy and its small English model, no PyTorch). It adds a few seconds when Kokoro starts, but almost nothing per sentence. Words it doesn't know still go to espeak, and other languages always use espeak. Word highlighting works the same. `kokoro --pronunciation standard` switches to espeak, and offers to remove misaki; `kokoro --pronunciation dictionary` installs it again. It's also in the settings, as **English pronunciation**.
+  It uses spaCy's small English model to tell a noun from a verb. Words misaki doesn't know, and other languages, go to espeak.
 - **Blend voices.** Mix two (or up to four) voices into one of your own: `-v af_heart:70+bf_emma:30` is 70% `af_heart` and 30% `bf_emma`, and `af_heart+af_bella` is half and half. In the settings, **Blend with** picks the second voice and **Blend amount** sets how much of it you hear (10% to 90%). Press Space on either to hear the mix. `af_heart` and `af_bella` are Kokoro's strongest voices, so they make a good base.
 - **Smooth joins.** A long text is read in parts of a few whole sentences each (up to 360 characters), never across a paragraph. Each part ends with a pause that fits where it is: 0.25 s after a sentence, as Kokoro pauses inside a part, then longer after a paragraph (0.65 s) and a chapter (1.06 s). Those are golden-ratio steps. The edges of each part are softened by a few milliseconds, so they can't click. Saved files get the same pauses.
 - **Text made speakable.** Before reading, kokomux tidies what's meant for the eye:
@@ -88,8 +85,6 @@ kokoro --stop                             # stop playback
   - in English, titles (Dr., Mrs., St.), abbreviations (e.g., i.e., etc., vs., No., p.), times (5 p.m.) and units (km, mph, °C, kg)
 
   The reader shows the tidied text, so the word that's lit is the word you hear. An abbreviation or initial ("J. R. R. Tolkien") never ends a part.
-
-Bookmarks made before this version still work: kokomux finds the same place in the text, even though the parts are now longer.
 
 **Saving where other apps can find it:** run `termux-setup-storage` once, then save to shared storage, e.g. `-o ~/storage/shared/Music/note.mp3`.
 
@@ -219,8 +214,6 @@ Before 0.8, a separate speech recogniser (Whistle) listened to each line to find
   - **Blend with** and **Blend amount:** a second voice mixed into yours, from 10% to 90%. Space hears the mix; ← on **Blend with** turns it off.
   - **Speed:** a slider from 0.5× to 2×.
   - **Language:** cycle through Kokoro's nine languages.
-  - **Voice quality:** High (the default), or Standard, the smaller 8-bit model (see [Better-sounding speech](#better-sounding-speech)). Choosing High offers to download it if it isn't there.
-  - **English pronunciation:** Dictionary (misaki, the default), or Standard (espeak). Choosing Dictionary offers to install it if it isn't there.
   - **Save files as:** the default file name.
 - **Reading:**
   - **Full-screen reader:** on or off.
@@ -255,7 +248,8 @@ The server only listens on the phone itself (127.0.0.1). It needs a secret token
 ## Update and uninstall
 
 ```sh
-kokoro --update      # get the latest kokomux and Kokoro
+kokoro --update          # get the latest kokomux and Kokoro (from main)
+kokoro --update BRANCH   # or from a branch, before it's merged
 kokoro --uninstall   # remove the container, the command, settings and helper scripts
 ```
 
@@ -266,11 +260,11 @@ Kokoro's Python packages (`onnxruntime`, `espeakng-loader`, `soundfile`) only sh
 - **`kokoro`** (Termux side): reads your text, starts or uses the server, and hands each run to the player.
 - **`player.sh`, `tui.sh` and `theme.sh`** (Termux side): play the audio with `play-audio`, and draw the reader, home screen and settings in colours made from the terminal's own.
 - **`engine.py`** (inside Debian): splits the text into sentences and runs Kokoro. With `-p` it hands back audio one chunk at a time, so playback starts after the first sentence.
-- **misaki** (inside Debian, optional): with **English pronunciation: Dictionary**, turns English into sounds the way Kokoro was trained, using spaCy to tell a noun from a verb.
+- **misaki** (inside Debian): turns English into sounds the way Kokoro was trained, using spaCy to tell a noun from a verb.
 - **`words.py`** (inside Debian): turns Kokoro's per-sound timings into word timings, for the highlight.
 - **Sharing files:** the two sides exchange text and audio through `$PREFIX/tmp`, which the container sees as `/tmp`.
 
-The installer only keeps what's needed in the container. It skips documentation and man pages, and clears the apt and pip download caches after installing. The models are the timestamped exports from onnx-community, pinned to one version: the full-precision one (326 MB) and the 8-bit one (92 MB, used with **Voice quality: Standard**, or if the big one is missing), plus about 28 MB of voices. With `--standard`, only the 8-bit one is downloaded.
+The installer only keeps what's needed in the container. It skips documentation and man pages, and clears the apt and pip download caches after installing. The model is the full-precision timestamped export from onnx-community (326 MB, pinned to one version), plus about 28 MB of voices.
 
 **Why not run natively in Termux?** Termux now packages onnxruntime, numpy, espeak and libsndfile, but kokoro-onnx's own dependencies still can't be installed there. `espeakng-loader` ships only glibc builds. `phonemizer` needs `segments`, which needs the `regex` C extension, and `soundfile` needs `cffi`; Termux packages neither, so both would have to be compiled on the phone. Until that's simpler, and can be tested on a real device, the container stays.
 

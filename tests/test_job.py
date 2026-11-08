@@ -2,8 +2,8 @@
 
 Run with:  python3 tests/test_job.py   (or pytest). Needs numpy and soundfile;
 skipped without them. The stand-in makes a tone per character, so lengths can
-be checked: the pauses between parts, the edges, blended voices, the model
-chosen for each quality, and bookmarks from an older version's parts.
+be checked: the pauses between parts, the edges, blended voices, misaki for
+English, and bookmarks from an older version's parts.
 """
 import os
 import secrets
@@ -44,7 +44,7 @@ class FakeKokoro:
         return np.full(len(text) * PER_CHAR, 0.5, dtype=np.float32), RATE
 
 
-def run(text, *, stream=True, out=None, models=("standard",), **job):
+def run(text, *, stream=True, out=None, g2p=None, **job):
     """Run a job with FakeKokoro; return (jobdir, fake)."""
     jobdir = f"/tmp/kokoro.{secrets.token_hex(6)}"          # as kokoro names them (the engine checks)
     os.mkdir(jobdir)
@@ -59,19 +59,22 @@ def run(text, *, stream=True, out=None, models=("standard",), **job):
         f.write("".join(f"{k}={v}\n" for k, v in job.items()))
     made = {}
 
-    def fake_tts(quality="standard"):
-        model = engine.MODEL_HQ if quality == "high" and "high" in models else engine.MODEL
-        made.setdefault(model, FakeKokoro(model))
-        return made[model]
+    def fake_tts():
+        made.setdefault(engine.MODEL, FakeKokoro(engine.MODEL))
+        return made[engine.MODEL]
 
-    old = engine.tts, engine.model_for, engine._wait_for_listener
+    # misaki for English: a stand-in, or none (text as given) to check the rest
+    old = engine.tts, engine._wait_for_listener, dict(engine._g2p)
     engine.tts = fake_tts
-    engine.model_for = lambda q: engine.MODEL_HQ if q == "high" and "high" in models else engine.MODEL
     engine._wait_for_listener = lambda *a: None
+    engine._g2p.clear()
+    engine._g2p.update({False: g2p, True: g2p})
     try:
         engine.run_job(os.path.join(jobdir, "job"))
     finally:
-        engine.tts, engine.model_for, engine._wait_for_listener = old
+        engine.tts, engine._wait_for_listener = old[:2]
+        engine._g2p.clear()
+        engine._g2p.update(old[2])
     return jobdir, made
 
 
@@ -181,22 +184,6 @@ def test_bad_voices_are_refused():
 
 
 @needs_audio
-def test_quality_picks_the_model_and_falls_back_when_it_is_missing():
-    jobdir, made = run("Hello.", quality="high", models=("standard", "high"))
-    shutil.rmtree(jobdir)
-    assert list(made) == [engine.MODEL_HQ]
-    jobdir, made = run("Hello.", quality="high")                   # not downloaded
-    shutil.rmtree(jobdir)
-    assert list(made) == [engine.MODEL]
-    try:
-        run("Hello.", quality="ultra")
-    except engine.JobError:
-        pass
-    else:
-        raise AssertionError("an unknown quality was accepted")
-
-
-@needs_audio
 def test_a_bookmark_from_older_parts_lands_in_the_same_place():
     text = " ".join(f"Sentence {n} of the story goes here, and it carries on." for n in range(200))
     parts = len(engine.split_text(engine.normalise(text)))
@@ -233,22 +220,13 @@ def test_dictionary_sounds_per_word_follow_the_highlighted_words():
 
 
 @needs_audio
-def test_dictionary_pronunciation_for_english_only():
-    old = dict(engine._g2p)
-    engine._g2p.update({False: FakeMisaki(), True: FakeMisaki()})
-    try:
-        jobdir, made = run("Well, read it.", pronunciation="dictionary")
-        shutil.rmtree(jobdir)
-        assert made[engine.MODEL].calls[0][0] == "WELL , READ IT ." and made[engine.MODEL].calls[0][-1] == "phonemes"
-        jobdir, made = run("Bonjour.", pronunciation="dictionary", lang="fr-fr")
-        shutil.rmtree(jobdir)
-        assert made[engine.MODEL].calls[0][0] == "Bonjour." and made[engine.MODEL].calls[0][-1] != "phonemes"
-        jobdir, made = run("Well, read it.", pronunciation="standard")
-        shutil.rmtree(jobdir)
-        assert made[engine.MODEL].calls[0][0] == "Well, read it."
-    finally:
-        engine._g2p.clear()
-        engine._g2p.update(old)
+def test_english_goes_through_misaki_other_languages_through_espeak():
+    jobdir, made = run("Well, read it.", g2p=FakeMisaki())
+    shutil.rmtree(jobdir)
+    assert made[engine.MODEL].calls[0][0] == "WELL , READ IT ." and made[engine.MODEL].calls[0][-1] == "phonemes"
+    jobdir, made = run("Bonjour.", g2p=FakeMisaki(), lang="fr-fr")
+    shutil.rmtree(jobdir)
+    assert made[engine.MODEL].calls[0][0] == "Bonjour." and made[engine.MODEL].calls[0][-1] != "phonemes"
 
 
 if __name__ == "__main__":
