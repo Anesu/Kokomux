@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.4.1"
+KOKOMUX_VERSION="0.5.0"
 DISTRO=kokoro
 
 ASSUME_YES=0; VERBOSE=0
@@ -360,7 +360,9 @@ import secrets
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
+import zipfile
 from html.parser import HTMLParser
 
 APP = os.path.dirname(os.path.abspath(__file__))
@@ -375,6 +377,7 @@ JOB_DIR_RE = re.compile(r"^/tmp/kokoro\.[A-Za-z0-9]+$")
 FORMATS = ("wav", "mp3", "ogg", "flac")
 USER_AGENT = "Mozilla/5.0 (Linux; Android) kokomux"
 MAX_CHUNK = 200  # characters per synthesis chunk
+AHEAD = 3        # while listening, parts made ahead of the one being heard
 SERVING = False
 
 
@@ -390,6 +393,10 @@ def log(msg):
 
 _tts = None
 _tts_lock = threading.Lock()
+# One synthesis at a time, across every job the server is running: espeak isn't
+# thread-safe, and the phone has only so much CPU. Held per part, not per job, so
+# a book playing for hours doesn't block a quick command.
+SYNTH_LOCK = threading.Lock()
 
 
 def tts():
@@ -509,20 +516,24 @@ class _Extractor(HTMLParser):
         self.buf = []
         self.block = None
 
-    def text(self):
+    def text(self, with_title=True):
         self._flush()
         art = [t for a, t in self.blocks if a]
         use = art if sum(map(len, art)) > 500 else [t for _, t in self.blocks]
         # Headings and list items often lack a full stop; end each block so it
         # gets its own pause.
         use = [t if t[-1] in ".!?…:;" else t + "." for t in use]
-        title = re.sub(r"\s+", " ", self.title).strip()
-        if title and (not use or title.split(" - ")[0].split(" | ")[0] not in use[0]):
+        title = self.page_title()
+        if with_title and title and (not use or title.split(" - ")[0].split(" | ")[0] not in use[0]):
             use.insert(0, title + ".")
         return "\n".join(use)
 
+    def page_title(self):
+        return re.sub(r"\s+", " ", self.title).strip()
+
 
 def fetch_url(url):
+    """A web page's (title, readable text)."""
     if not re.match(r"^https?://", url):
         raise JobError(f"Not a web address: {url}")
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -534,7 +545,7 @@ def fetch_url(url):
     except Exception as e:  # noqa: BLE001 - report any network error plainly
         raise JobError(f"Couldn't fetch {url}: {e}") from e
     if ctype == "text/plain":
-        return body
+        return url, body
     if "html" not in ctype and "xml" not in ctype:
         raise JobError(f"That link is {ctype}, not a web page")
     ex = _Extractor()
@@ -542,7 +553,109 @@ def fetch_url(url):
     text = ex.text()
     if not text.strip():
         raise JobError("Couldn't find any readable text on that page")
-    return text
+    return ex.page_title() or url, text
+
+
+# ------------------------------------------------------------------ books
+
+def read_epub(path, name):
+    """An EPUB's (title, text): its chapters in reading order, as the reader sees them."""
+    import posixpath
+    import xml.etree.ElementTree as ET
+
+    def local(tag):
+        return tag.rsplit("}", 1)[-1]
+
+    parts = []
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+            if "META-INF/encryption.xml" in names and b"EncryptedData" in z.read("META-INF/encryption.xml"):
+                raise JobError("That EPUB is DRM-protected, so its text can't be read")
+            container = ET.fromstring(z.read("META-INF/container.xml"))
+            opf_path = next(el.get("full-path") for el in container.iter() if local(el.tag) == "rootfile")
+            opf = ET.fromstring(z.read(opf_path))
+            title = next((el.text for el in opf.iter() if local(el.tag) == "title" and el.text), "")
+            manifest = {el.get("id"): el.get("href") for el in opf.iter() if local(el.tag) == "item"}
+            spine = [el.get("idref") for el in opf.iter()
+                     if local(el.tag) == "itemref" and el.get("linear", "yes") != "no"]
+            base = posixpath.dirname(opf_path)
+            for idref in spine:
+                href = manifest.get(idref)
+                if not href:
+                    continue
+                inner = posixpath.normpath(posixpath.join(base, urllib.parse.unquote(href.split("#")[0])))
+                if inner not in names:
+                    continue
+                ex = _Extractor()
+                ex.feed(z.read(inner).decode("utf-8", "replace"))
+                chapter = ex.text(with_title=False)
+                if chapter.strip():
+                    parts.append(chapter)
+    except JobError:
+        raise
+    except (KeyError, StopIteration, zipfile.BadZipFile, ET.ParseError) as e:
+        raise JobError(f"Couldn't read that EPUB ({type(e).__name__})") from None
+    if not parts:
+        raise JobError("That EPUB has no readable text")
+    return (title or "").strip() or name, "\n\n".join(parts)
+
+
+def read_pdf(path, name):
+    """A PDF's (title, text), with its lines joined back into sentences."""
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        raise JobError("Reading PDFs needs a newer kokomux: kokoro --update") from None
+    try:
+        reader = PdfReader(path)
+        if reader.is_encrypted and not reader.decrypt(""):
+            raise JobError("That PDF is password-protected")
+        pages = [page.extract_text() or "" for page in reader.pages]
+        title = (reader.metadata.title if reader.metadata else None) or name
+    except JobError:
+        raise
+    except Exception as e:  # noqa: BLE001 - pypdf raises many kinds of error for broken files
+        raise JobError(f"Couldn't read that PDF ({type(e).__name__})") from None
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", "\n".join(pages))        # words split across lines
+    lines = [ln.strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln and not re.fullmatch(r"\d{1,4}", ln)]   # bare page numbers
+    sentences, buf = [], ""
+    for ln in lines:   # a line that doesn't end a sentence carries on into the next
+        buf = f"{buf} {ln}" if buf else ln
+        if re.search(r"[.!?:;\"”’)]$", ln):
+            sentences.append(buf)
+            buf = ""
+    if buf:
+        sentences.append(buf)
+    if not sentences:
+        raise JobError("That PDF has no text to read (is it a scan?)")
+    return str(title).strip() or name, "\n".join(sentences)
+
+
+def read_source(jobdir, job):
+    """What a job reads, as (title, text): a web page, or a file that is an EPUB,
+    a PDF or plain text."""
+    name = job.get("name", "")
+    if job.get("url"):
+        log(f"Fetching {job['url']}")
+        return fetch_url(job["url"])
+    file = job.get("file", "in.txt")
+    if "/" in file:
+        raise JobError(f"Bad input file name: {file}")
+    path = os.path.join(jobdir, file)
+    with open(path, "rb") as fh:
+        head = fh.read(64)
+    if head.startswith(b"%PDF"):
+        return read_pdf(path, name)
+    if head.startswith(b"PK") and zipfile.is_zipfile(path):
+        return read_epub(path, name)
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    bad = text.count("\ufffd") + text.count("\x00")
+    if text and bad > max(3, len(text) // 100):
+        raise JobError("That doesn't look like text, an EPUB or a PDF")
+    return name, text
 
 
 # ------------------------------------------------------------------ jobs
@@ -594,28 +707,34 @@ def run_job(path):
         if job.get("words") == "1":
             aligner = WordAligner(stream, lang)
 
+    writer = None
+    total = 0.0
     try:
-        if job.get("url"):
-            log(f"Fetching {job['url']}")
-            text = fetch_url(job["url"])
-        else:
-            with open(os.path.join(jobdir, "in.txt"), encoding="utf-8", errors="replace") as fh:
-                text = fh.read()
-            bad = text.count("\ufffd") + text.count("\x00")
-            if text and bad > max(3, len(text) // 100):
-                raise JobError("That doesn't look like text (is it a PDF, image or other binary file?)")
+        title, text = read_source(jobdir, job)
+        _write_atomic(os.path.join(jobdir, "title"), (title or "").replace("\n", " ")[:120] + "\n")
         chunks = split_text(text)
         if not chunks:
             raise JobError("No text to read")
+        try:
+            first = int(job.get("start", "1"))
+        except ValueError:
+            first = 1
+        if not 1 <= first <= len(chunks):
+            first = 1   # a bookmark past the end: start again
+        if stream:
+            _write_atomic(os.path.join(stream, "first"), f"{first}\n")
 
-        parts, rate, total = [], 24000, 0.0
-        for i, chunk in enumerate(chunks, 1):
+        for i in range(first, len(chunks) + 1):
+            chunk = chunks[i - 1]
+            if stream:
+                _wait_for_listener(jobdir, stream, i, first)
             # The kokoro command deletes its job folder when it exits or is
             # stopped, so a vanished folder means nobody is waiting any more.
             if not os.path.isdir(jobdir) or (stream and not os.path.isdir(stream)):
                 raise JobError("Cancelled")
             _write_atomic(os.path.join(jobdir, "progress"), f"{i} {len(chunks)}\n")
-            samples, rate = engine.create(chunk, voice=voice, speed=speed, lang=lang)
+            with SYNTH_LOCK:
+                samples, rate = engine.create(chunk, voice=voice, speed=speed, lang=lang)
             total += len(samples) / rate
             if stream:
                 # The text first, so the player can show the line the moment its audio lands.
@@ -626,11 +745,15 @@ def run_job(path):
                 if aligner:
                     aligner.add(i, chunk, samples, rate)
             if out:
-                parts.append(samples)
-                parts.append(np.zeros(int(rate * 0.2), dtype=samples.dtype))
-        if out:
-            sf.write(out, np.concatenate(parts[:-1]), rate)
+                # Written as it's made, so a whole book never has to fit in memory.
+                if writer is None:
+                    writer = sf.SoundFile(out, "w", samplerate=rate, channels=1)
+                else:
+                    writer.write(np.zeros(int(rate * 0.2), dtype=np.float32))
+                writer.write(samples)
     finally:
+        if writer is not None:
+            writer.close()
         if stream and os.path.isdir(stream):
             open(os.path.join(stream, "end"), "w").close()
         if aligner:
@@ -639,6 +762,20 @@ def run_job(path):
     elapsed = time.time() - t0
     _write_atomic(os.path.join(jobdir, "result"), f"{total:.1f} {elapsed:.1f} {len(chunks)}\n")
     return f"Made {total:.1f}s of audio in {elapsed:.1f}s"
+
+
+def _wait_for_listener(jobdir, stream, i, first):
+    """While listening, stay at most AHEAD parts ahead of the one being heard, so a
+    whole book isn't rendered to disk while its first chapter plays (or is paused)."""
+    while os.path.isdir(jobdir):
+        try:
+            with open(os.path.join(stream, "playing")) as fh:
+                playing = int(fh.read().strip() or first)
+        except (OSError, ValueError):
+            playing = first
+        if i <= playing + AHEAD:
+            return
+        time.sleep(0.2)
 
 
 def _write_atomic(path, text):
@@ -741,7 +878,6 @@ def serve(port, idle):
     log("Loading model...")
     tts()
     token = secrets.token_hex(16)
-    job_lock = threading.Lock()
     state = {"last": time.time(), "busy": 0}
 
     class Handler(BaseHTTPRequestHandler):
@@ -780,8 +916,7 @@ def serve(port, idle):
             path = parse_qs(url.query).get("path", [""])[0]
             state["busy"] += 1
             try:
-                with job_lock:
-                    msg = run_job(path)
+                msg = run_job(path)
                 self._reply(200, msg)
             except JobError as e:
                 self._reply(400, f"Error: {e}")
@@ -1363,8 +1498,8 @@ CFG
     mkdir -p "$APP"
     [ -x "$APP/venv/bin/python" ] || python3 -m venv "$APP/venv"
     "$APP/venv/bin/pip" install --upgrade pip
-    # cactus-compute is Whistle, the recogniser behind word highlighting.
-    "$APP/venv/bin/pip" install --upgrade kokoro-onnx soundfile cactus-compute | tee /tmp/kokoro-setup/.pip
+    # cactus-compute is Whistle, the recogniser behind word highlighting; pypdf reads PDFs.
+    "$APP/venv/bin/pip" install --upgrade kokoro-onnx soundfile cactus-compute pypdf | tee /tmp/kokoro-setup/.pip
     grep -q '^Successfully installed' /tmp/kokoro-setup/.pip || printf 'up to date' > "$SRC/.note"
     cp "$SRC/engine.py" "$SRC/words.py" "$APP/"
     rm -f "$APP/speak.py"   # from older versions
@@ -1403,7 +1538,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
 # localhost (fast); otherwise each call starts the container (slower).
 set -euo pipefail
 
-KOKOMUX_VERSION="0.4.1"
+KOKOMUX_VERSION="0.5.0"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -1422,6 +1557,7 @@ KOKORO_IDLE_MINUTES=30
 KOKORO_PORT=8880
 KOKORO_WORDS=1                 # light up each word as it's spoken (-p on a terminal)
 KOKORO_WORDS_OFFSET_MS=100     # play-audio's start-up delay, so the highlight isn't early
+KOKORO_NOTIFY=1                # a notification with pause / next / again buttons (Termux:API)
 KOKORO_REPO_RAW=https://raw.githubusercontent.com/Anesu/kokomux/main
 # shellcheck source=/dev/null
 [ -f "$CONF" ] && . "$CONF"
@@ -1433,6 +1569,9 @@ ENGINE=/opt/kokoro/engine.py
 SRV_DIR="$PREFIX/tmp/kokoro-server"
 TOKEN_FILE="$SRV_DIR/token"
 PLAYER_PID="$PREFIX/tmp/kokoro-player.pid"
+CONTROL="$PREFIX/tmp/kokoro-control"      # kokoro --pause/--next/--again leave a word here
+PLAYER_STATE="$PREFIX/tmp/kokoro-state"   # "playing" or "paused", for --pause to report
+BOOKS="$HOME/.local/share/kokomux/bookmarks"
 
 # ------------------------------------------------------------ look & feel
 # Messages go to stderr. Colours and live status only on a terminal, so
@@ -1517,14 +1656,22 @@ usage() {
 ROWS
   printf '\n%sRead from%s\n' "$B" "$R"
   opt_rows <<'ROWS'
--f FILE|a text file
+-f FILE|a text file, EPUB or PDF
 -c, --clipboard|the clipboard (or the link in it)
 -u URL|a web page
+ROWS
+  printf '\n%sWhile listening%s\n' "$B" "$R"
+  opt_rows <<'ROWS'
+--pause|pause, or carry on
+--next|skip to the next part
+--again|hear this part again
+--stop|stop
+--continue|carry on with the last long text
+--restart|with -p: start from the top, not the bookmark
 ROWS
   printf '\n%sMore%s\n' "$B" "$R"
   opt_rows <<'ROWS'
 --list-voices|all 54 voices by language
---stop|stop playback
 --status|server status and settings
 --config|change your defaults
 --serve / --stop-server|start or stop the server
@@ -1585,6 +1732,19 @@ stop_server() {
 
 # ------------------------------------------------------------ playback
 
+player_alive() { local pid; pid="$(cat "$PLAYER_PID" 2>/dev/null)" && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }
+
+# control WORD MESSAGE: tell the running player to pause, skip or replay
+control() {
+  player_alive || { info "Nothing is playing."; exit 0; }
+  echo "$1" > "$CONTROL"
+  [ -n "${2:-}" ] && done_msg "$2"
+  return 0
+}
+
+# Bookmarks: where a long text was stopped, as key=value lines.
+mark_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1; }
+
 stop_playback() {
   local pid
   pid="$(cat "$PLAYER_PID" 2>/dev/null)" || return 1
@@ -1600,6 +1760,22 @@ case "${1:-}" in
   --stop)
     if stop_playback; then done_msg "Stopped."; else info "Nothing is playing."; fi
     exit 0 ;;
+  --pause)
+    if [ "$(cat "$PLAYER_STATE" 2>/dev/null)" = paused ]; then control toggle "Playing again."
+    else control toggle "Paused." ; fi
+    exit 0 ;;
+  --next) control next "Skipping to the next part."; exit 0 ;;
+  --again) control again "Playing this part again."; exit 0 ;;
+  --continue)
+    last="$(ls -t "$BOOKS"/*.mark 2>/dev/null | head -n 1)" || true
+    [ -n "$last" ] || die "There's nothing to continue." "A bookmark is kept when you stop a long text partway."
+    case "$(mark_get "$last" kind)" in
+      url)  src=(-u "$(mark_get "$last" source)") ;;
+      text) src=(-f "${last%.mark}.txt") ;;
+      *)    src=(-f "$(mark_get "$last" source)")
+            [ -f "${src[1]}" ] || die "Can't find \"${src[1]}\" any more." "Has the file moved? Open it again with kokoro -p -f." ;;
+    esac
+    exec "$0" -p -v "$(mark_get "$last" voice)" -s "$(mark_get "$last" speed)" -l "$(mark_get "$last" lang)" "${src[@]}" ;;
   --serve)
     if server_up; then info "The server is already running."; exit 0; fi
     start_server || exit 1
@@ -1620,6 +1796,11 @@ case "${1:-}" in
     printf '    Speed     %s\n' "$KOKORO_SPEED"
     printf '    Language  %s\n' "$KOKORO_LANG"
     printf '    Idle stop %s\n' "$idle"
+    last="$(ls -t "$BOOKS"/*.mark 2>/dev/null | head -n 1)" || true
+    if [ -n "$last" ]; then
+      printf '    Bookmark  %s %s(part %s of %s · kokoro --continue)%s\n' "$(mark_get "$last" title)" "$D" \
+        "$(mark_get "$last" part)" "$(mark_get "$last" parts)" "$R"
+    fi
     printf '    Settings  %s%s%s\n' "$D" "$(tilde "$CONF")" "$R"
     printf '    %sChange them with: kokoro --config%s\n' "$D" "$R"
     exit 0 ;;
@@ -1648,7 +1829,7 @@ case "${1:-}" in
              "$HOME/.shortcuts/tasks/"Kokoro*; do
       if [ -f "$f" ] && grep -q '^# kokomux' "$f"; then rm -f "$f"; done_msg "Removed $(tilde "$f")"; fi
     done
-    rm -rf "$CONF_DIR" "$SRV_DIR" "$HOME/kokoro-test.wav" "$HOME/.cache/kokomux"
+    rm -rf "$CONF_DIR" "$SRV_DIR" "$HOME/kokoro-test.wav" "$HOME/.cache/kokomux" "$HOME/.local/share/kokomux"
     done_msg "Settings removed"
     rm -f "$0"
     done_msg "kokomux is uninstalled." "Thanks for trying it!"
@@ -1668,7 +1849,7 @@ esac
 
 # ------------------------------------------------------------ options
 
-out=""; infile=""; url=""; play=0; clip=0; words=()
+out=""; infile=""; url=""; play=0; clip=0; restart=0; words=()
 voice="$KOKORO_VOICE"; speed="$KOKORO_SPEED"; lang="$KOKORO_LANG"
 need() { [ $# -ge 2 ] || die "$1 needs a value." "See: kokoro --help"; }
 while [ $# -gt 0 ]; do
@@ -1687,6 +1868,7 @@ while [ $# -gt 0 ]; do
     --lang=*)       lang="${1#*=}"; shift ;;
     -p|--play)      play=1; shift ;;
     -c|--clipboard) clip=1; shift ;;
+    --restart)      restart=1; shift ;;
     --)             shift; words+=("$@"); break ;;
     -?*)            die "Unknown option $1" "See: kokoro --help" ;;
     *)              words+=("$1"); shift ;;
@@ -1715,7 +1897,8 @@ gen_pid=""; play_pid=""
 cleanup() {
   set +e   # best effort from here: a process that's already gone mustn't change the exit code
   status_clear
-  [ "${in_line:-0}" = 1 ] && block_finish       # stopped mid-line: leave nothing lit
+  [ "${in_line:-0}" = 1 ] && [ "${show_words:-0}" = 1 ] && block_finish   # stopped mid-line: nothing lit
+  if [ "${play:-0}" = 1 ]; then notify_clear; rm -f "$PLAYER_STATE"; fi
   [ -n "$play_pid" ] && kill "$play_pid" 2>/dev/null
   [ -n "$gen_pid" ] && kill "$gen_pid" 2>/dev/null
   rm -rf "$tmpd"
@@ -1723,9 +1906,16 @@ cleanup() {
   return 0
 }
 trap cleanup EXIT
-trap 'exit 130' INT TERM HUP
+# A stop signal (Ctrl+C, kokoro --stop) during the frame timer must not exit from
+# inside `read -t`: if cleanup then outlives the timer, bash's alarm jumps back into
+# a read that's gone and bash crashes (seen with bash 5.2). So during the timer the
+# signal only sets a flag, and tick() exits once read has returned.
+STOP=""; IN_TICK=0
+on_signal() { if [ "$IN_TICK" = 1 ]; then STOP=1; else exit 130; fi; }
+trap on_signal INT TERM HUP
 
 text="$tmpd/in.txt"
+book=0
 if [ -n "$url" ]; then
   :
 elif [ "$clip" = 1 ]; then
@@ -1737,6 +1927,8 @@ elif [ "$clip" = 1 ]; then
 elif [ -n "$infile" ]; then
   [ -f "$infile" ] || die "There's no file called \"$infile\"."
   cp "$infile" "$text"
+  magic=""; read -r -n 4 magic < "$infile" || true
+  case "$magic" in %PDF*|PK*) book=1 ;; esac   # a PDF or EPUB: the engine reads it
 elif [ ${#words[@]} -gt 0 ]; then
   printf '%s\n' "${words[*]}" > "$text"
 elif [ ! -t 0 ]; then
@@ -1746,15 +1938,34 @@ else
 fi
 
 # A copied link on its own means "read that page".
-if [ -z "$url" ] && [ "$(wc -l < "$text")" -le 1 ] &&
+if [ -z "$url" ] && [ "$book" = 0 ] && [ "$(wc -l < "$text")" -le 1 ] &&
    grep -qE '^[[:space:]]*https?://[^[:space:]]+[[:space:]]*$' "$text"; then
   url="$(tr -d '[:space:]' < "$text")"
 fi
-if [ -z "$url" ] && ! grep -q '[^[:space:]]' "$text"; then
+if [ -z "$url" ] && [ "$book" = 0 ] && ! grep -q '[^[:space:]]' "$text"; then
   [ "$clip" = 1 ] && die "The clipboard is empty."
   die "There's no text to read."
 fi
 [[ "$url" != *$'\n'* ]] || die "That doesn't look like a web address."
+
+# What it's called (the engine may find a better title inside), and, when
+# listening, a bookmark keyed by what's being read: the same text, file or page
+# picks up where it was stopped.
+if [ -n "$url" ]; then kind=url source=$url name=$url
+elif [ -n "$infile" ]; then kind=file source="$(realpath "$infile")" name="$(basename "$infile")"
+else kind=text source="" name="$(head -c 60 "$text" | tr '\n' ' ')"; fi
+book_id=""; start=1
+if [ "$play" = 1 ] && [ -z "$out" ]; then
+  if [ "$kind" = url ]; then book_id="$(printf '%s' "$url" | sha256sum | cut -c1-16)"
+  else book_id="$(sha256sum < "$text" | cut -c1-16)"; fi
+  mark="$BOOKS/$book_id.mark"
+  if [ "$restart" = 1 ]; then rm -f "$mark" "$BOOKS/$book_id.txt"
+  elif [ -f "$mark" ] && [ "$(mark_get "$mark" part)" -gt 1 ] 2>/dev/null; then
+    start="$(mark_get "$mark" part)"
+    info "Picking up at part $start of $(mark_get "$mark" parts)."
+    printf '  %s(--restart starts from the top)%s\n' "$D" "$R" >&2
+  fi
+fi
 
 # With -p on a terminal, show each line as it's read and light the spoken word.
 show_words=0
@@ -1765,6 +1976,8 @@ show_words=0
   echo "speed=$speed"
   echo "lang=$lang"
   [ -n "$url" ] && echo "url=$url"
+  echo "name=$name"
+  [ "$start" -gt 1 ] && echo "start=$start"
   [ -n "$out" ] && echo "out=out.$ext"
   [ "$play" = 1 ] && echo "stream=1"
   [ "$show_words" = 1 ] && echo "words=1"
@@ -1798,7 +2011,7 @@ progress() {
   echo ""
 }
 waiting_label() {
-  if [ "$play" = 1 ] && [ "$i" -gt 1 ]; then echo "Preparing"
+  if [ "$play" = 1 ] && [ "$i" -gt "$start" ]; then echo "Preparing"
   elif [ -f "$tmpd/progress" ]; then echo "Making speech"
   elif [ -n "$url" ]; then echo "Fetching the page"
   else echo "Getting ready"; fi
@@ -1818,6 +2031,7 @@ blk_lines=(); blk_offs=(); view_top=0; view_h=0
 w_s=(); w_e=(); w_a=(); w_b=(); w_state=none
 TERM_ROWS=24
 exec {TICK}<> <(:)                    # read -t on this is a sleep with no process
+tick() { IN_TICK=1; read -r -t "$1" -u "$TICK" _ || true; IN_TICK=0; [ -z "$STOP" ] || exit 130; }
 now_ms() { local t=${EPOCHREALTIME//[!0-9]/}; NOW=$(( t / 1000 )); }   # no subshell: called every frame
 in_line=0
 
@@ -1887,41 +2101,105 @@ words_load() {   # read NNNN.words once it lands
   else w_state=none; block_redraw -1 -1; fi   # below the bar: the line plain, nothing lit
 }
 
-play_line() {    # play_line WAV IDX: play one line, lighting each word as it's heard
-  local wav=$1 i=$2 base="${1%.wav}" cur=-1 lit=-2 lit_now t t0 label last=""
+# ------------------------------------------------------------ listening
+# Bookmarks, the notification and the controls that work while a text plays.
+
+book_title=""
+title_get() { [ -n "$book_title" ] || { [ -f "$tmpd/title" ] && read -r book_title < "$tmpd/title"; } || true; }
+
+bookmark_save() {   # bookmark_save PART: so the same command, or kokoro --continue, picks up here
+  local parts=1
+  [ -n "$book_id" ] || return 0
+  [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
+  [ "${parts:-1}" -gt 1 ] || return 0                     # nothing to come back to
+  [ -d "$BOOKS" ] || mkdir -p "$BOOKS"
+  [ "$kind" = text ] && [ ! -f "$BOOKS/$book_id.txt" ] && cp "$text" "$BOOKS/$book_id.txt"
+  printf 'part=%s\nparts=%s\ntitle=%s\nkind=%s\nsource=%s\nvoice=%s\nspeed=%s\nlang=%s\n' \
+    "$1" "$parts" "${book_title:-$name}" "$kind" "$source" "$voice" "$speed" "$lang" > "$BOOKS/$book_id.mark"
+}
+bookmark_done() { [ -n "$book_id" ] && rm -f "$BOOKS/$book_id.mark" "$BOOKS/$book_id.txt"; return 0; }
+
+# The notification: what's playing, with pause / next / again buttons that run
+# kokoro --pause / --next / --again. Swiping it away stops. In the background,
+# with a timeout, because termux-* commands hang without the Termux:API app.
+notify() {
+  [ "$KOKORO_NOTIFY" = 1 ] && command -v termux-notification >/dev/null || return 0
+  local k="$PREFIX/bin/kokoro"
+  ( timeout 15 termux-notification --id kokomux --type media --alert-once \
+      --title "${book_title:-$name}" --content "$1" --icon record_voice_over \
+      --media-previous "$k --again" --media-pause "$k --pause" --media-play "$k --pause" \
+      --media-next "$k --next" --on-delete "$k --stop" >/dev/null 2>&1 & )
+  return 0
+}
+notify_clear() {
+  [ "$KOKORO_NOTIFY" = 1 ] && command -v termux-notification-remove >/dev/null || return 0
+  ( timeout 10 termux-notification-remove kokomux >/dev/null 2>&1 & )
+  return 0
+}
+
+play_line() {    # play_line WAV IDX: play one part; light its words; obey pause / next / again
+  local wav=$1 i=$2 base="${1%.wav}" cur=-1 lit=-2 lit_now t t0 label last="" cmd paused=0 restart=1
   w_state=pending
   [ -f "$tmpd/stream/words-off" ] && w_state=off
-  echo "$i" > "$tmpd/stream/playing"          # the aligner works from the line being heard
-  block_load "$base.txt"
-  status_clear
-  if [ "$w_state" = off ]; then block_draw -1 -1; else block_draw 0 0; fi   # dim until words light
-  play-audio "$wav" >/dev/null 2>&1 & play_pid=$!
-  now_ms; t0=$NOW; in_line=1
-  # Nothing in this loop starts a process: it runs ~30 times a second on a phone.
-  while kill -0 "$play_pid" 2>/dev/null; do
-    if [ "$w_state" = pending ]; then words_load "$base.words" || true; fi   # not landed yet
-    if [ "$w_state" = ready ]; then
-      now_ms; t=$(( NOW - t0 - KOKORO_WORDS_OFFSET_MS ))
-      while [ $(( cur + 1 )) -lt "${#w_s[@]}" ] && [ "${w_s[cur + 1]}" -le "$t" ]; do cur=$(( cur + 1 )); done
-      # Keep the word lit through the pause after it; the last one goes out when it ends.
-      lit_now=$cur
-      if [ "$cur" -eq $(( ${#w_s[@]} - 1 )) ] && [ "$t" -gt "${w_e[cur]}" ]; then lit_now=-1; fi
-      if [ "$lit_now" -ne "$lit" ]; then
-        if [ "$lit_now" -ge 0 ]; then block_redraw "${w_a[lit_now]}" "${w_b[lit_now]}"
-        elif [ "$cur" -ge 0 ]; then block_redraw -1 -1    # past the last word
-        else block_redraw 0 0; fi                          # before the first
-        lit=$lit_now; last=""
+  echo "$i" > "$tmpd/stream/playing"          # the engine and aligner work from the part being heard
+  title_get; part_of "$i"
+  bookmark_save "$i"; notify "${PART% · }"
+  if [ "$show_words" = 1 ]; then
+    block_load "$base.txt"; status_clear
+    if [ "$w_state" = off ]; then block_draw -1 -1; else block_draw 0 0; fi   # dim until words light
+  fi
+  in_line=1
+  # Nothing in this loop starts a process except when something changes: it
+  # runs ~30 times a second on a phone.
+  while :; do
+    if [ "$restart" = 1 ]; then               # (re)start this part from its beginning
+      play-audio "$wav" >/dev/null 2>&1 & play_pid=$!
+      now_ms; t0=$NOW; cur=-1; lit=-2; restart=0
+      echo playing > "$PLAYER_STATE"
+    fi
+    if [ -f "$CONTROL" ]; then                # kokoro --pause / --next / --again
+      read -r cmd < "$CONTROL" || cmd=""; rm -f "$CONTROL"
+      case "$cmd" in
+        toggle)
+          if [ "$paused" = 1 ]; then paused=0; restart=1; notify "${PART% · }"   # carry on from the part's start
+          else kill "$play_pid" 2>/dev/null; wait "$play_pid" || true
+               paused=1; last=""; echo paused > "$PLAYER_STATE"; notify "Paused · ${PART% · }"; fi
+          continue ;;
+        next)  kill "$play_pid" 2>/dev/null; wait "$play_pid" || true; break ;;
+        again) kill "$play_pid" 2>/dev/null; wait "$play_pid" || true; restart=1; continue ;;
+      esac
+    fi
+    if [ "$paused" = 1 ]; then
+      [ -n "$last" ] || { status "Paused" "${PART}--pause to carry on" "‖"; last=paused; }
+      tick 0.1
+      continue
+    fi
+    kill -0 "$play_pid" 2>/dev/null || break  # the part has finished
+    if [ "$show_words" = 1 ]; then
+      if [ "$w_state" = pending ]; then words_load "$base.words" || true; fi   # not landed yet
+      if [ "$w_state" = ready ]; then
+        now_ms; t=$(( NOW - t0 - KOKORO_WORDS_OFFSET_MS ))
+        while [ $(( cur + 1 )) -lt "${#w_s[@]}" ] && [ "${w_s[cur + 1]}" -le "$t" ]; do cur=$(( cur + 1 )); done
+        # Keep the word lit through the pause after it; the last one goes out when it ends.
+        lit_now=$cur
+        if [ "$cur" -eq $(( ${#w_s[@]} - 1 )) ] && [ "$t" -gt "${w_e[cur]}" ]; then lit_now=-1; fi
+        if [ "$lit_now" -ne "$lit" ]; then
+          if [ "$lit_now" -ge 0 ]; then block_redraw "${w_a[lit_now]}" "${w_b[lit_now]}"
+          elif [ "$cur" -ge 0 ]; then block_redraw -1 -1    # past the last word
+          else block_redraw 0 0; fi                          # before the first
+          lit=$lit_now; last=""
+        fi
       fi
     fi
     part_of "$i"
-    label="${PART}Ctrl+C to stop"; [ "$w_state" = pending ] && label="${PART}word timings…"
+    label="${PART}Ctrl+C to stop"; [ "$show_words" = 1 ] && [ "$w_state" = pending ] && label="${PART}word timings…"
     if [ "$label" != "$last" ]; then status "Playing" "$label" "▶"; last=$label; fi
-    read -r -t 0.03 -u "$TICK" _ || true
+    tick 0.03
   done
   wait "$play_pid" || true
   play_pid=""; in_line=0
-  echo $(( i + 1 )) > "$tmpd/stream/playing"  # heard: the aligner can drop this line
-  block_finish
+  echo $(( i + 1 )) > "$tmpd/stream/playing"  # heard: the aligner can drop this part
+  [ "$show_words" = 1 ] && block_finish
   rm -f "$wav"
 }
 
@@ -1929,25 +2207,18 @@ play_line() {    # play_line WAV IDX: play one line, lighting each word as it's 
 
 if [ "$play" = 1 ]; then
   stop_playback || true
+  rm -f "$CONTROL"                             # nothing left over from an earlier player
   echo "$$" > "$PLAYER_PID"
 fi
 run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
 
-i=1
+i=$start
 while :; do
+  # The engine starts over at part 1 if a bookmark points past the end (the text changed).
+  [ "$i" = "$start" ] && [ -f "$tmpd/stream/first" ] && { read -r i < "$tmpd/stream/first" || i=$start; start=$i; }
   f="$(printf '%s/stream/%04d.wav' "$tmpd" "$i")"
-  if [ "$show_words" = 1 ] && [ -f "$f" ]; then
+  if [ "$play" = 1 ] && [ -f "$f" ]; then
     play_line "$f" "$i"; i=$((i + 1))
-  elif [ "$play" = 1 ] && [ -f "$f" ]; then
-    play-audio "$f" >/dev/null 2>&1 & play_pid=$!
-    while kill -0 "$play_pid" 2>/dev/null; do
-      part_of "$i"
-      status "Playing" "${PART}Ctrl+C to stop" "▶"
-      read -r -t 0.15 -u "$TICK" _ || true
-    done
-    wait "$play_pid" || true
-    play_pid=""
-    rm -f "$f"; i=$((i + 1))
   elif [ "$play" = 1 ] && [ -f "$tmpd/stream/end" ]; then
     [ -f "$f" ] && continue   # a last chunk may have landed just now
     break
@@ -1962,6 +2233,7 @@ done
 rc=0; wait "$gen_pid" || rc=$?
 gen_pid=""
 status_clear
+[ "$play" = 1 ] && [ "$rc" = 0 ] && bookmark_done   # read to the end: nothing to come back to
 
 if [ "$rc" != 0 ]; then
   msg="$(grep -m1 '^Error: ' "$tmpd/engine.log" | sed 's/^Error: //')" || true
@@ -2059,16 +2331,24 @@ KOKORO_PORT=8880
 # highlight runs ahead of the voice, lower it if it lags.
 KOKORO_WORDS=1
 KOKORO_WORDS_OFFSET_MS=100
+
+# While listening, a notification with pause / next / again buttons (needs the
+# Termux:API app). Swiping it away stops.
+KOKORO_NOTIFY=1
 CFG
   fi
 
   # Share a link to Termux -> read the page. Share text or a file -> read it.
   put "$HOME/bin/termux-url-opener" 'exec kokoro -p -u "$1"'
-  put "$HOME/bin/termux-file-editor" 'if grep -Iq . "$1"; then exec kokoro -p -f "$1"; fi
-echo "kokoro: that file is not text"; sleep 3'
+  put "$HOME/bin/termux-file-editor" 'case "$(head -c 4 "$1")" in %PDF*|PK*) exec kokoro -p -f "$1" ;; esac   # PDF, EPUB
+if grep -Iq . "$1"; then exec kokoro -p -f "$1"; fi
+echo "kokoro: that file is not text, an EPUB or a PDF"; sleep 3'
   # Termux:Widget runs scripts in ~/.shortcuts/tasks in the background.
   put "$HOME/.shortcuts/tasks/Kokoro read clipboard" 'exec kokoro -p -c'
   put "$HOME/.shortcuts/tasks/Kokoro stop" 'exec kokoro --stop'
+  put "$HOME/.shortcuts/tasks/Kokoro pause" 'exec kokoro --pause'
+  put "$HOME/.shortcuts/tasks/Kokoro next" 'exec kokoro --next'
+  put "$HOME/.shortcuts/tasks/Kokoro continue" 'exec kokoro --continue'
 
   in_container tidy
 }
@@ -2133,6 +2413,7 @@ tips=(
   'kokoro -p "Hello there"|speak, words lit as read'
   'kokoro -c -p|read the clipboard'
   'kokoro -u URL -p|read a web page'
+  'kokoro -p -f book.epub|EPUB or PDF; resumes'
   'kokoro -o note.mp3 "Hi"|save a file'
   'kokoro --list-voices|54 voices'
   'kokoro --help|everything else'

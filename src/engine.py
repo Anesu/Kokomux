@@ -23,7 +23,9 @@ import secrets
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
+import zipfile
 from html.parser import HTMLParser
 
 APP = os.path.dirname(os.path.abspath(__file__))
@@ -38,6 +40,7 @@ JOB_DIR_RE = re.compile(r"^/tmp/kokoro\.[A-Za-z0-9]+$")
 FORMATS = ("wav", "mp3", "ogg", "flac")
 USER_AGENT = "Mozilla/5.0 (Linux; Android) kokomux"
 MAX_CHUNK = 200  # characters per synthesis chunk
+AHEAD = 3        # while listening, parts made ahead of the one being heard
 SERVING = False
 
 
@@ -53,6 +56,10 @@ def log(msg):
 
 _tts = None
 _tts_lock = threading.Lock()
+# One synthesis at a time, across every job the server is running: espeak isn't
+# thread-safe, and the phone has only so much CPU. Held per part, not per job, so
+# a book playing for hours doesn't block a quick command.
+SYNTH_LOCK = threading.Lock()
 
 
 def tts():
@@ -172,20 +179,24 @@ class _Extractor(HTMLParser):
         self.buf = []
         self.block = None
 
-    def text(self):
+    def text(self, with_title=True):
         self._flush()
         art = [t for a, t in self.blocks if a]
         use = art if sum(map(len, art)) > 500 else [t for _, t in self.blocks]
         # Headings and list items often lack a full stop; end each block so it
         # gets its own pause.
         use = [t if t[-1] in ".!?…:;" else t + "." for t in use]
-        title = re.sub(r"\s+", " ", self.title).strip()
-        if title and (not use or title.split(" - ")[0].split(" | ")[0] not in use[0]):
+        title = self.page_title()
+        if with_title and title and (not use or title.split(" - ")[0].split(" | ")[0] not in use[0]):
             use.insert(0, title + ".")
         return "\n".join(use)
 
+    def page_title(self):
+        return re.sub(r"\s+", " ", self.title).strip()
+
 
 def fetch_url(url):
+    """A web page's (title, readable text)."""
     if not re.match(r"^https?://", url):
         raise JobError(f"Not a web address: {url}")
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -197,7 +208,7 @@ def fetch_url(url):
     except Exception as e:  # noqa: BLE001 - report any network error plainly
         raise JobError(f"Couldn't fetch {url}: {e}") from e
     if ctype == "text/plain":
-        return body
+        return url, body
     if "html" not in ctype and "xml" not in ctype:
         raise JobError(f"That link is {ctype}, not a web page")
     ex = _Extractor()
@@ -205,7 +216,109 @@ def fetch_url(url):
     text = ex.text()
     if not text.strip():
         raise JobError("Couldn't find any readable text on that page")
-    return text
+    return ex.page_title() or url, text
+
+
+# ------------------------------------------------------------------ books
+
+def read_epub(path, name):
+    """An EPUB's (title, text): its chapters in reading order, as the reader sees them."""
+    import posixpath
+    import xml.etree.ElementTree as ET
+
+    def local(tag):
+        return tag.rsplit("}", 1)[-1]
+
+    parts = []
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+            if "META-INF/encryption.xml" in names and b"EncryptedData" in z.read("META-INF/encryption.xml"):
+                raise JobError("That EPUB is DRM-protected, so its text can't be read")
+            container = ET.fromstring(z.read("META-INF/container.xml"))
+            opf_path = next(el.get("full-path") for el in container.iter() if local(el.tag) == "rootfile")
+            opf = ET.fromstring(z.read(opf_path))
+            title = next((el.text for el in opf.iter() if local(el.tag) == "title" and el.text), "")
+            manifest = {el.get("id"): el.get("href") for el in opf.iter() if local(el.tag) == "item"}
+            spine = [el.get("idref") for el in opf.iter()
+                     if local(el.tag) == "itemref" and el.get("linear", "yes") != "no"]
+            base = posixpath.dirname(opf_path)
+            for idref in spine:
+                href = manifest.get(idref)
+                if not href:
+                    continue
+                inner = posixpath.normpath(posixpath.join(base, urllib.parse.unquote(href.split("#")[0])))
+                if inner not in names:
+                    continue
+                ex = _Extractor()
+                ex.feed(z.read(inner).decode("utf-8", "replace"))
+                chapter = ex.text(with_title=False)
+                if chapter.strip():
+                    parts.append(chapter)
+    except JobError:
+        raise
+    except (KeyError, StopIteration, zipfile.BadZipFile, ET.ParseError) as e:
+        raise JobError(f"Couldn't read that EPUB ({type(e).__name__})") from None
+    if not parts:
+        raise JobError("That EPUB has no readable text")
+    return (title or "").strip() or name, "\n\n".join(parts)
+
+
+def read_pdf(path, name):
+    """A PDF's (title, text), with its lines joined back into sentences."""
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        raise JobError("Reading PDFs needs a newer kokomux: kokoro --update") from None
+    try:
+        reader = PdfReader(path)
+        if reader.is_encrypted and not reader.decrypt(""):
+            raise JobError("That PDF is password-protected")
+        pages = [page.extract_text() or "" for page in reader.pages]
+        title = (reader.metadata.title if reader.metadata else None) or name
+    except JobError:
+        raise
+    except Exception as e:  # noqa: BLE001 - pypdf raises many kinds of error for broken files
+        raise JobError(f"Couldn't read that PDF ({type(e).__name__})") from None
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", "\n".join(pages))        # words split across lines
+    lines = [ln.strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln and not re.fullmatch(r"\d{1,4}", ln)]   # bare page numbers
+    sentences, buf = [], ""
+    for ln in lines:   # a line that doesn't end a sentence carries on into the next
+        buf = f"{buf} {ln}" if buf else ln
+        if re.search(r"[.!?:;\"”’)]$", ln):
+            sentences.append(buf)
+            buf = ""
+    if buf:
+        sentences.append(buf)
+    if not sentences:
+        raise JobError("That PDF has no text to read (is it a scan?)")
+    return str(title).strip() or name, "\n".join(sentences)
+
+
+def read_source(jobdir, job):
+    """What a job reads, as (title, text): a web page, or a file that is an EPUB,
+    a PDF or plain text."""
+    name = job.get("name", "")
+    if job.get("url"):
+        log(f"Fetching {job['url']}")
+        return fetch_url(job["url"])
+    file = job.get("file", "in.txt")
+    if "/" in file:
+        raise JobError(f"Bad input file name: {file}")
+    path = os.path.join(jobdir, file)
+    with open(path, "rb") as fh:
+        head = fh.read(64)
+    if head.startswith(b"%PDF"):
+        return read_pdf(path, name)
+    if head.startswith(b"PK") and zipfile.is_zipfile(path):
+        return read_epub(path, name)
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    bad = text.count("\ufffd") + text.count("\x00")
+    if text and bad > max(3, len(text) // 100):
+        raise JobError("That doesn't look like text, an EPUB or a PDF")
+    return name, text
 
 
 # ------------------------------------------------------------------ jobs
@@ -257,28 +370,34 @@ def run_job(path):
         if job.get("words") == "1":
             aligner = WordAligner(stream, lang)
 
+    writer = None
+    total = 0.0
     try:
-        if job.get("url"):
-            log(f"Fetching {job['url']}")
-            text = fetch_url(job["url"])
-        else:
-            with open(os.path.join(jobdir, "in.txt"), encoding="utf-8", errors="replace") as fh:
-                text = fh.read()
-            bad = text.count("\ufffd") + text.count("\x00")
-            if text and bad > max(3, len(text) // 100):
-                raise JobError("That doesn't look like text (is it a PDF, image or other binary file?)")
+        title, text = read_source(jobdir, job)
+        _write_atomic(os.path.join(jobdir, "title"), (title or "").replace("\n", " ")[:120] + "\n")
         chunks = split_text(text)
         if not chunks:
             raise JobError("No text to read")
+        try:
+            first = int(job.get("start", "1"))
+        except ValueError:
+            first = 1
+        if not 1 <= first <= len(chunks):
+            first = 1   # a bookmark past the end: start again
+        if stream:
+            _write_atomic(os.path.join(stream, "first"), f"{first}\n")
 
-        parts, rate, total = [], 24000, 0.0
-        for i, chunk in enumerate(chunks, 1):
+        for i in range(first, len(chunks) + 1):
+            chunk = chunks[i - 1]
+            if stream:
+                _wait_for_listener(jobdir, stream, i, first)
             # The kokoro command deletes its job folder when it exits or is
             # stopped, so a vanished folder means nobody is waiting any more.
             if not os.path.isdir(jobdir) or (stream and not os.path.isdir(stream)):
                 raise JobError("Cancelled")
             _write_atomic(os.path.join(jobdir, "progress"), f"{i} {len(chunks)}\n")
-            samples, rate = engine.create(chunk, voice=voice, speed=speed, lang=lang)
+            with SYNTH_LOCK:
+                samples, rate = engine.create(chunk, voice=voice, speed=speed, lang=lang)
             total += len(samples) / rate
             if stream:
                 # The text first, so the player can show the line the moment its audio lands.
@@ -289,11 +408,15 @@ def run_job(path):
                 if aligner:
                     aligner.add(i, chunk, samples, rate)
             if out:
-                parts.append(samples)
-                parts.append(np.zeros(int(rate * 0.2), dtype=samples.dtype))
-        if out:
-            sf.write(out, np.concatenate(parts[:-1]), rate)
+                # Written as it's made, so a whole book never has to fit in memory.
+                if writer is None:
+                    writer = sf.SoundFile(out, "w", samplerate=rate, channels=1)
+                else:
+                    writer.write(np.zeros(int(rate * 0.2), dtype=np.float32))
+                writer.write(samples)
     finally:
+        if writer is not None:
+            writer.close()
         if stream and os.path.isdir(stream):
             open(os.path.join(stream, "end"), "w").close()
         if aligner:
@@ -302,6 +425,20 @@ def run_job(path):
     elapsed = time.time() - t0
     _write_atomic(os.path.join(jobdir, "result"), f"{total:.1f} {elapsed:.1f} {len(chunks)}\n")
     return f"Made {total:.1f}s of audio in {elapsed:.1f}s"
+
+
+def _wait_for_listener(jobdir, stream, i, first):
+    """While listening, stay at most AHEAD parts ahead of the one being heard, so a
+    whole book isn't rendered to disk while its first chapter plays (or is paused)."""
+    while os.path.isdir(jobdir):
+        try:
+            with open(os.path.join(stream, "playing")) as fh:
+                playing = int(fh.read().strip() or first)
+        except (OSError, ValueError):
+            playing = first
+        if i <= playing + AHEAD:
+            return
+        time.sleep(0.2)
 
 
 def _write_atomic(path, text):
@@ -404,7 +541,6 @@ def serve(port, idle):
     log("Loading model...")
     tts()
     token = secrets.token_hex(16)
-    job_lock = threading.Lock()
     state = {"last": time.time(), "busy": 0}
 
     class Handler(BaseHTTPRequestHandler):
@@ -443,8 +579,7 @@ def serve(port, idle):
             path = parse_qs(url.query).get("path", [""])[0]
             state["busy"] += 1
             try:
-                with job_lock:
-                    msg = run_job(path)
+                msg = run_job(path)
                 self._reply(200, msg)
             except JobError as e:
                 self._reply(400, f"Error: {e}")

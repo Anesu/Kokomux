@@ -44,6 +44,7 @@ kokoro -o note.mp3 "Smaller file"         # .wav .mp3 .ogg or .flac
 kokoro -c -p                              # read the clipboard
 kokoro -u https://example.com/article -p  # read a web page
 kokoro -f story.txt -o story.mp3          # read a text file
+kokoro -p -f book.epub                    # or an EPUB or PDF
 cat notes.txt | kokoro -p                 # or pipe text in
 kokoro --stop                             # stop playback
 ```
@@ -55,13 +56,32 @@ kokoro --stop                             # stop playback
 | `-v NAME` | Voice, e.g. `af_heart`, `am_adam`, `bf_emma`, `bm_george` |
 | `-s N` | Speed, 0.5–2.0 |
 | `-l CODE` | Language: `en-us`, `en-gb`, `es`, `fr-fr`, `it`, `pt-br`, `hi`. Use a voice for that language too. |
-| `-f FILE` | Read a text file |
+| `-f FILE` | Read a text file, an EPUB or a PDF |
 | `-c` | Read the clipboard. A copied link reads that web page. |
 | `-u URL` | Read a web page. Menus, sidebars, tables and references are skipped. |
 
 **Voices:** the first two letters of a voice name tell you its accent and gender. `a` is American, `b` British, then `f` for female and `m` for male. Other languages have their own voices, such as `ef_dora` for Spanish and `ff_siwis` for French. `kokoro --list-voices` shows all 54.
 
 **Saving where other apps can find it:** run `termux-setup-storage` once, then save to shared storage, e.g. `-o ~/storage/shared/Music/note.mp3`.
+
+## Listening to long texts and books
+
+`kokoro -p -f` reads EPUBs (chapters in order, using the book's own title) and PDFs (with lines joined back into sentences, and page numbers dropped), as well as text files and web pages. DRM-protected EPUBs and scanned PDFs, which contain pictures of pages rather than text, can't be read.
+
+**It remembers where you stopped.** Stop a long text partway, by any route: Ctrl+C, `kokoro --stop`, the notification, or even closing Termux. Then run the same command again and it picks up at the part you were on. Add `--restart` to start from the top. `kokoro --continue` carries on with the last thing you were listening to, from anywhere, in the same voice and speed. `kokoro --status` shows the bookmark. A bookmark goes away once a text has been read to the end.
+
+**Controls while it plays:**
+
+```sh
+kokoro --pause     # pause, or carry on (picks up at the start of the part)
+kokoro --next      # skip to the next part
+kokoro --again     # hear this part again
+kokoro --stop      # stop (the bookmark is kept)
+```
+
+A part is a sentence or two. With the Termux:API app installed, a notification shows the title and which part is playing, with **previous** (again), **pause**, **play** and **next** buttons. They work from the lock screen too. Swiping the notification away stops playback. To turn the notification off, set `KOKORO_NOTIFY=0`.
+
+Only a few parts are made ahead of the one you're hearing, so a whole book never piles up on the phone's storage while you listen or pause. Saving a book with `-o` writes the file as it goes, so even a long book doesn't have to fit in memory.
 
 ## Words light up as they're read
 
@@ -80,10 +100,10 @@ After the installer has fetched Whistle, highlighting works offline. Whistle tra
 
 - **Share to Termux.** In any app, tap **Share → Termux**:
   - A **link** reads the web page aloud.
-  - **Text or a text file** reads that aloud.
+  - **Text, a text file, an EPUB or a PDF** reads that aloud.
 
   The installer sets this up with `~/bin/termux-url-opener` and `~/bin/termux-file-editor`. If you already had your own versions of these files, it leaves them alone and tells you.
-- **Home-screen buttons.** With Termux:Widget installed, add a Termux widget to the home screen. It lists **Kokoro read clipboard** and **Kokoro stop**. Copy some text, then tap the button.
+- **Home-screen buttons.** With Termux:Widget installed, add a Termux widget to the home screen. It lists **Kokoro read clipboard**, **Kokoro pause**, **Kokoro next**, **Kokoro continue** and **Kokoro stop**. Copy some text, then tap **Kokoro read clipboard**; tap **Kokoro continue** to pick up your book.
 
 ## Settings
 
@@ -144,6 +164,7 @@ The files in `src/` are the source. `./build.sh` bundles them into the single `i
 | `src/engine.py` | Kokoro engine, server, web-page reader and model downloader (container side) |
 | `src/words.py` | word timings: Whistle, the matching, and the cache (container side) |
 | `tests/test_words.py` | tests for the matching: `python3 tests/test_words.py` |
+| `tests/test_books.py` | tests for reading EPUB, PDF and text: `python3 tests/test_books.py` |
 | `src/setup-container.sh` | installs everything inside the container |
 | `src/install.sh` | installer template (UI, checks, steps) |
 | `VERSION` | the version stamped into both by `build.sh` |

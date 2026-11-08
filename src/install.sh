@@ -420,16 +420,24 @@ KOKORO_PORT=8880
 # highlight runs ahead of the voice, lower it if it lags.
 KOKORO_WORDS=1
 KOKORO_WORDS_OFFSET_MS=100
+
+# While listening, a notification with pause / next / again buttons (needs the
+# Termux:API app). Swiping it away stops.
+KOKORO_NOTIFY=1
 CFG
   fi
 
   # Share a link to Termux -> read the page. Share text or a file -> read it.
   put "$HOME/bin/termux-url-opener" 'exec kokoro -p -u "$1"'
-  put "$HOME/bin/termux-file-editor" 'if grep -Iq . "$1"; then exec kokoro -p -f "$1"; fi
-echo "kokoro: that file is not text"; sleep 3'
+  put "$HOME/bin/termux-file-editor" 'case "$(head -c 4 "$1")" in %PDF*|PK*) exec kokoro -p -f "$1" ;; esac   # PDF, EPUB
+if grep -Iq . "$1"; then exec kokoro -p -f "$1"; fi
+echo "kokoro: that file is not text, an EPUB or a PDF"; sleep 3'
   # Termux:Widget runs scripts in ~/.shortcuts/tasks in the background.
   put "$HOME/.shortcuts/tasks/Kokoro read clipboard" 'exec kokoro -p -c'
   put "$HOME/.shortcuts/tasks/Kokoro stop" 'exec kokoro --stop'
+  put "$HOME/.shortcuts/tasks/Kokoro pause" 'exec kokoro --pause'
+  put "$HOME/.shortcuts/tasks/Kokoro next" 'exec kokoro --next'
+  put "$HOME/.shortcuts/tasks/Kokoro continue" 'exec kokoro --continue'
 
   in_container tidy
 }
@@ -494,6 +502,7 @@ tips=(
   'kokoro -p "Hello there"|speak, words lit as read'
   'kokoro -c -p|read the clipboard'
   'kokoro -u URL -p|read a web page'
+  'kokoro -p -f book.epub|EPUB or PDF; resumes'
   'kokoro -o note.mp3 "Hi"|save a file'
   'kokoro --list-voices|54 voices'
   'kokoro --help|everything else'

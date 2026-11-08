@@ -25,8 +25,8 @@ CFG
     mkdir -p "$APP"
     [ -x "$APP/venv/bin/python" ] || python3 -m venv "$APP/venv"
     "$APP/venv/bin/pip" install --upgrade pip
-    # cactus-compute is Whistle, the recogniser behind word highlighting.
-    "$APP/venv/bin/pip" install --upgrade kokoro-onnx soundfile cactus-compute | tee /tmp/kokoro-setup/.pip
+    # cactus-compute is Whistle, the recogniser behind word highlighting; pypdf reads PDFs.
+    "$APP/venv/bin/pip" install --upgrade kokoro-onnx soundfile cactus-compute pypdf | tee /tmp/kokoro-setup/.pip
     grep -q '^Successfully installed' /tmp/kokoro-setup/.pip || printf 'up to date' > "$SRC/.note"
     cp "$SRC/engine.py" "$SRC/words.py" "$APP/"
     rm -f "$APP/speak.py"   # from older versions
