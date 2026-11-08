@@ -12,9 +12,13 @@ kokoro -p "Hello from my phone"
   <img src="docs/kokoro.png" width="32%" alt="Using the kokoro command: saving a file, playing text, an error message and the status screen">
 </p>
 
+While it reads aloud, kokomux shows the text and lights up each word as it's spoken:
+
+<p><img src="docs/words.png" width="60%" alt="kokoro -p showing two lines of a story, with the word being spoken highlighted"></p>
+
 ## Install
 
-You need **Termux from F-Droid or GitHub** (the Play Store version is outdated), a 64-bit phone, and about **600 MB** of free space. Then run this in Termux:
+You need **Termux from F-Droid or GitHub** (the Play Store version is outdated), a 64-bit phone, and about **700 MB** of free space. Then run this in Termux:
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/Anesu/kokomux/main/install.sh && bash install.sh
@@ -58,6 +62,19 @@ kokoro --stop                             # stop playback
 **Voices:** the first two letters of a voice name tell you its accent and gender. `a` is American, `b` British, then `f` for female and `m` for male. Other languages have their own voices, such as `ef_dora` for Spanish and `ff_siwis` for French. `kokoro --list-voices` shows all 54.
 
 **Saving where other apps can find it:** run `termux-setup-storage` once, then save to shared storage, e.g. `-o ~/storage/shared/Music/note.mp3`.
+
+## Words light up as they're read
+
+With `-p` on a terminal, each line appears as it starts playing. A soft highlight then moves from word to word in time with the voice: words already spoken are shown normally and upcoming words are dim. When a line finishes it stays on screen, so a long text leaves a transcript behind.
+
+How it works:
+
+1. **Recognise.** [Whistle](https://cactuscompute.com/blog/whistle), a small speech recogniser from Cactus Compute, listens to each line Kokoro renders and returns the words it heard, with start and end times. It runs on the CPU inside the Debian container, beside Kokoro, and starts with the line you're hearing.
+2. **Match.** Whistle isn't a forced aligner, so its transcript won't exactly match the text. An edit-distance alignment pairs its words with the text's words in order. It handles numbers ("60" ↔ "sixty"), hyphenated words ("worn-out" ↔ "wornout"), and names it hears as several words ("Igdrasil" ↔ "Igg Dressel").
+3. **Store.** Each line's result is cached as `<audio_hash>.words.json` in `/opt/kokoro/cache/words/` inside the container. Each entry holds `s`/`e` (start and end in ms), `a`/`b` (the character range in the line's text) and `p` (Whistle's confidence). The same line in the same voice is never transcribed twice.
+4. **Highlight.** The player lights the word that matches the time since the line started playing. A line whose match scores below 0.35 gets no highlight rather than a wrong one, and is shown in plain text.
+
+After the installer has fetched Whistle, highlighting works offline. Whistle transcribes English, Spanish, French and Italian among Kokoro's languages; lines in other languages (Hindi, Portuguese, Japanese, Mandarin) are shown without a highlight. To turn it off, set `KOKORO_WORDS=0`. If the highlight runs ahead of the voice on your phone, raise `KOKORO_WORDS_OFFSET_MS` (default 100); if it lags, lower it. `play-audio` doesn't report its position, so this offset covers its start-up delay.
 
 ## Use it from other apps
 
@@ -103,6 +120,7 @@ Kokoro's Python packages (`onnxruntime`, `espeakng-loader`, `soundfile`) only sh
 
 - **`kokoro`** (Termux side): reads your text, starts or uses the server, and plays the audio with `play-audio`.
 - **`engine.py`** (inside Debian): splits the text into sentences and runs Kokoro. With `-p` it hands back audio one chunk at a time, so playback starts after the first sentence.
+- **`words.py`** (inside Debian): runs Whistle on each chunk in a separate thread and matches its words to the text, for the highlight.
 - **Sharing files:** the two sides exchange text and audio through `$PREFIX/tmp`, which the container sees as `/tmp`.
 
 The installer only keeps what's needed in the container. It skips documentation and man pages, and clears the apt and pip download caches after installing. The model is the 8-bit (int8) version, about 92 MB, plus about 28 MB of voices.
@@ -124,6 +142,8 @@ The files in `src/` are the source. `./build.sh` bundles them into the single `i
 |---|---|
 | `src/kokoro` | the `kokoro` command (Termux side) |
 | `src/engine.py` | Kokoro engine, server, web-page reader and model downloader (container side) |
+| `src/words.py` | word timings: Whistle, the matching, and the cache (container side) |
+| `tests/test_words.py` | tests for the matching: `python3 tests/test_words.py` |
 | `src/setup-container.sh` | installs everything inside the container |
 | `src/install.sh` | installer template (UI, checks, steps) |
 | `VERSION` | the version stamped into both by `build.sh` |

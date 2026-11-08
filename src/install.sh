@@ -275,7 +275,7 @@ else
 fi
 
 free_kb="$(df -Pk "$HOME" 2>/dev/null | awk 'NR == 2 { print $4 }')" || true
-need_mb=600; [ "$MODE" = update ] && need_mb=150
+need_mb=700; [ "$MODE" = update ] && need_mb=200
 if [[ "${free_kb:-}" =~ ^[0-9]+$ ]]; then
   free_mb=$(( free_kb / 1024 ))
   if [ "$free_mb" -ge 1024 ]; then free_h="$(awk "BEGIN { printf \"%.1f GB\", $free_mb / 1024 }")"; else free_h="$free_mb MB"; fi
@@ -305,10 +305,11 @@ fi
 if [ "$MODE" = install ]; then
   heading "Here's the plan"
   bullet "A small Debian system to run Kokoro in"
-  bullet "Python, Kokoro and 54 voices (a 200 MB download)"
+  bullet "Python, Kokoro and 54 voices (a 250 MB download)"
+  bullet "Whistle, which lights up each word as it's read"
   bullet "The kokoro command, plus Share and widget shortcuts"
   blank
-  wrap "  " "${D}Takes 5–15 minutes and about 600 MB. You can use your phone meanwhile; it stays awake until done.${R}"
+  wrap "  " "${D}Takes 5–15 minutes and about 700 MB. You can use your phone meanwhile; it stays awake until done.${R}"
 else
   if [ "$OLD_VERSION" = "$KOKOMUX_VERSION" ]; then
     heading "Reinstalling kokomux v$KOKOMUX_VERSION"
@@ -336,6 +337,10 @@ rm -rf "$WORK"; mkdir -p "$WORK"
 cat > "$WORK/engine.py" <<'__KOKOMUX_ENGINE__'
 #@EMBED engine.py
 __KOKOMUX_ENGINE__
+
+cat > "$WORK/words.py" <<'__KOKOMUX_WORDS__'
+#@EMBED words.py
+__KOKOMUX_WORDS__
 
 cat > "$WORK/setup.sh" <<'__KOKOMUX_SETUP__'
 #@EMBED setup-container.sh
@@ -409,6 +414,12 @@ KOKORO_OUT=kokoro.wav     # file name when -o isn't given (.wav .mp3 .ogg .flac)
 KOKORO_AUTOSERVE=1
 KOKORO_IDLE_MINUTES=30
 KOKORO_PORT=8880
+
+# Light up each word as it's spoken (with -p, on a terminal). Whistle listens to
+# each line and its words are matched to the text. Raise the offset if the
+# highlight runs ahead of the voice, lower it if it lags.
+KOKORO_WORDS=1
+KOKORO_WORDS_OFFSET_MS=100
 CFG
   fi
 
@@ -480,7 +491,7 @@ else
 fi
 say "  $bar"
 tips=(
-  'kokoro -p "Hello there"|speak out loud'
+  'kokoro -p "Hello there"|speak, words lit as read'
   'kokoro -c -p|read the clipboard'
   'kokoro -u URL -p|read a web page'
   'kokoro -o note.mp3 "Hi"|save a file'

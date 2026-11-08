@@ -24,6 +24,8 @@ KOKORO_OUT=kokoro.wav
 KOKORO_AUTOSERVE=1
 KOKORO_IDLE_MINUTES=30
 KOKORO_PORT=8880
+KOKORO_WORDS=1                 # light up each word as it's spoken (-p on a terminal)
+KOKORO_WORDS_OFFSET_MS=100     # play-audio's start-up delay, so the highlight isn't early
 KOKORO_REPO_RAW=https://raw.githubusercontent.com/Anesu/kokomux/main
 # shellcheck source=/dev/null
 [ -f "$CONF" ] && . "$CONF"
@@ -315,7 +317,9 @@ fi
 tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
 gen_pid=""; play_pid=""
 cleanup() {
+  set +e   # best effort from here: a process that's already gone mustn't change the exit code
   status_clear
+  [ "${in_line:-0}" = 1 ] && block_redraw -1 -1   # stopped mid-line: leave nothing lit
   [ -n "$play_pid" ] && kill "$play_pid" 2>/dev/null
   [ -n "$gen_pid" ] && kill "$gen_pid" 2>/dev/null
   rm -rf "$tmpd"
@@ -356,6 +360,10 @@ if [ -z "$url" ] && ! grep -q '[^[:space:]]' "$text"; then
 fi
 [[ "$url" != *$'\n'* ]] || die "That doesn't look like a web address."
 
+# With -p on a terminal, show each line as it's read and light the spoken word.
+karaoke=0
+[ "$play" = 1 ] && [ "$LIVE" = 1 ] && [ "$KOKORO_WORDS" = 1 ] && karaoke=1
+
 {
   echo "voice=$voice"
   echo "speed=$speed"
@@ -363,6 +371,7 @@ fi
   [ -n "$url" ] && echo "url=$url"
   [ -n "$out" ] && echo "out=out.$ext"
   [ "$play" = 1 ] && echo "stream=1"
+  [ "$karaoke" = 1 ] && echo "words=1"
 } > "$tmpd/job"
 job="/tmp/$(basename "$tmpd")/job"   # the same file, as the container sees it
 
@@ -399,6 +408,102 @@ waiting_label() {
   else echo "Getting ready"; fi
 }
 
+# ------------------------------------------------------------ the line being heard
+# Each line is printed wrapped to the screen while it plays, and a soft
+# highlight moves from word to word. Times come from Whistle via the engine
+# (stream/NNNN.words: "confidence", then "start end a b" per word, with a/b the
+# word's byte range in NNNN.txt). play-audio has no clock to read, so the time
+# is how long it has been playing, less its start-up delay.
+
+HL=$'\033[48;5;61m\033[38;5;231m'   # the soft highlight
+blk_lines=(); blk_offs=()
+w_s=(); w_e=(); w_a=(); w_b=(); w_state=none
+TERM_ROWS="$(stty size 2>/dev/null </dev/tty | cut -d' ' -f1)" || true
+[[ "${TERM_ROWS:-}" =~ ^[0-9]+$ ]] || TERM_ROWS=24
+exec {TICK}<> <(:)                    # read -t on this is a sleep with no process
+now_ms() { local t=${EPOCHREALTIME//[!0-9]/}; NOW=$(( t / 1000 )); }   # no subshell: called every frame
+in_line=0
+
+block_load() {   # wrap a line's text to the screen, remembering each row's byte offset
+  local LC_ALL=C row off=0
+  blk_lines=(); blk_offs=()
+  while IFS= read -r row; do
+    blk_lines+=("$row"); blk_offs+=("$off"); off=$(( off + ${#row} ))
+  done < <(fold -s -w $(( TERM_COLS - 3 )) "$1"; echo)
+}
+
+block_draw() {   # block_draw A B: draw the rows with bytes A..B lit (A = -1: none lit)
+  local LC_ALL=C a=$1 b=$2 k o row len x y
+  for k in "${!blk_lines[@]}"; do
+    o=${blk_offs[k]} row=${blk_lines[k]} len=${#blk_lines[k]}
+    printf '\r\033[K  ' >&2
+    if [ "$a" -lt 0 ] || [ $(( o + len )) -le "$a" ]; then
+      printf '%s' "$row" >&2                                  # already spoken
+    elif [ "$o" -ge "$b" ]; then
+      printf '%s%s%s' "$D" "$row" "$R" >&2                    # still to come
+    else
+      x=$(( a > o ? a - o : 0 )); y=$(( b - o < len ? b - o : len ))
+      printf '%s%s%s%s%s%s' "${row:0:x}" "$HL" "${row:x:y-x}" "$R$D" "${row:y}" "$R" >&2
+    fi
+    printf '\n' >&2
+  done
+}
+
+block_redraw() { # back up over the rows and draw them again
+  printf '\r\033[K\033[%dA' "${#blk_lines[@]}" >&2
+  block_draw "$@"
+}
+
+words_load() {   # read NNNN.words once it lands
+  local f=$1 s e a b
+  [ -f "$f" ] || return 1
+  w_s=(); w_e=(); w_a=(); w_b=()
+  { read -r _                                 # the "confidence" line
+    while read -r s e a b; do w_s+=("$s"); w_e+=("$e"); w_a+=("$a"); w_b+=("$b"); done
+  } < "$f"
+  if [ "${#w_s[@]}" -gt 0 ]; then w_state=ready
+  else w_state=none; block_redraw -1 -1; fi   # below the bar: the line plain, nothing lit
+}
+
+play_line() {    # play_line WAV IDX: play one line, lighting each word as it's heard
+  local wav=$1 i=$2 base="${1%.wav}" cur=-1 lit=-2 t t0 n where label last=""
+  w_state=pending
+  [ -f "$tmpd/stream/words-off" ] && w_state=off
+  echo "$i" > "$tmpd/stream/playing"          # the aligner works from the line being heard
+  block_load "$base.txt"
+  local fits=1; [ "${#blk_lines[@]}" -lt $(( TERM_ROWS - 2 )) ] || fits=0
+  status_clear
+  if [ "$w_state" = off ]; then block_draw -1 -1; else block_draw 0 0; fi   # dim until words light
+  play-audio "$wav" >/dev/null 2>&1 & play_pid=$!
+  now_ms; t0=$NOW; in_line=1
+  # Nothing in this loop starts a process: it runs ~30 times a second on a phone.
+  while kill -0 "$play_pid" 2>/dev/null; do
+    if [ "$w_state" = pending ]; then words_load "$base.words" || true; fi   # not landed yet
+    if [ "$w_state" = ready ] && [ "$fits" = 1 ]; then
+      now_ms; t=$(( NOW - t0 - KOKORO_WORDS_OFFSET_MS ))
+      while [ $(( cur + 1 )) -lt "${#w_s[@]}" ] && [ "${w_s[cur + 1]}" -le "$t" ]; do cur=$(( cur + 1 )); done
+      # Keep the word lit through the pause after it; the last one goes out when it ends.
+      n=$cur
+      if [ "$cur" -eq $(( ${#w_s[@]} - 1 )) ] && [ "$t" -gt "${w_e[cur]}" ]; then n=-1; fi
+      if [ "$n" -ne "$lit" ]; then
+        if [ "$n" -ge 0 ]; then block_redraw "${w_a[n]}" "${w_b[n]}"
+        elif [ "$cur" -ge 0 ]; then block_redraw -1 -1    # past the last word
+        else block_redraw 0 0; fi                          # before the first
+        lit=$n; last=""
+      fi
+    fi
+    n=1; [ -f "$tmpd/progress" ] && { read -r _ n < "$tmpd/progress" || n=1; }
+    where=""; [ "${n:-1}" -gt 1 ] && where="part $i of $n · "
+    label="${where}Ctrl+C to stop"; [ "$w_state" = pending ] && label="${where}word timings…"
+    if [ "$label" != "$last" ]; then status "Playing" "$label" "▶"; last=$label; fi
+    read -r -t 0.03 -u "$TICK" _ || true
+  done
+  wait "$play_pid" || true
+  play_pid=""; in_line=0
+  block_redraw -1 -1                            # the line as read, all lit as spoken
+  rm -f "$wav"
+}
+
 # ------------------------------------------------------------ run
 
 if [ "$play" = 1 ]; then
@@ -410,7 +515,9 @@ run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
 i=1
 while :; do
   f="$(printf '%s/stream/%04d.wav' "$tmpd" "$i")"
-  if [ "$play" = 1 ] && [ -f "$f" ]; then
+  if [ "$karaoke" = 1 ] && [ -f "$f" ]; then
+    play_line "$f" "$i"; i=$((i + 1))
+  elif [ "$play" = 1 ] && [ -f "$f" ]; then
     play-audio "$f" >/dev/null 2>&1 & play_pid=$!
     while kill -0 "$play_pid" 2>/dev/null; do
       n="$(cut -d' ' -f2 "$tmpd/progress" 2>/dev/null || echo 1)"

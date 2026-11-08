@@ -27,6 +27,8 @@ import urllib.request
 from html.parser import HTMLParser
 
 APP = os.path.dirname(os.path.abspath(__file__))
+if APP not in sys.path:
+    sys.path.insert(0, APP)   # words.py lives beside this file
 MODELS = os.path.join(APP, "models")
 MODEL = os.path.join(MODELS, "kokoro-v1.0.int8.onnx")
 VOICES = os.path.join(MODELS, "voices-v1.0.bin")
@@ -248,9 +250,12 @@ def run_job(path):
         out = os.path.join(jobdir, out)
 
     stream = None
+    lane = None
     if job.get("stream") == "1":
         stream = os.path.join(jobdir, "stream")
         os.makedirs(stream, exist_ok=True)
+        if job.get("words") == "1":
+            lane = AlignLane(stream, lang)
 
     try:
         if job.get("url"):
@@ -276,9 +281,13 @@ def run_job(path):
             samples, rate = engine.create(chunk, voice=voice, speed=speed, lang=lang)
             total += len(samples) / rate
             if stream:
+                # The text first, so the player can show the line the moment its audio lands.
+                _write_atomic(os.path.join(stream, f"{i:04d}.txt"), chunk)
                 tmp = os.path.join(stream, f"{i:04d}.tmp.wav")
                 sf.write(tmp, samples, rate)
                 os.replace(tmp, os.path.join(stream, f"{i:04d}.wav"))
+                if lane:
+                    lane.add(i, chunk, samples, rate)
             if out:
                 parts.append(samples)
                 parts.append(np.zeros(int(rate * 0.2), dtype=samples.dtype))
@@ -287,6 +296,8 @@ def run_job(path):
     finally:
         if stream and os.path.isdir(stream):
             open(os.path.join(stream, "end"), "w").close()
+        if lane:
+            lane.finish()   # the last lines' timings, before the job counts as done
 
     elapsed = time.time() - t0
     _write_atomic(os.path.join(jobdir, "result"), f"{total:.1f} {elapsed:.1f} {len(chunks)}\n")
@@ -300,6 +311,85 @@ def _write_atomic(path, text):
         os.replace(path + ".tmp", path)
     except OSError:
         pass  # the job folder vanished (cancelled); the loop will notice
+
+
+# ------------------------------------------------------------------ word timings
+
+class AlignLane(threading.Thread):
+    """Whistle's lane for one job: aligns rendered lines on the CPU beside speech,
+    starting from the line being heard, and publishes each as stream/NNNN.words
+    the moment it lands. The player lights the spoken word from those files.
+
+    NNNN.words is tab-separated, for the bash player: a "confidence" line, then
+    one "s e a b" row per word (ms, and the word's UTF-8 byte range in NNNN.txt).
+    A line below WORDS_MIN_CONFIDENCE gets the confidence line and no rows."""
+
+    def __init__(self, stream, lang):
+        super().__init__(daemon=True)
+        self.stream, self.lang = stream, lang
+        self.pending, self.done = {}, False
+        self.cond = threading.Condition()
+        self.off = None
+        try:
+            import words
+            self.words = words
+            if not words.available():
+                self.off = "Whistle isn't installed (run kokoro --update)"
+            elif (lang or "")[:2].lower() not in words.SUPPORTED:
+                self.off = f"Whistle doesn't transcribe {lang}"
+        except ImportError:
+            self.off = "word timings aren't installed (run kokoro --update)"
+        if self.off:
+            _write_atomic(os.path.join(stream, "words-off"), self.off + "\n")
+        else:
+            self.start()
+
+    def add(self, i, text, samples, rate):
+        if self.off:
+            return
+        with self.cond:
+            self.pending[i] = (text, samples, rate)
+            self.cond.notify()
+
+    def finish(self):
+        if self.off:
+            return
+        with self.cond:
+            self.done = True
+            self.cond.notify()
+        self.join()
+
+    def _next(self):
+        """The line being heard, or the first after it; earlier lines last."""
+        try:
+            with open(os.path.join(self.stream, "playing")) as fh:
+                playing = int(fh.read().strip() or 1)
+        except (OSError, ValueError):
+            playing = 1
+        ahead = [i for i in self.pending if i >= playing]
+        return min(ahead) if ahead else min(self.pending)
+
+    def run(self):
+        while True:
+            with self.cond:
+                while not self.pending and not self.done:
+                    self.cond.wait()
+                if not self.pending:
+                    return
+                i = self._next()
+                text, samples, rate = self.pending.pop(i)
+            if not os.path.isdir(self.stream):
+                return   # cancelled
+            try:
+                data = self.words.line_words(text, samples, rate, self.lang)
+            except Exception as e:  # noqa: BLE001 - one bad line must not stop the others
+                log(f"Word timings, line {i}: {type(e).__name__}: {e}")
+                data = {"confidence": 0, "words": []}
+            rows = [f"confidence\t{data.get('confidence', 0)}"]
+            if data.get("confidence", 0) >= self.words.WORDS_MIN_CONFIDENCE:
+                for w, (a, b) in zip(data["words"], self.words.byte_ranges(text, data["words"])):
+                    rows.append(f"{w['s']}\t{w['e']}\t{a}\t{b}")
+            _write_atomic(os.path.join(self.stream, f"{i:04d}.words"), "\n".join(rows) + "\n")
 
 
 # ------------------------------------------------------------------ server
@@ -499,6 +589,7 @@ def main():
     v.add_argument("--default", default="")
     v.add_argument("--color", action="store_true", help="colour even when piped")
     sub.add_parser("download")
+    sub.add_parser("whistle", help="fetch and load Whistle once (word timings)")
     a = p.parse_args()
 
     if a.cmd == "job":
@@ -516,6 +607,11 @@ def main():
             print_voices(names, a.width, a.default)
     elif a.cmd == "download":
         download()
+    elif a.cmd == "whistle":
+        import words
+        t0 = time.time()
+        words._whistle()
+        print(f"Whistle ready ({words.engine_name()}, {time.time() - t0:.1f}s)")
 
 
 if __name__ == "__main__":

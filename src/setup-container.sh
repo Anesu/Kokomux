@@ -25,17 +25,26 @@ CFG
     mkdir -p "$APP"
     [ -x "$APP/venv/bin/python" ] || python3 -m venv "$APP/venv"
     "$APP/venv/bin/pip" install --upgrade pip
-    "$APP/venv/bin/pip" install --upgrade kokoro-onnx soundfile | tee /tmp/kokoro-setup/.pip
+    # cactus-compute is Whistle, the recogniser behind word highlighting.
+    "$APP/venv/bin/pip" install --upgrade kokoro-onnx soundfile cactus-compute | tee /tmp/kokoro-setup/.pip
     grep -q '^Successfully installed' /tmp/kokoro-setup/.pip || printf 'up to date' > "$SRC/.note"
-    cp "$SRC/engine.py" "$APP/engine.py"
+    cp "$SRC/engine.py" "$SRC/words.py" "$APP/"
     rm -f "$APP/speak.py"   # from older versions
     ;;
   models)
-    cp "$SRC/engine.py" "$APP/engine.py"
+    cp "$SRC/engine.py" "$SRC/words.py" "$APP/"
     if [ -s "$APP/models/kokoro-v1.0.int8.onnx" ] && [ -s "$APP/models/voices-v1.0.bin" ]; then
       printf 'already downloaded' > "$SRC/.note"
     fi
     "$APP/venv/bin/python" -u "$APP/engine.py" download
+    # Whistle's engine and weights (~17 MB), fetched now so the first -p doesn't
+    # wait, and so highlighting works offline. Optional: kokomux reads without it.
+    echo "@@progress whistle 0 0 17"
+    if "$APP/venv/bin/python" -u "$APP/engine.py" whistle; then
+      echo "@@progress whistle 100 17 17"
+    else
+      echo "Whistle couldn't be fetched; words won't be highlighted until it can." >&2
+    fi
     ;;
   tidy)
     apt-get clean
