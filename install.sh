@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.4.0"
+KOKOMUX_VERSION="0.4.1"
 DISTRO=kokoro
 
 ASSUME_YES=0; VERBOSE=0
@@ -587,12 +587,12 @@ def run_job(path):
         out = os.path.join(jobdir, out)
 
     stream = None
-    lane = None
+    aligner = None
     if job.get("stream") == "1":
         stream = os.path.join(jobdir, "stream")
         os.makedirs(stream, exist_ok=True)
         if job.get("words") == "1":
-            lane = AlignLane(stream, lang)
+            aligner = WordAligner(stream, lang)
 
     try:
         if job.get("url"):
@@ -623,8 +623,8 @@ def run_job(path):
                 tmp = os.path.join(stream, f"{i:04d}.tmp.wav")
                 sf.write(tmp, samples, rate)
                 os.replace(tmp, os.path.join(stream, f"{i:04d}.wav"))
-                if lane:
-                    lane.add(i, chunk, samples, rate)
+                if aligner:
+                    aligner.add(i, chunk, samples, rate)
             if out:
                 parts.append(samples)
                 parts.append(np.zeros(int(rate * 0.2), dtype=samples.dtype))
@@ -633,8 +633,8 @@ def run_job(path):
     finally:
         if stream and os.path.isdir(stream):
             open(os.path.join(stream, "end"), "w").close()
-        if lane:
-            lane.finish()   # the last lines' timings, before the job counts as done
+        if aligner:
+            aligner.finish()   # timings for any line not yet heard
 
     elapsed = time.time() - t0
     _write_atomic(os.path.join(jobdir, "result"), f"{total:.1f} {elapsed:.1f} {len(chunks)}\n")
@@ -652,14 +652,12 @@ def _write_atomic(path, text):
 
 # ------------------------------------------------------------------ word timings
 
-class AlignLane(threading.Thread):
-    """Whistle's lane for one job: aligns rendered lines on the CPU beside speech,
-    starting from the line being heard, and publishes each as stream/NNNN.words
-    the moment it lands. The player lights the spoken word from those files.
-
-    NNNN.words is tab-separated, for the bash player: a "confidence" line, then
-    one "s e a b" row per word (ms, and the word's UTF-8 byte range in NNNN.txt).
-    A line below WORDS_MIN_CONFIDENCE gets the confidence line and no rows."""
+class WordAligner(threading.Thread):
+    """Times the words of a job's lines with Whistle, on the CPU beside speech, and
+    publishes each line as stream/NNNN.words the moment it lands; the player lights
+    the spoken word from those files. It works from the line being heard (the
+    player keeps stream/playing up to date) and drops lines already heard, so a
+    job never waits on timings nobody will see."""
 
     def __init__(self, stream, lang):
         super().__init__(daemon=True)
@@ -672,7 +670,7 @@ class AlignLane(threading.Thread):
             self.words = words
             if not words.available():
                 self.off = "Whistle isn't installed (run kokoro --update)"
-            elif (lang or "")[:2].lower() not in words.SUPPORTED:
+            elif not words.supported(lang):
                 self.off = f"Whistle doesn't transcribe {lang}"
         except ImportError:
             self.off = "word timings aren't installed (run kokoro --update)"
@@ -696,24 +694,31 @@ class AlignLane(threading.Thread):
             self.cond.notify()
         self.join()
 
-    def _next(self):
-        """The line being heard, or the first after it; earlier lines last."""
+    def _playing(self):
         try:
             with open(os.path.join(self.stream, "playing")) as fh:
-                playing = int(fh.read().strip() or 1)
+                return int(fh.read().strip() or 1)
         except (OSError, ValueError):
-            playing = 1
-        ahead = [i for i in self.pending if i >= playing]
-        return min(ahead) if ahead else min(self.pending)
+            return 1
+
+    def _next(self):
+        """The line being heard, or the next one after it; None once every line
+        left has already been heard."""
+        playing = self._playing()
+        for i in [i for i in self.pending if i < playing]:
+            del self.pending[i]
+        return min(self.pending) if self.pending else None
 
     def run(self):
         while True:
             with self.cond:
                 while not self.pending and not self.done:
                     self.cond.wait()
-                if not self.pending:
-                    return
                 i = self._next()
+                if i is None:
+                    if self.done:
+                        return
+                    continue
                 text, samples, rate = self.pending.pop(i)
             if not os.path.isdir(self.stream):
                 return   # cancelled
@@ -721,12 +726,8 @@ class AlignLane(threading.Thread):
                 data = self.words.line_words(text, samples, rate, self.lang)
             except Exception as e:  # noqa: BLE001 - one bad line must not stop the others
                 log(f"Word timings, line {i}: {type(e).__name__}: {e}")
-                data = {"confidence": 0, "words": []}
-            rows = [f"confidence\t{data.get('confidence', 0)}"]
-            if data.get("confidence", 0) >= self.words.WORDS_MIN_CONFIDENCE:
-                for w, (a, b) in zip(data["words"], self.words.byte_ranges(text, data["words"])):
-                    rows.append(f"{w['s']}\t{w['e']}\t{a}\t{b}")
-            _write_atomic(os.path.join(self.stream, f"{i:04d}.words"), "\n".join(rows) + "\n")
+                data = self.words.empty_result("error")
+            _write_atomic(os.path.join(self.stream, f"{i:04d}.words"), self.words.player_rows(text, data))
 
 
 # ------------------------------------------------------------------ server
@@ -947,7 +948,7 @@ def main():
     elif a.cmd == "whistle":
         import words
         t0 = time.time()
-        words._whistle()
+        words.load()
         print(f"Whistle ready ({words.engine_name()}, {time.time() - t0:.1f}s)")
 
 
@@ -987,11 +988,12 @@ WORDS_MIN_CONFIDENCE = 0.35
 # Languages Whistle transcribes. Anything else would come back as a detected,
 # useless transcript, so it isn't attempted.
 SUPPORTED = {"en", "de", "fr", "es", "it", "nl", "pl"}
-CACHE_DIR = os.environ.get("KOKORO_WORDS_CACHE", "/opt/kokoro/cache/words")
-# cactus-compute 4.1 transcribes a 35 s line in one pass in ~4 s; its streaming API took
-# ~40 s for the same line. Only lines past this go through streaming.
-LIMIT_S = 120.0
-CHUNK_S = 1.0    # the buffer size that API expects
+CACHE_DIR = "/opt/kokoro/cache/words"
+# The longest audio given to Whistle in one pass. Measured with cactus-compute 4.1:
+# one pass transcribes 90 s of speech completely, but 120 s comes back cut off at
+# ~96 s. Longer lines are cut at their quietest moment into pieces no longer than
+# this (one pass is ~10x faster than Whistle's streaming API).
+ONE_PASS_MAX_S = 60.0
 RATE = 16000     # Whistle listens at 16 kHz
 
 os.environ.setdefault("CACTUS_TELEMETRY", "0")   # kokomux talks to nobody it doesn't have to
@@ -1001,6 +1003,17 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 # ---------------------------------------------------------------- the words of a line
 
 _TOKEN = re.compile(r"<[^>\n]*>|[^\W\d_][\w'’]*|\d+")
+
+
+def supported(language):
+    """Whistle's code for a language ("en-us" -> "en"), or None if it can't transcribe it."""
+    code = (language or "")[:2].lower()
+    return code if code in SUPPORTED else None
+
+
+def empty_result(engine):
+    """Timings for a line that has none usable: never lit, and never transcribed again."""
+    return {"v": LINE_WORDS_VERSION, "engine": engine, "confidence": 0, "words": []}
 
 
 def word_tokens(text):
@@ -1115,10 +1128,11 @@ def map_words(display, asr, engine):
             continue
         w = asr[j]
         first = last = j
+        same = key(groups[g]) == spoken[j]
         # A word the recogniser didn't quite agree with has usually swallowed its
         # neighbours ("Igdrasil" heard as "Igg Dressel"): it takes any spoken words
         # beside it that nothing else claimed.
-        if key(groups[g]) != spoken[j]:
+        if not same:
             while first > 0 and first - 1 not in claimed:
                 first -= 1
                 claimed.add(first)
@@ -1129,8 +1143,7 @@ def map_words(display, asr, engine):
         put(groups[g], asr[first]["start"] * 1000, asr[last]["end"] * 1000, prob)
         matched += 1
         sure += prob
-        if key(groups[g]) == spoken[j]:
-            exact += 1
+        exact += same
     if not matched:
         return None
 
@@ -1195,7 +1208,7 @@ def available():
     return importlib.util.find_spec("cactus") is not None
 
 
-def _whistle():
+def load():
     """Whistle, loaded once. Offline first: once its engine and weights are cached
     (the installer fetches them), it needs no network, which a phone often lacks.
     Only if something isn't cached yet does it go online to fetch it."""
@@ -1204,15 +1217,15 @@ def _whistle():
         if _model is None:
             import huggingface_hub.constants as hub
             from cactus.agent.whistle import Whistle
-            saved = hub.HF_HUB_OFFLINE
+            online = hub.HF_HUB_OFFLINE
+            hub.HF_HUB_OFFLINE = True
             try:
-                hub.HF_HUB_OFFLINE = True
                 _model = Whistle()
             except Exception:
-                hub.HF_HUB_OFFLINE = saved
+                hub.HF_HUB_OFFLINE = online
                 _model = Whistle()
             finally:
-                hub.HF_HUB_OFFLINE = saved
+                hub.HF_HUB_OFFLINE = online
     return _model
 
 
@@ -1226,16 +1239,31 @@ def to_16k(samples, rate):
     return np.interp(np.linspace(0, len(x) - 1, n), np.arange(len(x)), x).astype(np.float32)
 
 
+def quiet_cuts(x, longest=ONE_PASS_MAX_S, search=10.0, frame=0.05):
+    """Where to cut 16 kHz audio so no piece is longer than `longest` seconds: at the
+    quietest 50 ms in the last `search` seconds before each limit, which is almost
+    always a pause between words. Returns the piece boundaries in samples."""
+    import numpy as np
+    step, cuts, start = int(RATE * frame), [0], 0
+    while len(x) - start > longest * RATE:
+        lo, hi = start + int((longest - search) * RATE), start + int(longest * RATE)
+        frames = x[lo:hi][: (hi - lo) // step * step].reshape(-1, step)
+        start = lo + int(np.argmin((frames ** 2).mean(axis=1))) * step + step // 2
+        cuts.append(start)
+    return cuts + [len(x)]
+
+
 def recognise(samples, rate, language):
-    """Whistle's words for one line: [{"word", "start", "end", "probability"}]."""
-    model = _whistle()
+    """Whistle's words for one line: [{"word", "start", "end", "probability"}],
+    seconds from the start of the line."""
+    model = load()
     x = to_16k(samples, rate)
-    lang = language if language in SUPPORTED else None
-    if len(x) / RATE <= LIMIT_S:
-        return model.transcribe(x, language=lang, word_timestamps=True).get("words") or []
-    words, step = [], int(RATE * CHUNK_S)
-    for part in model.stream((x[i:i + step] for i in range(0, len(x), step)), language=lang):
-        words.extend(part.get("words") or [])
+    cuts = quiet_cuts(x)
+    words = []
+    for a, b in zip(cuts, cuts[1:]):
+        out = model.transcribe(x[a:b], language=supported(language), word_timestamps=True)
+        for w in out.get("words") or []:
+            words.append({**w, "start": w["start"] + a / RATE, "end": w["end"] + a / RATE})
     return words
 
 
@@ -1275,16 +1303,24 @@ def line_words(text, samples, rate, language):
     cached = read_cached(h)
     if cached is not None:
         return cached
-    lang = (language or "")[:2].lower()
-    if lang not in SUPPORTED:
-        data = {"v": LINE_WORDS_VERSION, "engine": "none", "confidence": 0, "words": [],
-                "note": f"Whistle doesn't transcribe {language}"}
+    if supported(language):
+        data = map_words(text, recognise(samples, rate, language), engine_name()) or empty_result(engine_name())
     else:
-        asr = recognise(samples, rate, lang)
-        data = map_words(text, asr, engine_name()) or \
-            {"v": LINE_WORDS_VERSION, "engine": engine_name(), "confidence": 0, "words": []}
+        data = empty_result("none")
     write_cached(h, data)
     return data
+
+
+def player_rows(text, data):
+    """A line's timings in the form the bash player reads (stream/NNNN.words): a
+    "confidence" line, then one "start end a b" row per word, with a/b the word's
+    UTF-8 byte range in the line. Below WORDS_MIN_CONFIDENCE there are no rows,
+    so nothing is lit."""
+    rows = [f"confidence\t{data.get('confidence', 0)}"]
+    if data.get("confidence", 0) >= WORDS_MIN_CONFIDENCE:
+        for w, (a, b) in zip(data["words"], byte_ranges(text, data["words"])):
+            rows.append(f"{w['s']}\t{w['e']}\t{a}\t{b}")
+    return "\n".join(rows) + "\n"
 
 
 def byte_ranges(text, words):
@@ -1334,7 +1370,6 @@ CFG
     rm -f "$APP/speak.py"   # from older versions
     ;;
   models)
-    cp "$SRC/engine.py" "$SRC/words.py" "$APP/"
     if [ -s "$APP/models/kokoro-v1.0.int8.onnx" ] && [ -s "$APP/models/voices-v1.0.bin" ]; then
       printf 'already downloaded' > "$SRC/.note"
     fi
@@ -1368,7 +1403,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
 # localhost (fast); otherwise each call starts the container (slower).
 set -euo pipefail
 
-KOKOMUX_VERSION="0.4.0"
+KOKOMUX_VERSION="0.4.1"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -1680,7 +1715,7 @@ gen_pid=""; play_pid=""
 cleanup() {
   set +e   # best effort from here: a process that's already gone mustn't change the exit code
   status_clear
-  [ "${in_line:-0}" = 1 ] && block_redraw -1 -1   # stopped mid-line: leave nothing lit
+  [ "${in_line:-0}" = 1 ] && block_finish       # stopped mid-line: leave nothing lit
   [ -n "$play_pid" ] && kill "$play_pid" 2>/dev/null
   [ -n "$gen_pid" ] && kill "$gen_pid" 2>/dev/null
   rm -rf "$tmpd"
@@ -1722,8 +1757,8 @@ fi
 [[ "$url" != *$'\n'* ]] || die "That doesn't look like a web address."
 
 # With -p on a terminal, show each line as it's read and light the spoken word.
-karaoke=0
-[ "$play" = 1 ] && [ "$LIVE" = 1 ] && [ "$KOKORO_WORDS" = 1 ] && karaoke=1
+show_words=0
+[ "$play" = 1 ] && [ "$LIVE" = 1 ] && [ "$KOKORO_WORDS" = 1 ] && show_words=1
 
 {
   echo "voice=$voice"
@@ -1732,7 +1767,7 @@ karaoke=0
   [ -n "$url" ] && echo "url=$url"
   [ -n "$out" ] && echo "out=out.$ext"
   [ "$play" = 1 ] && echo "stream=1"
-  [ "$karaoke" = 1 ] && echo "words=1"
+  [ "$show_words" = 1 ] && echo "words=1"
 } > "$tmpd/job"
 job="/tmp/$(basename "$tmpd")/job"   # the same file, as the container sees it
 
@@ -1775,27 +1810,40 @@ waiting_label() {
 # (stream/NNNN.words: "confidence", then "start end a b" per word, with a/b the
 # word's byte range in NNNN.txt). play-audio has no clock to read, so the time
 # is how long it has been playing, less its start-up delay.
+# A line taller than the screen is shown as a window of rows that follows the
+# lit word, then printed in full when it ends.
 
 HL=$'\033[48;5;61m\033[38;5;231m'   # the soft highlight
-blk_lines=(); blk_offs=()
+blk_lines=(); blk_offs=(); view_top=0; view_h=0
 w_s=(); w_e=(); w_a=(); w_b=(); w_state=none
-TERM_ROWS="$(stty size 2>/dev/null </dev/tty | cut -d' ' -f1)" || true
-[[ "${TERM_ROWS:-}" =~ ^[0-9]+$ ]] || TERM_ROWS=24
+TERM_ROWS=24
 exec {TICK}<> <(:)                    # read -t on this is a sleep with no process
 now_ms() { local t=${EPOCHREALTIME//[!0-9]/}; NOW=$(( t / 1000 )); }   # no subshell: called every frame
 in_line=0
 
-block_load() {   # wrap a line's text to the screen, remembering each row's byte offset
-  local LC_ALL=C row off=0
+part_of() {      # PART="part I of N · " while a job has more than one part
+  local parts=1
+  [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
+  PART=""; [ "${parts:-1}" -gt 1 ] && PART="part $1 of $parts · "
+  return 0
+}
+
+block_load() {   # wrap a line to the screen as it is now, remembering each row's byte offset
+  local LC_ALL=C row off=0 size
+  size="$(stty size 2>/dev/null </dev/tty)" || size=""
+  if [[ "$size" =~ ^([0-9]+)\ ([0-9]+)$ ]]; then TERM_ROWS=${BASH_REMATCH[1]} TERM_COLS=${BASH_REMATCH[2]}; fi
   blk_lines=(); blk_offs=()
   while IFS= read -r row; do
     blk_lines+=("$row"); blk_offs+=("$off"); off=$(( off + ${#row} ))
   done < <(fold -s -w $(( TERM_COLS - 3 )) "$1"; echo)
+  view_top=0
+  view_h=$(( ${#blk_lines[@]} < TERM_ROWS - 2 ? ${#blk_lines[@]} : TERM_ROWS - 2 ))
+  [ "$view_h" -ge 1 ] || view_h=1
 }
 
-block_draw() {   # block_draw A B: draw the rows with bytes A..B lit (A = -1: none lit)
+block_draw() {   # block_draw A B: draw the visible rows with bytes A..B lit (A = -1: none lit)
   local LC_ALL=C a=$1 b=$2 k o row len x y
-  for k in "${!blk_lines[@]}"; do
+  for (( k = view_top; k < view_top + view_h; k++ )); do
     o=${blk_offs[k]} row=${blk_lines[k]} len=${#blk_lines[k]}
     printf '\r\033[K  ' >&2
     if [ "$a" -lt 0 ] || [ $(( o + len )) -le "$a" ]; then
@@ -1810,9 +1858,22 @@ block_draw() {   # block_draw A B: draw the rows with bytes A..B lit (A = -1: no
   done
 }
 
-block_redraw() { # back up over the rows and draw them again
-  printf '\r\033[K\033[%dA' "${#blk_lines[@]}" >&2
+block_redraw() { # back up over the visible rows and draw them again, moving the window to the lit word
+  local a=$1 k=0
+  if [ "$a" -ge 0 ]; then
+    while [ $(( k + 1 )) -lt "${#blk_lines[@]}" ] && [ "${blk_offs[k + 1]}" -le "$a" ]; do k=$(( k + 1 )); done
+    if [ "$k" -lt "$view_top" ] || [ "$k" -ge $(( view_top + view_h )) ]; then
+      view_top=$(( k + view_h > ${#blk_lines[@]} ? ${#blk_lines[@]} - view_h : k ))
+    fi
+  fi
+  printf '\r\033[K\033[%dA' "$view_h" >&2
   block_draw "$@"
+}
+
+block_finish() { # the whole line as read, nothing lit (it stays on screen as a transcript)
+  printf '\r\033[K\033[%dA' "$view_h" >&2
+  view_top=0; view_h=${#blk_lines[@]}
+  block_draw -1 -1
 }
 
 words_load() {   # read NNNN.words once it lands
@@ -1827,12 +1888,11 @@ words_load() {   # read NNNN.words once it lands
 }
 
 play_line() {    # play_line WAV IDX: play one line, lighting each word as it's heard
-  local wav=$1 i=$2 base="${1%.wav}" cur=-1 lit=-2 t t0 n where label last=""
+  local wav=$1 i=$2 base="${1%.wav}" cur=-1 lit=-2 lit_now t t0 label last=""
   w_state=pending
   [ -f "$tmpd/stream/words-off" ] && w_state=off
   echo "$i" > "$tmpd/stream/playing"          # the aligner works from the line being heard
   block_load "$base.txt"
-  local fits=1; [ "${#blk_lines[@]}" -lt $(( TERM_ROWS - 2 )) ] || fits=0
   status_clear
   if [ "$w_state" = off ]; then block_draw -1 -1; else block_draw 0 0; fi   # dim until words light
   play-audio "$wav" >/dev/null 2>&1 & play_pid=$!
@@ -1840,28 +1900,28 @@ play_line() {    # play_line WAV IDX: play one line, lighting each word as it's 
   # Nothing in this loop starts a process: it runs ~30 times a second on a phone.
   while kill -0 "$play_pid" 2>/dev/null; do
     if [ "$w_state" = pending ]; then words_load "$base.words" || true; fi   # not landed yet
-    if [ "$w_state" = ready ] && [ "$fits" = 1 ]; then
+    if [ "$w_state" = ready ]; then
       now_ms; t=$(( NOW - t0 - KOKORO_WORDS_OFFSET_MS ))
       while [ $(( cur + 1 )) -lt "${#w_s[@]}" ] && [ "${w_s[cur + 1]}" -le "$t" ]; do cur=$(( cur + 1 )); done
       # Keep the word lit through the pause after it; the last one goes out when it ends.
-      n=$cur
-      if [ "$cur" -eq $(( ${#w_s[@]} - 1 )) ] && [ "$t" -gt "${w_e[cur]}" ]; then n=-1; fi
-      if [ "$n" -ne "$lit" ]; then
-        if [ "$n" -ge 0 ]; then block_redraw "${w_a[n]}" "${w_b[n]}"
+      lit_now=$cur
+      if [ "$cur" -eq $(( ${#w_s[@]} - 1 )) ] && [ "$t" -gt "${w_e[cur]}" ]; then lit_now=-1; fi
+      if [ "$lit_now" -ne "$lit" ]; then
+        if [ "$lit_now" -ge 0 ]; then block_redraw "${w_a[lit_now]}" "${w_b[lit_now]}"
         elif [ "$cur" -ge 0 ]; then block_redraw -1 -1    # past the last word
         else block_redraw 0 0; fi                          # before the first
-        lit=$n; last=""
+        lit=$lit_now; last=""
       fi
     fi
-    n=1; [ -f "$tmpd/progress" ] && { read -r _ n < "$tmpd/progress" || n=1; }
-    where=""; [ "${n:-1}" -gt 1 ] && where="part $i of $n · "
-    label="${where}Ctrl+C to stop"; [ "$w_state" = pending ] && label="${where}word timings…"
+    part_of "$i"
+    label="${PART}Ctrl+C to stop"; [ "$w_state" = pending ] && label="${PART}word timings…"
     if [ "$label" != "$last" ]; then status "Playing" "$label" "▶"; last=$label; fi
     read -r -t 0.03 -u "$TICK" _ || true
   done
   wait "$play_pid" || true
   play_pid=""; in_line=0
-  block_redraw -1 -1                            # the line as read, all lit as spoken
+  echo $(( i + 1 )) > "$tmpd/stream/playing"  # heard: the aligner can drop this line
+  block_finish
   rm -f "$wav"
 }
 
@@ -1876,15 +1936,14 @@ run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
 i=1
 while :; do
   f="$(printf '%s/stream/%04d.wav' "$tmpd" "$i")"
-  if [ "$karaoke" = 1 ] && [ -f "$f" ]; then
+  if [ "$show_words" = 1 ] && [ -f "$f" ]; then
     play_line "$f" "$i"; i=$((i + 1))
   elif [ "$play" = 1 ] && [ -f "$f" ]; then
     play-audio "$f" >/dev/null 2>&1 & play_pid=$!
     while kill -0 "$play_pid" 2>/dev/null; do
-      n="$(cut -d' ' -f2 "$tmpd/progress" 2>/dev/null || echo 1)"
-      if [ "${n:-1}" -gt 1 ]; then where="part $i of $n · "; else where=""; fi
-      status "Playing" "${where}Ctrl+C to stop" "▶"
-      sleep 0.15
+      part_of "$i"
+      status "Playing" "${PART}Ctrl+C to stop" "▶"
+      read -r -t 0.15 -u "$TICK" _ || true
     done
     wait "$play_pid" || true
     play_pid=""

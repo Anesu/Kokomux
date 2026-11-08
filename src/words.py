@@ -29,11 +29,12 @@ WORDS_MIN_CONFIDENCE = 0.35
 # Languages Whistle transcribes. Anything else would come back as a detected,
 # useless transcript, so it isn't attempted.
 SUPPORTED = {"en", "de", "fr", "es", "it", "nl", "pl"}
-CACHE_DIR = os.environ.get("KOKORO_WORDS_CACHE", "/opt/kokoro/cache/words")
-# cactus-compute 4.1 transcribes a 35 s line in one pass in ~4 s; its streaming API took
-# ~40 s for the same line. Only lines past this go through streaming.
-LIMIT_S = 120.0
-CHUNK_S = 1.0    # the buffer size that API expects
+CACHE_DIR = "/opt/kokoro/cache/words"
+# The longest audio given to Whistle in one pass. Measured with cactus-compute 4.1:
+# one pass transcribes 90 s of speech completely, but 120 s comes back cut off at
+# ~96 s. Longer lines are cut at their quietest moment into pieces no longer than
+# this (one pass is ~10x faster than Whistle's streaming API).
+ONE_PASS_MAX_S = 60.0
 RATE = 16000     # Whistle listens at 16 kHz
 
 os.environ.setdefault("CACTUS_TELEMETRY", "0")   # kokomux talks to nobody it doesn't have to
@@ -43,6 +44,17 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 # ---------------------------------------------------------------- the words of a line
 
 _TOKEN = re.compile(r"<[^>\n]*>|[^\W\d_][\w'’]*|\d+")
+
+
+def supported(language):
+    """Whistle's code for a language ("en-us" -> "en"), or None if it can't transcribe it."""
+    code = (language or "")[:2].lower()
+    return code if code in SUPPORTED else None
+
+
+def empty_result(engine):
+    """Timings for a line that has none usable: never lit, and never transcribed again."""
+    return {"v": LINE_WORDS_VERSION, "engine": engine, "confidence": 0, "words": []}
 
 
 def word_tokens(text):
@@ -157,10 +169,11 @@ def map_words(display, asr, engine):
             continue
         w = asr[j]
         first = last = j
+        same = key(groups[g]) == spoken[j]
         # A word the recogniser didn't quite agree with has usually swallowed its
         # neighbours ("Igdrasil" heard as "Igg Dressel"): it takes any spoken words
         # beside it that nothing else claimed.
-        if key(groups[g]) != spoken[j]:
+        if not same:
             while first > 0 and first - 1 not in claimed:
                 first -= 1
                 claimed.add(first)
@@ -171,8 +184,7 @@ def map_words(display, asr, engine):
         put(groups[g], asr[first]["start"] * 1000, asr[last]["end"] * 1000, prob)
         matched += 1
         sure += prob
-        if key(groups[g]) == spoken[j]:
-            exact += 1
+        exact += same
     if not matched:
         return None
 
@@ -237,7 +249,7 @@ def available():
     return importlib.util.find_spec("cactus") is not None
 
 
-def _whistle():
+def load():
     """Whistle, loaded once. Offline first: once its engine and weights are cached
     (the installer fetches them), it needs no network, which a phone often lacks.
     Only if something isn't cached yet does it go online to fetch it."""
@@ -246,15 +258,15 @@ def _whistle():
         if _model is None:
             import huggingface_hub.constants as hub
             from cactus.agent.whistle import Whistle
-            saved = hub.HF_HUB_OFFLINE
+            online = hub.HF_HUB_OFFLINE
+            hub.HF_HUB_OFFLINE = True
             try:
-                hub.HF_HUB_OFFLINE = True
                 _model = Whistle()
             except Exception:
-                hub.HF_HUB_OFFLINE = saved
+                hub.HF_HUB_OFFLINE = online
                 _model = Whistle()
             finally:
-                hub.HF_HUB_OFFLINE = saved
+                hub.HF_HUB_OFFLINE = online
     return _model
 
 
@@ -268,16 +280,31 @@ def to_16k(samples, rate):
     return np.interp(np.linspace(0, len(x) - 1, n), np.arange(len(x)), x).astype(np.float32)
 
 
+def quiet_cuts(x, longest=ONE_PASS_MAX_S, search=10.0, frame=0.05):
+    """Where to cut 16 kHz audio so no piece is longer than `longest` seconds: at the
+    quietest 50 ms in the last `search` seconds before each limit, which is almost
+    always a pause between words. Returns the piece boundaries in samples."""
+    import numpy as np
+    step, cuts, start = int(RATE * frame), [0], 0
+    while len(x) - start > longest * RATE:
+        lo, hi = start + int((longest - search) * RATE), start + int(longest * RATE)
+        frames = x[lo:hi][: (hi - lo) // step * step].reshape(-1, step)
+        start = lo + int(np.argmin((frames ** 2).mean(axis=1))) * step + step // 2
+        cuts.append(start)
+    return cuts + [len(x)]
+
+
 def recognise(samples, rate, language):
-    """Whistle's words for one line: [{"word", "start", "end", "probability"}]."""
-    model = _whistle()
+    """Whistle's words for one line: [{"word", "start", "end", "probability"}],
+    seconds from the start of the line."""
+    model = load()
     x = to_16k(samples, rate)
-    lang = language if language in SUPPORTED else None
-    if len(x) / RATE <= LIMIT_S:
-        return model.transcribe(x, language=lang, word_timestamps=True).get("words") or []
-    words, step = [], int(RATE * CHUNK_S)
-    for part in model.stream((x[i:i + step] for i in range(0, len(x), step)), language=lang):
-        words.extend(part.get("words") or [])
+    cuts = quiet_cuts(x)
+    words = []
+    for a, b in zip(cuts, cuts[1:]):
+        out = model.transcribe(x[a:b], language=supported(language), word_timestamps=True)
+        for w in out.get("words") or []:
+            words.append({**w, "start": w["start"] + a / RATE, "end": w["end"] + a / RATE})
     return words
 
 
@@ -317,16 +344,24 @@ def line_words(text, samples, rate, language):
     cached = read_cached(h)
     if cached is not None:
         return cached
-    lang = (language or "")[:2].lower()
-    if lang not in SUPPORTED:
-        data = {"v": LINE_WORDS_VERSION, "engine": "none", "confidence": 0, "words": [],
-                "note": f"Whistle doesn't transcribe {language}"}
+    if supported(language):
+        data = map_words(text, recognise(samples, rate, language), engine_name()) or empty_result(engine_name())
     else:
-        asr = recognise(samples, rate, lang)
-        data = map_words(text, asr, engine_name()) or \
-            {"v": LINE_WORDS_VERSION, "engine": engine_name(), "confidence": 0, "words": []}
+        data = empty_result("none")
     write_cached(h, data)
     return data
+
+
+def player_rows(text, data):
+    """A line's timings in the form the bash player reads (stream/NNNN.words): a
+    "confidence" line, then one "start end a b" row per word, with a/b the word's
+    UTF-8 byte range in the line. Below WORDS_MIN_CONFIDENCE there are no rows,
+    so nothing is lit."""
+    rows = [f"confidence\t{data.get('confidence', 0)}"]
+    if data.get("confidence", 0) >= WORDS_MIN_CONFIDENCE:
+        for w, (a, b) in zip(data["words"], byte_ranges(text, data["words"])):
+            rows.append(f"{w['s']}\t{w['e']}\t{a}\t{b}")
+    return "\n".join(rows) + "\n"
 
 
 def byte_ranges(text, words):

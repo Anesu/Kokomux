@@ -319,7 +319,7 @@ gen_pid=""; play_pid=""
 cleanup() {
   set +e   # best effort from here: a process that's already gone mustn't change the exit code
   status_clear
-  [ "${in_line:-0}" = 1 ] && block_redraw -1 -1   # stopped mid-line: leave nothing lit
+  [ "${in_line:-0}" = 1 ] && block_finish       # stopped mid-line: leave nothing lit
   [ -n "$play_pid" ] && kill "$play_pid" 2>/dev/null
   [ -n "$gen_pid" ] && kill "$gen_pid" 2>/dev/null
   rm -rf "$tmpd"
@@ -361,8 +361,8 @@ fi
 [[ "$url" != *$'\n'* ]] || die "That doesn't look like a web address."
 
 # With -p on a terminal, show each line as it's read and light the spoken word.
-karaoke=0
-[ "$play" = 1 ] && [ "$LIVE" = 1 ] && [ "$KOKORO_WORDS" = 1 ] && karaoke=1
+show_words=0
+[ "$play" = 1 ] && [ "$LIVE" = 1 ] && [ "$KOKORO_WORDS" = 1 ] && show_words=1
 
 {
   echo "voice=$voice"
@@ -371,7 +371,7 @@ karaoke=0
   [ -n "$url" ] && echo "url=$url"
   [ -n "$out" ] && echo "out=out.$ext"
   [ "$play" = 1 ] && echo "stream=1"
-  [ "$karaoke" = 1 ] && echo "words=1"
+  [ "$show_words" = 1 ] && echo "words=1"
 } > "$tmpd/job"
 job="/tmp/$(basename "$tmpd")/job"   # the same file, as the container sees it
 
@@ -414,27 +414,40 @@ waiting_label() {
 # (stream/NNNN.words: "confidence", then "start end a b" per word, with a/b the
 # word's byte range in NNNN.txt). play-audio has no clock to read, so the time
 # is how long it has been playing, less its start-up delay.
+# A line taller than the screen is shown as a window of rows that follows the
+# lit word, then printed in full when it ends.
 
 HL=$'\033[48;5;61m\033[38;5;231m'   # the soft highlight
-blk_lines=(); blk_offs=()
+blk_lines=(); blk_offs=(); view_top=0; view_h=0
 w_s=(); w_e=(); w_a=(); w_b=(); w_state=none
-TERM_ROWS="$(stty size 2>/dev/null </dev/tty | cut -d' ' -f1)" || true
-[[ "${TERM_ROWS:-}" =~ ^[0-9]+$ ]] || TERM_ROWS=24
+TERM_ROWS=24
 exec {TICK}<> <(:)                    # read -t on this is a sleep with no process
 now_ms() { local t=${EPOCHREALTIME//[!0-9]/}; NOW=$(( t / 1000 )); }   # no subshell: called every frame
 in_line=0
 
-block_load() {   # wrap a line's text to the screen, remembering each row's byte offset
-  local LC_ALL=C row off=0
+part_of() {      # PART="part I of N · " while a job has more than one part
+  local parts=1
+  [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
+  PART=""; [ "${parts:-1}" -gt 1 ] && PART="part $1 of $parts · "
+  return 0
+}
+
+block_load() {   # wrap a line to the screen as it is now, remembering each row's byte offset
+  local LC_ALL=C row off=0 size
+  size="$(stty size 2>/dev/null </dev/tty)" || size=""
+  if [[ "$size" =~ ^([0-9]+)\ ([0-9]+)$ ]]; then TERM_ROWS=${BASH_REMATCH[1]} TERM_COLS=${BASH_REMATCH[2]}; fi
   blk_lines=(); blk_offs=()
   while IFS= read -r row; do
     blk_lines+=("$row"); blk_offs+=("$off"); off=$(( off + ${#row} ))
   done < <(fold -s -w $(( TERM_COLS - 3 )) "$1"; echo)
+  view_top=0
+  view_h=$(( ${#blk_lines[@]} < TERM_ROWS - 2 ? ${#blk_lines[@]} : TERM_ROWS - 2 ))
+  [ "$view_h" -ge 1 ] || view_h=1
 }
 
-block_draw() {   # block_draw A B: draw the rows with bytes A..B lit (A = -1: none lit)
+block_draw() {   # block_draw A B: draw the visible rows with bytes A..B lit (A = -1: none lit)
   local LC_ALL=C a=$1 b=$2 k o row len x y
-  for k in "${!blk_lines[@]}"; do
+  for (( k = view_top; k < view_top + view_h; k++ )); do
     o=${blk_offs[k]} row=${blk_lines[k]} len=${#blk_lines[k]}
     printf '\r\033[K  ' >&2
     if [ "$a" -lt 0 ] || [ $(( o + len )) -le "$a" ]; then
@@ -449,9 +462,22 @@ block_draw() {   # block_draw A B: draw the rows with bytes A..B lit (A = -1: no
   done
 }
 
-block_redraw() { # back up over the rows and draw them again
-  printf '\r\033[K\033[%dA' "${#blk_lines[@]}" >&2
+block_redraw() { # back up over the visible rows and draw them again, moving the window to the lit word
+  local a=$1 k=0
+  if [ "$a" -ge 0 ]; then
+    while [ $(( k + 1 )) -lt "${#blk_lines[@]}" ] && [ "${blk_offs[k + 1]}" -le "$a" ]; do k=$(( k + 1 )); done
+    if [ "$k" -lt "$view_top" ] || [ "$k" -ge $(( view_top + view_h )) ]; then
+      view_top=$(( k + view_h > ${#blk_lines[@]} ? ${#blk_lines[@]} - view_h : k ))
+    fi
+  fi
+  printf '\r\033[K\033[%dA' "$view_h" >&2
   block_draw "$@"
+}
+
+block_finish() { # the whole line as read, nothing lit (it stays on screen as a transcript)
+  printf '\r\033[K\033[%dA' "$view_h" >&2
+  view_top=0; view_h=${#blk_lines[@]}
+  block_draw -1 -1
 }
 
 words_load() {   # read NNNN.words once it lands
@@ -466,12 +492,11 @@ words_load() {   # read NNNN.words once it lands
 }
 
 play_line() {    # play_line WAV IDX: play one line, lighting each word as it's heard
-  local wav=$1 i=$2 base="${1%.wav}" cur=-1 lit=-2 t t0 n where label last=""
+  local wav=$1 i=$2 base="${1%.wav}" cur=-1 lit=-2 lit_now t t0 label last=""
   w_state=pending
   [ -f "$tmpd/stream/words-off" ] && w_state=off
   echo "$i" > "$tmpd/stream/playing"          # the aligner works from the line being heard
   block_load "$base.txt"
-  local fits=1; [ "${#blk_lines[@]}" -lt $(( TERM_ROWS - 2 )) ] || fits=0
   status_clear
   if [ "$w_state" = off ]; then block_draw -1 -1; else block_draw 0 0; fi   # dim until words light
   play-audio "$wav" >/dev/null 2>&1 & play_pid=$!
@@ -479,28 +504,28 @@ play_line() {    # play_line WAV IDX: play one line, lighting each word as it's 
   # Nothing in this loop starts a process: it runs ~30 times a second on a phone.
   while kill -0 "$play_pid" 2>/dev/null; do
     if [ "$w_state" = pending ]; then words_load "$base.words" || true; fi   # not landed yet
-    if [ "$w_state" = ready ] && [ "$fits" = 1 ]; then
+    if [ "$w_state" = ready ]; then
       now_ms; t=$(( NOW - t0 - KOKORO_WORDS_OFFSET_MS ))
       while [ $(( cur + 1 )) -lt "${#w_s[@]}" ] && [ "${w_s[cur + 1]}" -le "$t" ]; do cur=$(( cur + 1 )); done
       # Keep the word lit through the pause after it; the last one goes out when it ends.
-      n=$cur
-      if [ "$cur" -eq $(( ${#w_s[@]} - 1 )) ] && [ "$t" -gt "${w_e[cur]}" ]; then n=-1; fi
-      if [ "$n" -ne "$lit" ]; then
-        if [ "$n" -ge 0 ]; then block_redraw "${w_a[n]}" "${w_b[n]}"
+      lit_now=$cur
+      if [ "$cur" -eq $(( ${#w_s[@]} - 1 )) ] && [ "$t" -gt "${w_e[cur]}" ]; then lit_now=-1; fi
+      if [ "$lit_now" -ne "$lit" ]; then
+        if [ "$lit_now" -ge 0 ]; then block_redraw "${w_a[lit_now]}" "${w_b[lit_now]}"
         elif [ "$cur" -ge 0 ]; then block_redraw -1 -1    # past the last word
         else block_redraw 0 0; fi                          # before the first
-        lit=$n; last=""
+        lit=$lit_now; last=""
       fi
     fi
-    n=1; [ -f "$tmpd/progress" ] && { read -r _ n < "$tmpd/progress" || n=1; }
-    where=""; [ "${n:-1}" -gt 1 ] && where="part $i of $n · "
-    label="${where}Ctrl+C to stop"; [ "$w_state" = pending ] && label="${where}word timings…"
+    part_of "$i"
+    label="${PART}Ctrl+C to stop"; [ "$w_state" = pending ] && label="${PART}word timings…"
     if [ "$label" != "$last" ]; then status "Playing" "$label" "▶"; last=$label; fi
     read -r -t 0.03 -u "$TICK" _ || true
   done
   wait "$play_pid" || true
   play_pid=""; in_line=0
-  block_redraw -1 -1                            # the line as read, all lit as spoken
+  echo $(( i + 1 )) > "$tmpd/stream/playing"  # heard: the aligner can drop this line
+  block_finish
   rm -f "$wav"
 }
 
@@ -515,15 +540,14 @@ run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
 i=1
 while :; do
   f="$(printf '%s/stream/%04d.wav' "$tmpd" "$i")"
-  if [ "$karaoke" = 1 ] && [ -f "$f" ]; then
+  if [ "$show_words" = 1 ] && [ -f "$f" ]; then
     play_line "$f" "$i"; i=$((i + 1))
   elif [ "$play" = 1 ] && [ -f "$f" ]; then
     play-audio "$f" >/dev/null 2>&1 & play_pid=$!
     while kill -0 "$play_pid" 2>/dev/null; do
-      n="$(cut -d' ' -f2 "$tmpd/progress" 2>/dev/null || echo 1)"
-      if [ "${n:-1}" -gt 1 ]; then where="part $i of $n · "; else where=""; fi
-      status "Playing" "${where}Ctrl+C to stop" "▶"
-      sleep 0.15
+      part_of "$i"
+      status "Playing" "${PART}Ctrl+C to stop" "▶"
+      read -r -t 0.15 -u "$TICK" _ || true
     done
     wait "$play_pid" || true
     play_pid=""

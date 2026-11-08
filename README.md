@@ -65,11 +65,11 @@ kokoro --stop                             # stop playback
 
 ## Words light up as they're read
 
-With `-p` on a terminal, each line appears as it starts playing. A soft highlight then moves from word to word in time with the voice: words already spoken are shown normally and upcoming words are dim. When a line finishes it stays on screen, so a long text leaves a transcript behind.
+With `-p` on a terminal, each line appears as it starts playing. A soft highlight then moves from word to word in time with the voice: words already spoken are shown normally and upcoming words are dim. When a line finishes it stays on screen, so a long text leaves a transcript behind. A line taller than the screen is shown as a window that follows the word being read.
 
 How it works:
 
-1. **Recognise.** [Whistle](https://cactuscompute.com/blog/whistle), a small speech recogniser from Cactus Compute, listens to each line Kokoro renders and returns the words it heard, with start and end times. It runs on the CPU inside the Debian container, beside Kokoro, and starts with the line you're hearing.
+1. **Recognise.** [Whistle](https://cactuscompute.com/blog/whistle), a small speech recogniser from Cactus Compute, listens to each line Kokoro renders and returns the words it heard, with start and end times. It runs on the CPU inside the Debian container, beside Kokoro. It starts with the line you're hearing and skips lines you've already heard. A line longer than a minute is cut at a pause and transcribed in pieces, because one pass of Whistle stops partway through very long audio.
 2. **Match.** Whistle isn't a forced aligner, so its transcript won't exactly match the text. An edit-distance alignment pairs its words with the text's words in order. It handles numbers ("60" ↔ "sixty"), hyphenated words ("worn-out" ↔ "wornout"), and names it hears as several words ("Igdrasil" ↔ "Igg Dressel").
 3. **Store.** Each line's result is cached as `<audio_hash>.words.json` in `/opt/kokoro/cache/words/` inside the container. Each entry holds `s`/`e` (start and end in ms), `a`/`b` (the character range in the line's text) and `p` (Whistle's confidence). The same line in the same voice is never transcribed twice.
 4. **Highlight.** The player lights the word that matches the time since the line started playing. A line whose match scores below 0.35 gets no highlight rather than a wrong one, and is shown in plain text.

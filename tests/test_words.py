@@ -7,7 +7,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-from words import WORDS_MIN_CONFIDENCE, align_pairs, byte_ranges, map_words, word_key, word_tokens  # noqa: E402
+from words import (WORDS_MIN_CONFIDENCE, align_pairs, byte_ranges, empty_result, map_words,  # noqa: E402
+                   player_rows, quiet_cuts, supported, word_key, word_tokens)
 
 
 def asr(*words):
@@ -134,6 +135,41 @@ def test_byte_ranges_follow_utf8():
     raw = text.encode("utf-8")
     for (a, b), w in zip(byte_ranges(text, m["words"]), m["words"]):
         assert raw[a:b].decode("utf-8") == text[w["a"]:w["b"]]
+
+
+def test_supported_languages():
+    assert supported("en-us") == "en" and supported("en-gb") == "en"
+    assert supported("fr-fr") == "fr" and supported("es") == "es"
+    assert supported("pt-br") is None and supported("hi") is None and supported("") is None
+
+
+def test_player_rows_light_a_confident_line_and_nothing_else():
+    text = "Max! Lay low"
+    good = mapped(text, asr(("Max", 0.4, 0.72), ("lay", 1.28, 1.44), ("low", 1.44, 1.68)))
+    rows = player_rows(text, good).splitlines()
+    assert rows[0].startswith("confidence\t") and len(rows) == 4
+    assert rows[1].split("\t") == ["400", "720", "0", "3"]
+    poor = {**good, "confidence": WORDS_MIN_CONFIDENCE - 0.01}
+    assert player_rows(text, poor).splitlines() == [f"confidence\t{poor['confidence']}"]
+    assert player_rows(text, empty_result("none")) == "confidence\t0\n"
+
+
+def test_quiet_cuts_split_long_audio_at_a_pause():
+    import numpy as np
+    rate = 16000
+    rng = np.random.default_rng(1)
+    # 150 s of "speech" (noise) with a 0.4 s pause every 7 s.
+    x = rng.normal(0, 0.3, rate * 150).astype(np.float32)
+    pauses = list(range(7, 150, 7))
+    for p in pauses:
+        x[p * rate:int((p + 0.4) * rate)] = 0
+    cuts = quiet_cuts(x, longest=60.0)
+    assert cuts[0] == 0 and cuts[-1] == len(x) and len(cuts) == 4    # three pieces
+    for a, b in zip(cuts, cuts[1:]):
+        assert b - a <= 60 * rate                                     # each fits one pass
+    for c in cuts[1:-1]:
+        assert any(p * rate <= c <= (p + 0.4) * rate for p in pauses)  # and is cut in a pause
+    assert quiet_cuts(x[:rate * 30]) == [0, rate * 30]               # short audio: one piece
 
 
 if __name__ == "__main__":

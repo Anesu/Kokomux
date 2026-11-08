@@ -32,7 +32,6 @@ CFG
     rm -f "$APP/speak.py"   # from older versions
     ;;
   models)
-    cp "$SRC/engine.py" "$SRC/words.py" "$APP/"
     if [ -s "$APP/models/kokoro-v1.0.int8.onnx" ] && [ -s "$APP/models/voices-v1.0.bin" ]; then
       printf 'already downloaded' > "$SRC/.note"
     fi

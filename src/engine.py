@@ -250,12 +250,12 @@ def run_job(path):
         out = os.path.join(jobdir, out)
 
     stream = None
-    lane = None
+    aligner = None
     if job.get("stream") == "1":
         stream = os.path.join(jobdir, "stream")
         os.makedirs(stream, exist_ok=True)
         if job.get("words") == "1":
-            lane = AlignLane(stream, lang)
+            aligner = WordAligner(stream, lang)
 
     try:
         if job.get("url"):
@@ -286,8 +286,8 @@ def run_job(path):
                 tmp = os.path.join(stream, f"{i:04d}.tmp.wav")
                 sf.write(tmp, samples, rate)
                 os.replace(tmp, os.path.join(stream, f"{i:04d}.wav"))
-                if lane:
-                    lane.add(i, chunk, samples, rate)
+                if aligner:
+                    aligner.add(i, chunk, samples, rate)
             if out:
                 parts.append(samples)
                 parts.append(np.zeros(int(rate * 0.2), dtype=samples.dtype))
@@ -296,8 +296,8 @@ def run_job(path):
     finally:
         if stream and os.path.isdir(stream):
             open(os.path.join(stream, "end"), "w").close()
-        if lane:
-            lane.finish()   # the last lines' timings, before the job counts as done
+        if aligner:
+            aligner.finish()   # timings for any line not yet heard
 
     elapsed = time.time() - t0
     _write_atomic(os.path.join(jobdir, "result"), f"{total:.1f} {elapsed:.1f} {len(chunks)}\n")
@@ -315,14 +315,12 @@ def _write_atomic(path, text):
 
 # ------------------------------------------------------------------ word timings
 
-class AlignLane(threading.Thread):
-    """Whistle's lane for one job: aligns rendered lines on the CPU beside speech,
-    starting from the line being heard, and publishes each as stream/NNNN.words
-    the moment it lands. The player lights the spoken word from those files.
-
-    NNNN.words is tab-separated, for the bash player: a "confidence" line, then
-    one "s e a b" row per word (ms, and the word's UTF-8 byte range in NNNN.txt).
-    A line below WORDS_MIN_CONFIDENCE gets the confidence line and no rows."""
+class WordAligner(threading.Thread):
+    """Times the words of a job's lines with Whistle, on the CPU beside speech, and
+    publishes each line as stream/NNNN.words the moment it lands; the player lights
+    the spoken word from those files. It works from the line being heard (the
+    player keeps stream/playing up to date) and drops lines already heard, so a
+    job never waits on timings nobody will see."""
 
     def __init__(self, stream, lang):
         super().__init__(daemon=True)
@@ -335,7 +333,7 @@ class AlignLane(threading.Thread):
             self.words = words
             if not words.available():
                 self.off = "Whistle isn't installed (run kokoro --update)"
-            elif (lang or "")[:2].lower() not in words.SUPPORTED:
+            elif not words.supported(lang):
                 self.off = f"Whistle doesn't transcribe {lang}"
         except ImportError:
             self.off = "word timings aren't installed (run kokoro --update)"
@@ -359,24 +357,31 @@ class AlignLane(threading.Thread):
             self.cond.notify()
         self.join()
 
-    def _next(self):
-        """The line being heard, or the first after it; earlier lines last."""
+    def _playing(self):
         try:
             with open(os.path.join(self.stream, "playing")) as fh:
-                playing = int(fh.read().strip() or 1)
+                return int(fh.read().strip() or 1)
         except (OSError, ValueError):
-            playing = 1
-        ahead = [i for i in self.pending if i >= playing]
-        return min(ahead) if ahead else min(self.pending)
+            return 1
+
+    def _next(self):
+        """The line being heard, or the next one after it; None once every line
+        left has already been heard."""
+        playing = self._playing()
+        for i in [i for i in self.pending if i < playing]:
+            del self.pending[i]
+        return min(self.pending) if self.pending else None
 
     def run(self):
         while True:
             with self.cond:
                 while not self.pending and not self.done:
                     self.cond.wait()
-                if not self.pending:
-                    return
                 i = self._next()
+                if i is None:
+                    if self.done:
+                        return
+                    continue
                 text, samples, rate = self.pending.pop(i)
             if not os.path.isdir(self.stream):
                 return   # cancelled
@@ -384,12 +389,8 @@ class AlignLane(threading.Thread):
                 data = self.words.line_words(text, samples, rate, self.lang)
             except Exception as e:  # noqa: BLE001 - one bad line must not stop the others
                 log(f"Word timings, line {i}: {type(e).__name__}: {e}")
-                data = {"confidence": 0, "words": []}
-            rows = [f"confidence\t{data.get('confidence', 0)}"]
-            if data.get("confidence", 0) >= self.words.WORDS_MIN_CONFIDENCE:
-                for w, (a, b) in zip(data["words"], self.words.byte_ranges(text, data["words"])):
-                    rows.append(f"{w['s']}\t{w['e']}\t{a}\t{b}")
-            _write_atomic(os.path.join(self.stream, f"{i:04d}.words"), "\n".join(rows) + "\n")
+                data = self.words.empty_result("error")
+            _write_atomic(os.path.join(self.stream, f"{i:04d}.words"), self.words.player_rows(text, data))
 
 
 # ------------------------------------------------------------------ server
@@ -610,7 +611,7 @@ def main():
     elif a.cmd == "whistle":
         import words
         t0 = time.time()
-        words._whistle()
+        words.load()
         print(f"Whistle ready ({words.engine_name()}, {time.time() - t0:.1f}s)")
 
 
