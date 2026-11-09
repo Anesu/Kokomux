@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.15.4"
+KOKOMUX_VERSION="0.16.0"
 DISTRO=kokoro
 
 ASSUME_YES=0; VERBOSE=0
@@ -2978,9 +2978,12 @@ chapter_of() {   # chapter_of PART: CH = the index of the chapter PART is in (-1
   return 0
 }
 
-# The sleep timer: off, a number of minutes, or the end of the chapter. When it's
-# up, the part being read is finished and then it stops (keeping the bookmark).
+# The sleep timer: off, a number of minutes, or the end of the chapter. The voice
+# fades out over its last SLEEP_FADE ms and then it stops, keeping the bookmark
+# at the part being read (so it picks up at the start of that sentence). Time
+# spent paused doesn't count.
 SLEEP=off; SLEEP_AT=0
+SLEEP_FADE=13000
 sleep_cycle() {
   case "$SLEEP" in
     off) SLEEP=15 ;; 15) SLEEP=30 ;; 30) SLEEP=60 ;;
@@ -2998,6 +3001,18 @@ sleep_label() {  # SLEEP_LABEL: what the timer shows ("" when off)
     *) now_ms; SLEEP_LABEL="☾ $(( (SLEEP_AT - NOW + 59999) / 60000 ))m" ;;
   esac
 }
+sleep_vol() {    # sleep_vol PART: VOL = mpv's volume now (100, falling to 0 as the timer runs out)
+  local left
+  VOL=100
+  case "$SLEEP" in
+    off) return 0 ;;
+    chapter) sleep_due $(( $1 + 1 )) || return 0              # (fades in the chapter's last part)
+             mpv_ms "$MPV_DUR"; left=$MS; mpv_ms; left=$(( left - MS )) ;;
+    *) now_ms; left=$(( SLEEP_AT - NOW )) ;;
+  esac
+  [ "$left" -lt "$SLEEP_FADE" ] && VOL=$(( left > 0 ? left * 100 / SLEEP_FADE : 0 ))
+  return 0
+}
 sleep_due() {    # sleep_due NEXT_PART: is it time to stop, before NEXT_PART starts?
   case "$SLEEP" in
     off) return 1 ;;
@@ -3006,7 +3021,7 @@ sleep_due() {    # sleep_due NEXT_PART: is it time to stop, before NEXT_PART sta
   esac
 }
 
-# Jumping (a chapter, a click on the progress bar, a new speed) starts the
+# Jumping (a chapter, a click on the progress bar, a new voice) starts the
 # reading again at a part: a fresh job folder, so the old job sees its folder
 # go and stops, and the engine picks up from there.
 JUMP=""
@@ -3023,6 +3038,35 @@ jump_to() {      # jump_to PART
   if [ "$ui" = tui ]; then tui_hist=(); TUI_PART=0; TUI_WRAP=(); TUI_OFFS=(); TUI_INFO="$(voice_label "$voice") · ${speed}×"; TUI_SPEED=$speed; tui_draw; fi
 }
 
+# A new speed, heard at once: mpv plays the part being heard at the new tempo
+# (pitch kept), and the engine remakes the parts after it at the new speed,
+# which Kokoro speaks more naturally than a stretched recording. The parts
+# already heard stay on screen.
+speed_now() {    # speed_now PART: (while PART plays) $speed from this moment on
+  local at=$1 idx=${MPV_IDX[$1]} old=$tmpd parts=0 n f e files=()
+  mpv_send "\"set_property\",\"file-local-options/speed\",$(awk -v a="$speed" -v b="${MPV_SPD[idx]}" 'BEGIN { printf "%.4f", a / b }')"
+  mpv_send '"playlist-clear"'                   # (the parts queued after it were made at the old speed)
+  MPV_IDX=(["$at"]=0); MPV_PART=("$at"); MPV_SPD=("${MPV_SPD[idx]}"); MPV_N=1; MPV_POS=0; MPV_MAX=0
+  [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=0; }
+  if [ "${parts:-0}" -gt "$at" ]; then
+    if [ -n "$gen_pid" ]; then kill "$gen_pid" 2>/dev/null || true; wait "$gen_pid" 2>/dev/null || true; gen_pid=""; fi
+    tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
+    for f in in.txt title chapters progress; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
+    mkdir "$tmpd/stream"
+    for (( n = at > 40 ? at - 40 : 1; n <= at; n++ )); do   # this part and the ones on screen above it
+      printf -v f '%s/stream/%04d' "$old" "$n"
+      for e in txt words wav; do [ -e "$f.$e" ] && files+=("$f.$e"); done
+    done
+    [ "${#files[@]}" = 0 ] || mv -f "${files[@]}" "$tmpd/stream/"
+    rm -rf "$old"                               # (the old job sees its folder go and stops)
+    start=$(( at + 1 )); was_parts=0
+    write_job
+    run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
+  fi
+  bookmark_save "$at"
+  if [ "$ui" = tui ]; then TUI_INFO="$(voice_label "$voice") · ${speed}×"; TUI_SPEED=$speed; tui_draw; fi
+}
+
 # Commands that change where or how it reads (from a key, a click or the menu).
 # Sets JUMP to restart at a part; returns 1 if CMD isn't one of these.
 listen_cmd() {   # listen_cmd CMD PART
@@ -3033,7 +3077,8 @@ listen_cmd() {   # listen_cmd CMD PART
       t=$(printf '%s' "$speed" | awk '{ printf "%d", $1 * 10 + 0.5 }')
       if [ "$cmd" = faster ]; then t=$(( t + 1 )); else t=$(( t - 1 )); fi
       [ "$t" -ge 5 ] && [ "$t" -le 20 ] || return 0
-      speed="$(( t / 10 )).$(( t % 10 ))"; JUMP=$at ;;              # this part again, at the new speed
+      speed="$(( t / 10 )).$(( t % 10 ))"
+      if [ "$in_line" = 1 ]; then speed_now "$at"; else JUMP=$at; fi ;;
     sleep) sleep_cycle ;;
     chapters)
       [ "${#CH_START[@]}" -gt 1 ] && [ "$ui" = tui ] || return 0
@@ -3054,12 +3099,15 @@ listen_cmd() {   # listen_cmd CMD PART
       esac ;;
     settings|voice)                             # change things mid-listen: a new voice, speed or language
       [ "$ui" = tui ] || return 0              # picks up at this part
-      local before after
-      before="$(voice_mix)|$KOKORO_SPEED|$KOKORO_LANG"
+      local before after was_speed=$KOKORO_SPEED
+      before="$(voice_mix)|$KOKORO_LANG"
       if [ "$cmd" = settings ]; then tui_settings; else tui_voices; fi
-      after="$(voice_mix)|$KOKORO_SPEED|$KOKORO_LANG"
-      if [ "$after" != "$before" ]; then
-        voice="$(voice_mix)"; speed=$KOKORO_SPEED; lang=$KOKORO_LANG; JUMP=$at
+      after="$(voice_mix)|$KOKORO_LANG"
+      [ "$KOKORO_SPEED" = "$was_speed" ] || speed=$KOKORO_SPEED
+      if [ "$after" != "$before" ]; then                  # a new voice or language: made again from here
+        voice="$(voice_mix)"; lang=$KOKORO_LANG; JUMP=$at
+      elif [ "$KOKORO_SPEED" != "$was_speed" ]; then      # only the speed: heard at once
+        if [ "$in_line" = 1 ]; then speed_now "$at"; else JUMP=$at; fi
       fi
       tui_draw ;;
     *) return 1 ;;
@@ -3075,10 +3123,12 @@ listen_cmd() {   # listen_cmd CMD PART
 
 MPV_PID=""; MPV_SOCK=""; MPV_IN=""; MPV_OUT=""; MPV_CARRY=""
 MPV_T=0; MPV_POS=-1; MPV_N=0       # seconds into the current part; playlist index; entries queued
+MPV_DUR=0; MPV_VOL=100             # the current part's length (seconds); the volume set (the sleep timer's fade)
 MPV_MAX=-1                         # the furthest playlist index reached (parts played while a menu was open)
 CMD_PENDING=""                     # a command chosen in the menu, for the player to carry out
 declare -A MPV_IDX=()              # part -> its playlist index
 MPV_PART=()                        # playlist index -> part
+MPV_SPD=()                         # playlist index -> the speed it was made at
 
 mpv_start() {
   [ -n "$MPV_PID" ] && kill -0 "$MPV_PID" 2>/dev/null && return 0
@@ -3096,6 +3146,7 @@ mpv_start() {
   MPV_IN=${MPVC[0]} MPV_OUT=${MPVC[1]}
   mpv_send '"observe_property",1,"playback-time"'
   mpv_send '"observe_property",2,"playlist-pos"'
+  mpv_send '"observe_property",3,"duration"'
 }
 mpv_send() { printf '{"command":[%s]}\n' "$1" >&"$MPV_OUT"; }
 mpv_pump() {     # take in what mpv has reported since last time
@@ -3107,6 +3158,7 @@ mpv_pump() {     # take in what mpv has reported since last time
         *'"name":"playback-time"'*) if [[ "$line" =~ \"data\":([0-9.]+) ]]; then MPV_T=${BASH_REMATCH[1]}; fi ;;
         *'"name":"playlist-pos"'*) if [[ "$line" =~ \"data\":(-?[0-9]+) ]]; then
                                      MPV_POS=${BASH_REMATCH[1]}; [ "$MPV_POS" -gt "$MPV_MAX" ] && MPV_MAX=$MPV_POS; fi ;;
+        *'"name":"duration"'*) if [[ "$line" =~ \"data\":([0-9.]+) ]]; then MPV_DUR=${BASH_REMATCH[1]}; fi ;;
       esac
     else
       MPV_CARRY+=$line             # half a line: the rest comes next time
@@ -3114,18 +3166,19 @@ mpv_pump() {     # take in what mpv has reported since last time
     fi
   done
 }
-mpv_ms() {       # MPV_T as whole milliseconds, in MS
-  local s=${MPV_T%%.*} f=0
-  [[ "$MPV_T" == *.* ]] && f=${MPV_T#*.}
+mpv_ms() {       # mpv_ms [SECONDS]: SECONDS (default MPV_T) as whole milliseconds, in MS
+  local v=${1:-$MPV_T}
+  local s=${v%%.*} f=0
+  [[ "$v" == *.* ]] && f=${v#*.}
   f="${f}000"; MS=$(( 10#${s:-0} * 1000 + 10#${f:0:3} ))
 }
 mpv_queue() {    # mpv_queue PART WAV: add a part to the playlist (it plays at once if nothing is)
   mpv_send "\"loadfile\",\"$2\",\"append-play\""
-  MPV_IDX[$1]=$MPV_N; MPV_PART[MPV_N]=$1; MPV_N=$(( MPV_N + 1 ))
+  MPV_IDX[$1]=$MPV_N; MPV_PART[MPV_N]=$1; MPV_SPD[MPV_N]=$speed; MPV_N=$(( MPV_N + 1 ))
 }
 mpv_stop() {     # empty the playlist (a jump starts again from a new part)
   [ -n "$MPV_PID" ] && mpv_send '"stop"'
-  MPV_IDX=(); MPV_PART=(); MPV_N=0; MPV_POS=-1; MPV_T=0; MPV_MAX=-1
+  MPV_IDX=(); MPV_PART=(); MPV_SPD=(); MPV_N=0; MPV_POS=-1; MPV_T=0; MPV_MAX=-1
   return 0
 }
 mpv_quit() {
@@ -3152,6 +3205,7 @@ go_home() {      # stop (keeping the place) and open the home screen
 
 play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause / next / again
   local wav=$1 i=$2 base="${1%.wav}" cur=-1 lit=-2 lit_now t label last="" cmd paused=0 started=0 idx k f waited=0
+  local paused_at=0 away back
   w_state=pending
   { [ -f "$tmpd/stream/words-off" ] || [ "$show_words" = 0 ]; } && w_state=off
   title_get; part_of "$i"
@@ -3179,9 +3233,17 @@ play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause
     if [ -n "$cmd" ]; then
       case "$cmd" in
         toggle)
-          if [ "$paused" = 1 ]; then mpv_send '"set_property","pause",false'; paused=0; last=""
+          now_ms
+          if [ "$paused" = 1 ]; then
+               # Back a little after a long pause, to pick up the thread: 5 s after a
+               # minute away, 10 s after an hour (never before this part's start).
+               away=$(( NOW - paused_at )); back=0
+               [ "$away" -ge 60000 ] && back=5; [ "$away" -ge 3600000 ] && back=10
+               [ "$back" = 0 ] || { mpv_send "\"seek\",-$back,\"relative\""; cur=-1; lit=-2; }
+               case "$SLEEP" in off|chapter) ;; *) SLEEP_AT=$(( SLEEP_AT + away )) ;; esac   # (paused time doesn't count)
+               mpv_send '"set_property","pause",false'; paused=0; last=""
                echo playing > "$PLAYER_STATE"; notify "${PART% · }"
-          else mpv_send '"set_property","pause",true'; paused=1; last=""
+          else mpv_send '"set_property","pause",true'; paused=1; paused_at=$NOW; last=""
                echo paused > "$PLAYER_STATE"; notify "Paused · ${PART% · }"; fi ;;
         next)  if [ -n "${MPV_IDX[$k]+x}" ]; then mpv_send '"playlist-next"'
                else mpv_send '"playlist-next","force"'; fi
@@ -3194,6 +3256,7 @@ play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause
         *)     if listen_cmd "$cmd" "$i"; then
                  last=""
                  [ -n "$JUMP" ] && break      # jump_to empties the playlist
+                 idx=${MPV_IDX[$i]}; base="$tmpd/stream/${base##*/}"   # (a new speed: a new job folder)
                fi ;;
       esac
     fi
@@ -3223,6 +3286,9 @@ play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause
         fi
       fi
     fi
+    sleep_vol "$i"
+    if [ "$VOL" != "$MPV_VOL" ]; then mpv_send "\"set_property\",\"volume\",$VOL"; MPV_VOL=$VOL; fi
+    if [ "$VOL" = 0 ] && [ "$SLEEP" != chapter ]; then SLEPT=1; exit "$QUIT_RC"; fi   # time's up (the bookmark is this part)
     part_of "$i"; sleep_label
     if [ "$ui" = tui ]; then label="$SLEEP_LABEL${SLEEP_LABEL:+${MADE:+ · }}$MADE"
     else label="${PART}${SLEEP_LABEL:+$SLEEP_LABEL · }${MADE:+$MADE · }␣ pause · → next · q stop"; fi
@@ -3526,7 +3592,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
 # in player.sh, the colours in theme.sh (all three loaded below).
 set -euo pipefail
 
-KOKOMUX_VERSION="0.15.4"
+KOKOMUX_VERSION="0.16.0"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 

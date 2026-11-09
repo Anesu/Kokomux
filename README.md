@@ -102,10 +102,10 @@ On a terminal, `kokoro -p` opens a full-screen reader. Across the top are the ti
 
 | Key | Click or tap | Does |
 |---|---|---|
-| Space | **‖ Pause** / **▶ Play** | pause mid-word, or carry on from there |
+| Space | **‖ Pause** / **▶ Play** | pause mid-word, or carry on from there (a few seconds back after a long pause) |
 | → | **Next ›** | skip to the next part |
 | ← | **‹ Again** | hear this part again |
-| − and + | **−** / **+** either side of the speed | change the speed while it plays, in steps of 0.1× |
+| − and + | **−** / **+** either side of the speed | change the speed at once, in steps of 0.1× |
 | t | **☾ Sleep** | sleep timer: 15, 30 or 60 minutes, or the end of the chapter |
 | c | **Chapters** | the book's chapters: pick one to jump there (EPUBs) |
 | [ and ] | | the previous or next chapter |
@@ -115,9 +115,13 @@ On a terminal, `kokoro -p` opens a full-screen reader. Across the top are the ti
 | q or Esc | Menu → **Stop** | stop, keeping your place |
 | | the progress bar | click or tap it to jump to that point |
 
-Above the bar, a line says what's happening (playing, paused, how much of the book is made) and where you are (chapter, part). Playback carries on while the menu or settings are open; a new voice, speed or language starts again at the part you're on.
+Above the bar, a line says what's happening (playing, paused, how much of the book is made) and where you are (chapter, part). Playback carries on while the menu or settings are open; a new voice or language starts again at the part you're on.
 
-When the sleep timer runs out, the part being read finishes and playback stops, keeping your place. The reader shows the chapter you're in beside the progress bar.
+**A new speed is heard at once.** The part you're on carries on at the new speed, with its pitch kept, while the rest is made again at that speed behind it. From the next part on you hear Kokoro speaking at the new speed itself, which sounds more natural than a sped-up recording.
+
+**Back a little after a long pause.** Carry on after a minute or more away and it goes back 5 seconds first, or 10 after an hour, so you pick up the thread.
+
+The sleep timer fades the voice out over its last 13 seconds, then stops, keeping your place at the start of the sentence it faded on. With **end of chapter**, it fades over the end of the chapter's last part. Time spent paused doesn't count towards it. The reader shows the chapter you're in beside the progress bar.
 
 With a keyboard and mouse (DeX, a tablet, or a Bluetooth keyboard), the keys and clicks both work. On a phone, tap the buttons. When you stop, kokoro says where you stopped and how to carry on.
 
@@ -327,6 +331,7 @@ python3 dev/screen.py --out reader.png -- dev/kokoro -p -f story.txt   # a pictu
 | `tests/test_job.py` | running a job with a stand-in for Kokoro: pauses, kept parts, blends, misaki, chapter times, bookmarks |
 | `tests/test_web.py` | reading web pages (needs trafilatura) |
 | `tests/test_reader.py` | the reader's focus effect |
+| `tests/test_player.py` | a new speed heard at once, and the sleep timer's fade |
 | `tests/test_settings.py` | every setting in the menu changes and is saved |
 | `tests/test_theme.py` | the colours: contrast on 15 terminal themes, the golden steps, asking the terminal |
 | `dev/check.sh` | everything to run before a commit |
