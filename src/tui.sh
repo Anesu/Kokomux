@@ -292,28 +292,28 @@ tui_info() {     # what's happening on the left, the chapter and part on the rig
 }
 
 tui_transport() { # again · play/pause · next, equal widths, centred; play/pause stands out
-  local row=$FT_TRANS w=11 gap=3 x i lab cmd bg play="‖  Pause"
+  local row=$FT_TRANS w=11 gap=3 x i lab cmd bg bold play="‖  Pause"
   [ "$TUI_PAUSED" = 1 ] && play="▶  Play"
   local labels=("‹  Again" "$play" "Next  ›") cmds=(again toggle next)
   [ $(( 3 * w + 2 * gap )) -le $(( TW - 2 )) ] || gap=1
   x=$(( (TW - 3 * w - 2 * gap) / 2 + 1 ))
   out '%s\033[%d;1H\033[K' "$R" "$row"
   for i in 0 1 2; do
-    lab=${labels[i]} cmd=${cmds[i]} bg=$SURF
-    [ "$i" = 1 ] && bg=$PSEL
+    lab=${labels[i]} cmd=${cmds[i]} bg=$SURF bold=""
+    if [ "$i" = 1 ]; then bg=$PSEL bold=$B; fi
     out '\033[%d;%dH%s%*s\033[%d;%dH%s%s%s%s' "$row" "$x" "$bg" "$w" "" "$row" $(( x + (w - ${#lab}) / 2 )) \
-      "$bg" "$( [ "$i" = 1 ] && printf '%s' "$B")" "$lab" "$R"
+      "$bg" "$bold" "$lab" "$R"
     TUI_BTN+=("$row $x $(( x + w - 1 )) $cmd")
     x=$(( x + w + gap ))
   done
 }
 
 tui_controls() { # − speed +, sleep, chapters, menu: quiet, and centred
-  local row=$FT_CTRL x gap=4 total=0 i spec lab cmd col sl
+  local row=$FT_CTRL x gap=4 total=0 i spec lab cmd col sl on
   sleep_label 2>/dev/null || SLEEP_LABEL=""
-  sl=${SLEEP_LABEL:-☾ Sleep}
+  sl=${SLEEP_LABEL:-☾ Sleep} on=""; [ -z "$SLEEP_LABEL" ] || on=A
   # each: label|command|colour (A: the accent, for what's switched on)
-  local items=("−|slower|" "${TUI_SPEED}×|-|A" "+|faster|" "$sl|sleep|$( [ -n "$SLEEP_LABEL" ] && echo A)")
+  local items=("−|slower|" "${TUI_SPEED}×|-|A" "+|faster|" "$sl|sleep|$on")
   [ "$TUI_HAS_CHAPTERS" = 1 ] && items+=("Chapters|chapters|")
   items+=("≡  Menu|menu|")
   for spec in "${items[@]}"; do lab=${spec%%|*}; total=$(( total + ${#lab} )); done
@@ -573,9 +573,10 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
       out '\033[%d;%dH %s%s%s  %s' "$y" "$x0" "$ACC2" "$key" "$R" "$r"
       rowact[$y]=$cmd; y=$(( y + 1 ))
     done
-    local novel=0; [ "${#marks[@]}" -gt 0 ] && [ "$(mark_get "${marks[sel]}" kind)" = novel ] && novel=1
-    if [ "$TW" -ge 64 ]; then r="↑↓ choose · Enter play$( [ "$novel" = 1 ] && echo " · g go to chapter") · click or tap anything · q quit"
-    else r="↑↓ · Enter play$( [ "$novel" = 1 ] && echo " · g chapter") · tap · q quit"; fi
+    local go=""                                   # a web novel can start from another chapter
+    if [ "${#marks[@]}" -gt 0 ] && [ "$(mark_get "${marks[sel]}" kind)" = novel ]; then go=" · g go to chapter"; fi
+    if [ "$TW" -ge 64 ]; then r="↑↓ choose · Enter play$go · click or tap anything · q quit"
+    else r="↑↓ · Enter play${go/go to /} · tap · q quit"; fi
     out '\033[%d;%dH%s%s%s' "$TH" "$LM" "$D" "$r" "$R"
     out '%s' "$SYNC_OFF"
 
@@ -765,6 +766,7 @@ setting_change() { # setting_change ID STEP: ←/→ (-1/+1); 0 means Enter, a c
       tui_save KOKORO_THEME "${themes[$(( (i + step + 3) % 3 ))]}"
       tui_theme ;;
     out)
+      [ "$step" = 0 ] || return 0
       tui_prompt "Save files as:" "$KOKORO_OUT"
       if [[ "$ANSWER" =~ ^[^/[:space:]]+\.(wav|mp3|ogg|flac)$ ]]; then tui_save KOKORO_OUT "$ANSWER"
       elif [ -n "$ANSWER" ]; then SETTINGS_NOTE="A file name ending in .wav, .mp3, .ogg or .flac, please."; fi ;;
@@ -776,6 +778,7 @@ setting_change() { # setting_change ID STEP: ←/→ (-1/+1); 0 means Enter, a c
       [ "$step" = 0 ] && step=1
       tui_save KOKORO_IDLE_MINUTES "${opts[$(( (i + step + ${#opts[@]}) % ${#opts[@]} ))]}" ;;
     port)
+      [ "$step" = 0 ] || return 0
       tui_prompt "Port (1024 to 65535):" "$KOKORO_PORT"
       if [[ "$ANSWER" =~ ^[0-9]+$ ]] && [ "$ANSWER" -ge 1024 ] && [ "$ANSWER" -le 65535 ]; then tui_save KOKORO_PORT "$ANSWER"
       elif [ -n "$ANSWER" ]; then SETTINGS_NOTE="A port between 1024 and 65535, please."; fi ;;
@@ -795,6 +798,7 @@ setting_change() { # setting_change ID STEP: ←/→ (-1/+1); 0 means Enter, a c
       [ -f "$CONF" ] && . "$CONF"
       out '\033[?1049h'; tui_raw ;;
   esac
+  return 0                                    # (a step past the end of a range does nothing)
 }
 
 tui_settings() { # the settings menu; works on its own or from the home screen
@@ -822,7 +826,9 @@ tui_settings() { # the settings menu; works on its own or from the home screen
       elif [ "${r:0:1}" = "#" ]; then [ "${#rows[@]}" -gt 0 ] && rows+=(""); rows+=("$r"); else rows+=("$r"); fi
     done
     n=0; for i in "${!rows[@]}"; do [[ "${rows[i]}" == *"|"* ]] && { [ "$n" = "$sel" ] && y=$i; n=$(( n + 1 )); }; done
-    [ "$y" -lt "$top" ] && top=$(( y > 0 && ${rows[y-1]:0:1} == "#" ? y - 1 : y ))
+    if [ "$y" -lt "$top" ]; then                              # scrolled up: show its heading too
+      top=$y; [ "$y" -gt 0 ] && [ "${rows[y - 1]:0:1}" = "#" ] && top=$(( y - 1 ))
+    fi
     [ "$y" -ge $(( top + view )) ] && top=$(( y - view + 1 ))
     [ "$y" -le 1 ] && top=0
     out '%s%s\033[2J' "$SYNC_ON" "$R"

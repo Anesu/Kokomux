@@ -278,7 +278,7 @@ control() {
 }
 
 # Bookmarks: where a long text was stopped, as key=value lines.
-mark_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1; }
+mark_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1 || true; }   # (empty if there's no such file)
 chapter_url() {  # chapter_url URL N: CHURL = chapter N's address, where a novel's addresses count chapters (…/chapter-5)
   local u=${1%%[?#]*}
   u=${u%/}; CHURL=""
@@ -751,13 +751,13 @@ write_job
 cache_trim() {
   [ -d "$CACHE" ] || return 0
   local cap=$(( ${KOKORO_CACHE_GB:-50} * 1024 )) total d
-  total="$(du -sm "$CACHE" 2>/dev/null | cut -f1)"
+  total="$(du -sm "$CACHE" 2>/dev/null | cut -f1)" || true   # (du complains about a part replaced as it counts)
   while [ "${total:-0}" -gt "$cap" ]; do
     d="$(find "$CACHE" -mindepth 1 -maxdepth 1 -type d ! -name "${book_id:-none}" -printf '%T@ %p\n' |
          sort -n | head -n 1 | cut -d' ' -f2-)" || true
     [ -n "$d" ] || break
     rm -rf "$d"
-    total="$(du -sm "$CACHE" 2>/dev/null | cut -f1)"
+    total="$(du -sm "$CACHE" 2>/dev/null | cut -f1)" || true
   done
 }
 if [ -n "$book_id" ]; then mkdir -p "$CACHE/$book_id"; touch "$CACHE/$book_id"; cache_trim; fi

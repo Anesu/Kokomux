@@ -482,7 +482,10 @@ def fetch(url):
         code, _, ctype = r.stdout.partition("\t")
         raw = tmp.read()
     m = re.search(r"charset=([\w-]+)", ctype)
-    body = raw.decode(m.group(1) if m else "utf-8", errors="replace")
+    try:
+        body = raw.decode(m.group(1) if m else "utf-8", errors="replace")
+    except LookupError:                       # a charset Python doesn't know: read it as UTF-8
+        body = raw.decode("utf-8", errors="replace")
     if code == "404":
         raise NotFound(f"There's no page at {url}")
     if re.search(r"<title>\s*Just a moment", body[:3000]):
@@ -839,10 +842,7 @@ def epub_meta(path):
 
 def read_pdf(path, name):
     """A PDF's (title, text), with its lines joined back into sentences."""
-    try:
-        from pypdf import PdfReader
-    except ImportError:
-        raise JobError("Reading PDFs needs a newer kokomux: kokoro --update") from None
+    from pypdf import PdfReader
     try:
         reader = PdfReader(path)
         if reader.is_encrypted and not reader.decrypt(""):

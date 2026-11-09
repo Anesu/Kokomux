@@ -60,12 +60,15 @@ class Site(http.server.BaseHTTPRequestHandler):
         Site.hits.append(self.path)
         path = self.path.rstrip("/")
         n = path.rsplit("-", 1)[-1]
-        if path.startswith("/novel/the-long-road/chapter-") and n.isdigit() and int(n) in NAMES:
+        ctype = "text/html; charset=utf-8"
+        if path.endswith("/odd-charset"):          # a charset no one has heard of
+            body, code, ctype = "<html><body><p>Café au lait.</p></body></html>".encode(), 200, "text/html; charset=x-made-up"
+        elif path.startswith("/novel/the-long-road/chapter-") and n.isdigit() and int(n) in NAMES:
             body, code = chapter_page(int(n)).encode(), 200
         else:
             body, code = b"<html><body>Not found</body></html>", 404
         self.send_response(code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -94,6 +97,13 @@ def needs(*mods):
         wrapper.__name__ = fn.__name__
         return wrapper
     return deco
+
+
+def test_a_page_in_an_unknown_charset_is_read_as_utf8():
+    if not shutil.which("curl"):
+        return
+    ctype, body = engine.fetch(site() + "/odd-charset")
+    assert ctype == "text/html" and "Café au lait." in body
 
 
 def test_addresses():
