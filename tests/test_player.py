@@ -99,6 +99,20 @@ def test_end_of_chapter_fades_out_the_chapters_last_part():
         assert sleep_vol(d, ch, 2) == 100           # not the last part
 
 
+def test_a_jump_moves_the_bookmark_at_once():
+    """Jump to a chapter and stop before it plays: kokoro --continue still picks up there."""
+    with tempfile.TemporaryDirectory() as d:
+        out = bash("""
+tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"; mkdir "$tmpd/stream"
+echo "2 9" > "$tmpd/progress"; printf '1\tOne\n5\tTwo\n' > "$tmpd/chapters"; echo hello > "$tmpd/in.txt"
+speed=1.0; jump_to 5
+echo "progress=$(cat "$tmpd/progress")"; echo "chapters=$(wc -l < "$tmpd/chapters")"
+""", d)
+        f = fields(out)
+        assert open(os.path.join(d, "bookmark")).read().split() == ["5", "1.0"]
+        assert f["progress"] == "2 9" and f["chapters"] == "2", f        # (what the bookmark needs came along)
+
+
 # ---------------------------------------------------------------- the clock the highlight follows
 
 def clock(steps):

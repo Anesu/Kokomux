@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.18.1"
+KOKOMUX_VERSION="0.18.2"
 DISTRO=kokoro
 
 VERBOSE=0
@@ -3409,10 +3409,11 @@ jump_to() {      # jump_to PART
   mpv_stop
   if [ -n "$gen_pid" ]; then kill "$gen_pid" 2>/dev/null || true; wait "$gen_pid" 2>/dev/null || true; gen_pid=""; fi
   tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
-  for f in in.txt title chapters serial novel; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
+  for f in in.txt title chapters serial novel progress; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
   rm -rf "$old"
   start=$target; i=$target; was_parts=0          # (a part in this run's own numbering)
   write_job
+  bookmark_save "$target"                        # (stopped before it plays, it still picks up there)
   run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
   if [ "$ui" = tui ]; then tui_hist=(); TUI_PART=0; TUI_WRAP=(); TUI_OFFS=(); TUI_INFO="$(voice_label "$voice") · ${speed}×"; TUI_SPEED=$speed; tui_draw; fi
 }
@@ -3999,7 +4000,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
 # in player.sh, the colours in theme.sh (all three loaded below).
 set -euo pipefail
 
-KOKOMUX_VERSION="0.18.1"
+KOKOMUX_VERSION="0.18.2"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
