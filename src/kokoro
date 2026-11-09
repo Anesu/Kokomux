@@ -519,7 +519,7 @@ case "${1:-}" in
       die "main has v$new, older than this v$KOKOMUX_VERSION." "To install from a branch: kokoro --update BRANCH"
     fi
     server_up && stop_server >/dev/null 2>&1
-    rc=0; bash "$tmp" --yes || rc=$?; rm -f "$tmp"; exit "$rc" ;;
+    rc=0; bash "$tmp" || rc=$?; rm -f "$tmp"; exit "$rc" ;;
   --uninstall)
     printf '%s\n\n' "This removes the kokoro command, its Debian container, the voices, your settings and shortcuts." |
       fold -s -w "$(( $(cols) - 1 ))" >&2

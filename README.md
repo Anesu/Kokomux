@@ -7,7 +7,7 @@ kokoro -p "Hello from my phone"
 ```
 
 <p>
-  <img src="docs/install-progress.png" width="32%" alt="The installer checking the phone and downloading the voice model">
+  <img src="docs/install-progress.png" width="32%" alt="The installer downloading the voice model">
   <img src="docs/install-done.png" width="32%" alt="The finished install with a quick-start card">
   <img src="docs/kokoro.png" width="32%" alt="Using the kokoro command: saving a file, playing text, an error message and the status screen">
 </p>
@@ -24,12 +24,9 @@ You need **Termux from F-Droid or GitHub** (the Play Store version is outdated) 
 curl -fsSLO https://raw.githubusercontent.com/Anesu/kokomux/main/install.sh && bash install.sh
 ```
 
-The installer checks your phone first (CPU, free space, connection), shows what it's going to do, and asks before starting. Then it works through seven steps with live progress, and keeps the phone awake until it's done. Installing takes 10–20 minutes. At the end it says hello out loud. Running it again is safe: it skips what's already done and updates the rest.
+It works through seven steps with live progress and keeps the phone awake until it's done, about 10–20 minutes. At the end it says hello out loud. Running it again skips what's already done and updates the rest; `--verbose` shows everything it runs.
 
-- `--yes` skips the question (for scripts).
-- `--verbose` shows everything the installer runs.
-
-If a step fails, the installer shows what went wrong and how to fix it ([example](docs/install-error.png)). The full log is kept at `~/.cache/kokomux/install.log`. If you stop it with Ctrl+C, nothing breaks: run it again and it carries on.
+If a step fails, the installer shows the error and what to do ([example](docs/install-error.png)); the full log is at `~/.cache/kokomux/install.log`. After Ctrl+C, run it again and it carries on.
 
 **Optional extras:**
 - **Termux:API app** (from the same place you got Termux) plus `pkg install termux-api`, for reading the clipboard.
@@ -341,7 +338,7 @@ python3 dev/screen.py --out reader.png -- dev/kokoro -p -f story.txt   # a pictu
 | `src/engine.py` | Kokoro engine, server, web-page reader and model downloader (container side) |
 | `src/words.py` | word timings from Kokoro's per-sound timings (container side) |
 | `src/setup-container.sh` | installs everything inside the container |
-| `src/install.sh` | installer template (UI, checks, steps) |
+| `src/install.sh` | installer template (UI and steps) |
 | `VERSION` | the version stamped into both by `build.sh` |
 | `tests/test_words.py` | word timings, on recorded Kokoro output |
 | `tests/test_books.py` | reading EPUB, PDF and text |

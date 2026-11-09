@@ -1,7 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # kokomux: Kokoro text-to-speech for Termux. https://github.com/Anesu/kokomux
 #
-#   bash install.sh [--yes] [--verbose]
+#   bash install.sh [--verbose]
 #
 # Sets up a small Debian container ("kokoro") with proot-distro, installs
 # Kokoro in it, and adds the `kokoro` command to Termux. Kokoro's Python
@@ -14,12 +14,12 @@ set -euo pipefail
 KOKOMUX_VERSION="@@VERSION@@"
 DISTRO=kokoro
 
-ASSUME_YES=0; VERBOSE=0
+VERBOSE=0
 for arg in "$@"; do
   case "$arg" in
-    -y|--yes) ASSUME_YES=1 ;;
+    -y|--yes) ;;   # kokoro --update before v0.17.1 passes it
     -v|--verbose) VERBOSE=1 ;;
-    -h|--help) echo "Usage: bash install.sh [--yes] [--verbose]"; exit 0 ;;
+    -h|--help) echo "Usage: bash install.sh [--verbose]"; exit 0 ;;
     *) echo "Unknown option: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -37,7 +37,7 @@ done
 FANCY=0   # colours + spinners, only on a real terminal
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then FANCY=1; fi
 if [ "$FANCY" = 1 ]; then
-  KOKORO_THEME="$(sed -n 's/^KOKORO_THEME=\([a-z]*\).*/\1/p' "$HOME/.config/kokoro/config" 2>/dev/null | tail -n 1)"
+  KOKORO_THEME="$(sed -n 's/^KOKORO_THEME=\([a-z]*\).*/\1/p' "$HOME/.config/kokoro/config" 2>/dev/null | tail -n 1)" || true   # no settings yet on a first install
   [ -t 0 ] && { theme_detect || true; }
   theme_apply
 else
@@ -51,18 +51,7 @@ W=$(( COLS > 72 ? 72 : COLS ))   # layout width
 
 say()   { printf '%s\n' "$*"; }
 blank() { printf '\n'; }
-ok()    { printf '  %s✓%s %s%s\n' "$GRN" "$R" "$1" "${2:+ $D$2$R}"; }
-warn()  { printf '  %s!%s %s%s\n' "$YEL" "$R" "$1" "${2:+ $D$2$R}"; }
-bad()   { printf '  %s✗%s %s%s\n' "$RED" "$R" "$1" "${2:+ $D$2$R}"; }
 heading() { blank; printf '  %s%s%s\n' "$B" "$1" "$R"; }
-# A "›" bullet whose continuation lines line up under the text.
-bullet() {
-  local first=1 line
-  while IFS= read -r line; do
-    if [ "$first" = 1 ]; then printf '  %s›%s %s\n' "$ACC" "$R" "$line"; first=0
-    else printf '    %s\n' "$line"; fi
-  done < <(printf '%s\n' "$*" | fold -s -w $(( W - 5 )))
-}
 # Wrap text to the layout width with an indent: wrap "  │ " "text"
 wrap() {
   local pre="$1" vis; shift
@@ -219,18 +208,15 @@ step() {
   local edge="  $RED│$R"
   printf '  %s╭─%s %s%s failed%s\n' "$RED" "$R" "$B" "$title" "$R"
   say "$edge"
-  say "$edge ${D}What happened${R}"
   # This step's output only, wrapped, last 8 lines.
   awk '/^=== \[/ { n = 0; next } !/^@@progress/ && NF { l[n++] = $0 }
        END { for (i = (n > 8 ? n - 8 : 0); i < n; i++) print l[i] }' "$LOG" |
-    tr -d '\r' | tr -cd '\11\12\40-\176' | fold -w $(( W - 8 )) | tail -n 8 |
-    while IFS= read -r line; do say "$edge   $D$line$R"; done
+    tr -d '\r' | tr -cd '\11\12\40-\176' | fold -s -w $(( W - 7 )) | tail -n 8 |
+    while IFS= read -r line; do say "$edge  $D$line$R"; done
   say "$edge"
-  say "$edge ${B}How to fix it${R}"
-  wrap "$edge   " "$hint"
-  say "$edge"
-  say "$edge   ${D}Log:${R} ${ACC2}$(tilde "$LOG")${R}"
-  printf '  %s╰─%s %sRun the installer again to retry.%s\n' "$RED" "$R" "$D" "$R"
+  wrap "$edge  " "$hint"
+  say "$edge  ${D}Log:${R} ${ACC2}$(tilde "$LOG")${R}"
+  printf '  %s╰─%s %sRun the installer again.%s\n' "$RED" "$R" "$D" "$R"
   blank
   [ "$FANCY" = 1 ] && printf '\a'
   exit 1
@@ -249,18 +235,18 @@ on_interrupt() {
     printf '  %s✗%s %s%s%s %s%s\n' "$RED" "$R" "$D" "${CUR_STEP%% *}" "$R" "${CUR_STEP#* }" " ${D}stopped${R}"
   fi
   blank
-  wrap "  " "Stopped. Nothing is broken: run the installer again and it picks up where it left off."
+  say "  Stopped. Run the installer again to carry on."
   blank
   exit 130
 }
 trap on_exit EXIT
 trap on_interrupt INT TERM
 
-# ================================================================ pre-flight
+# ================================================================ start
 
 banner
 
-[ -n "${PREFIX:-}" ] && [ -d "$PREFIX/bin" ] || { blank; bad "This installer runs inside Termux."; blank; exit 1; }
+[ -n "${PREFIX:-}" ] && [ -d "$PREFIX/bin" ] || { blank; say "  ${RED}✗${R} This installer runs inside Termux."; blank; exit 1; }
 OLD_VERSION=""
 if [ -x "$PREFIX/bin/kokoro" ] && grep -q '^# kokomux' "$PREFIX/bin/kokoro" 2>/dev/null; then
   MODE=update
@@ -269,74 +255,12 @@ else
   MODE=install
 fi
 
-heading "Checking your phone"
-problems=0
-arch="$(uname -m)"
-case "$arch" in
-  aarch64|arm64|x86_64) ok "64-bit processor" "$arch" ;;
-  *) bad "Kokoro needs a 64-bit phone" "this one is $arch"; problems=1 ;;
-esac
-
-android="$(getprop ro.build.version.release 2>/dev/null || true)"
-[ -n "$android" ] && ok "Android $android"
-
-if [ -n "${TERMUX_VERSION:-}" ]; then
-  ok "Termux $TERMUX_VERSION"
-else
-  warn "Termux looks old" "get the F-Droid or GitHub build if anything fails"
-fi
-
-free_kb="$(df -Pk "$HOME" 2>/dev/null | awk 'NR == 2 { print $4 }')" || true
-need_mb=1200; [ "$MODE" = update ] && need_mb=600
-if [[ "${free_kb:-}" =~ ^[0-9]+$ ]]; then
-  free_mb=$(( free_kb / 1024 ))
-  if [ "$free_mb" -ge 1024 ]; then free_h="$(awk "BEGIN { printf \"%.1f GB\", $free_mb / 1024 }")"; else free_h="$free_mb MB"; fi
-  if [ "$free_mb" -ge "$need_mb" ]; then
-    ok "$free_h free"
-  else
-    bad "Only $free_h free" "kokomux needs about $need_mb MB"; problems=1
-  fi
-fi
-
-# Any HTTP answer means we can reach the host (a proxy may refuse a HEAD).
-reachable() { [ "$(curl -s -o /dev/null -m 12 -I -w '%{http_code}' "$1" 2>/dev/null)" != 000 ]; }
-if reachable "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin" &&
-   reachable "https://pypi.org/simple/kokoro-onnx/"; then
-  ok "Online"
-else
-  bad "Can't reach the download servers" "check your internet connection"; problems=1
-fi
-
-if [ "$problems" = 1 ]; then
-  blank; wrap "  " "Fix the items marked ✗ above, then run the installer again."; blank
-  exit 1
-fi
-
-# ================================================================ plan
-
 if [ "$MODE" = install ]; then
-  heading "Here's the plan"
-  bullet "A small Debian system to run Kokoro in"
-  bullet "Python, Kokoro at full precision, misaki for English and 54 voices (a 450 MB download)"
-  bullet "The kokoro command, plus Share and widget shortcuts"
-  blank
-  wrap "  " "${D}Takes 10–20 minutes and about 1.2 GB. It keeps the phone awake until done.${R}"
+  heading "Installing"
+elif [ -z "$OLD_VERSION" ] || [ "$OLD_VERSION" = "$KOKOMUX_VERSION" ]; then
+  heading "Reinstalling"
 else
-  if [ "$OLD_VERSION" = "$KOKOMUX_VERSION" ]; then
-    heading "Reinstalling kokomux v$KOKOMUX_VERSION"
-  elif [ -n "$OLD_VERSION" ]; then
-    heading "Updating kokomux ${D}v$OLD_VERSION${R}${B} → ${ACC}v$KOKOMUX_VERSION"
-  else
-    heading "Updating kokomux to ${ACC}v$KOKOMUX_VERSION"
-  fi
-  say "  ${D}Your settings and downloaded voices are kept.${R}"
-fi
-
-if [ "$ASSUME_YES" = 0 ] && [ -r /dev/tty ] && [ -t 1 ]; then
-  blank
-  printf '  %sReady?%s %s[Y/n]%s ' "$B" "$R" "$D" "$R"
-  read -r answer < /dev/tty || answer=""
-  case "$answer" in [Nn]*) blank; say "  No changes made. See you next time."; blank; exit 0 ;; esac
+  heading "Updating ${D}v$OLD_VERSION →${R}${B} ${ACC}v$KOKOMUX_VERSION"
 fi
 
 if command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock >/dev/null 2>&1; then
@@ -498,95 +422,43 @@ voice_test() {
   else
     echo no > "$HOME/.config/kokoro/termux-api"
   fi
-  # The container's size, for the summary. Only a nicety: du complains about the
-  # odd file it can't read inside a proot container, and that mustn't fail the step.
-  local root size
-  for root in "$PREFIX/var/lib/proot-distro/containers/$DISTRO" "$PREFIX/var/lib/proot-distro/installed-rootfs/$DISTRO"; do
-    if [ -d "$root" ]; then
-      size="$(du -sm "$root" 2>/dev/null | cut -f1)" || true
-      [ -n "$size" ] && echo "$size" > "$WORK/.size"
-      break
-    fi
-  done
   note "sounds good"
 }
 
-[ "$MODE" = install ] && heading "Installing"
-[ "$MODE" = update ] && blank
 hide_cursor
-step "Termux packages" \
-  "Termux couldn't install its packages. Run: dpkg --configure -a && pkg upgrade, then the installer again. If downloads fail, pick another mirror with termux-change-repo." \
-  termux_packages
-step "Debian container" \
-  "Check that you have enough free space and a steady connection." \
-  debian_container
-step "Python" \
-  "Debian's servers may be busy. Wait a minute and try again." \
-  in_container apt
-step "Kokoro" \
-  "Installing Python packages failed. Check your connection and try again." \
-  in_container pip
-step "Download" \
-  "The download was interrupted. Running the installer again resumes it." \
-  in_container models
-step "kokoro command" \
-  "Couldn't finish setting up. The log below says why." \
-  kokoro_command
-step "Voice test" \
-  "Kokoro is installed but couldn't speak. Try: kokoro -p hello, and check the log." \
-  voice_test
+step "Termux packages" "Pick another mirror with termux-change-repo." termux_packages
+step "Debian container" "Check the connection." debian_container
+step "Python" "Check the connection." in_container apt
+step "Kokoro" "Check the connection." in_container pip
+step "Download" "Check the connection. It resumes where it stopped." in_container models
+step "kokoro command" "The log says why." kokoro_command
+step "Voice test" "The log says why." voice_test
 show_cursor
 
 # ================================================================ done
 
 took="$(human_time $(( SECONDS - T_START )))"
-size=""; [ -s "$WORK/.size" ] && size=" · $(cat "$WORK/.size") MB"
-bar="${ACC}│${R}"
 
 blank
 if [ "$MODE" = install ]; then
+  bar="${ACC}│${R}"
   printf '  %s╭─%s %s%s✓ kokomux is ready%s\n' "$ACC" "$R" "$B" "$GRN" "$R"
-elif [ "$OLD_VERSION" = "$KOKOMUX_VERSION" ]; then
-  printf '  %s╭─%s %s%s✓ kokomux reinstalled%s\n' "$ACC" "$R" "$B" "$GRN" "$R"
+  say "  $bar"
+  for t in 'kokoro|home' 'kokoro -p -f book.epub|read a book' 'kokoro --help|everything else'; do
+    printf '  %s  %s%-22s%s %s%s%s\n' "$bar" "$ACC2" "${t%%|*}" "$R" "$D" "${t#*|}" "$R"
+  done
+  say "  $bar"
+  printf '  %s╰─%s %s%s%s\n' "$ACC" "$R" "$D" "$took" "$R"
+elif [ "$OLD_VERSION" = "$KOKOMUX_VERSION" ] || [ -z "$OLD_VERSION" ]; then
+  printf '  %s✓ kokomux reinstalled%s %s%s%s\n' "$GRN" "$R" "$D" "$took" "$R"
 else
-  printf '  %s╭─%s %s%s✓ kokomux updated to v%s%s\n' "$ACC" "$R" "$B" "$GRN" "$KOKOMUX_VERSION" "$R"
+  printf '  %s✓ kokomux updated to v%s%s %s%s%s\n' "$GRN" "$KOKOMUX_VERSION" "$R" "$D" "$took" "$R"
 fi
-say "  $bar"
-tips=(
-  'kokoro|home: books, clipboard, files'
-  'kokoro -p "Hello there"|speak, words lit as read'
-  'kokoro -c -p|read the clipboard'
-  'kokoro -u URL -p|read a web page'
-  'kokoro -p -f book.epub|EPUB or PDF; resumes'
-  'kokoro -o note.mp3 "Hi"|save a file'
-  'kokoro --list-voices|54 voices'
-  'kokoro --help|everything else'
-)
-for t in "${tips[@]}"; do
-  cmd="${t%%|*}"; what="${t#*|}"
-  if [ "$W" -ge 50 ]; then
-    printf '  %s  %s%-24s%s %s%s%s\n' "$bar" "$ACC2" "$cmd" "$R" "$D" "$what" "$R"
-  else
-    printf '  %s  %s%s%s\n' "$bar" "$ACC2" "$cmd" "$R"
-    printf '  %s    %s%s%s\n' "$bar" "$D" "$what" "$R"
-  fi
-done
-say "  $bar"
-wrap "  $bar  " "Tip: Share → Termux in any app reads links and text aloud."
-say "  $bar"
-if [ -f "$WORK/.api" ]; then
-  say "  $bar  ${GRN}✓${R} Clipboard ready ${D}(Termux:API)${R}"
-else
-  say "  $bar  ${D}○${R} Clipboard: ${D}install the Termux:API app${R}"
-fi
-say "  $bar  ${D}○${R} Home-screen buttons: ${D}Termux:Widget app${R}"
+# Only what needs doing.
+[ -f "$WORK/.api" ] || say "  ${YEL}!${R} Install the Termux:API app to read the clipboard."
 if [ -s "$SKIPPED" ]; then
-  while read -r f; do
-    wrap "  $bar  " "${YEL}!${R} ${D}Kept your own $f, so sharing that type won't use kokoro.${R}"
-  done < "$SKIPPED"
+  while read -r f; do say "  ${YEL}!${R} Kept your own $f."; done < "$SKIPPED"
 fi
-say "  $bar"
-printf '  %s╰─%s %s%s in %s%s%s\n' "$ACC" "$R" "$D" "$( [ "$MODE" = install ] && echo Installed || echo Updated )" "$took" "$size" "$R"
 blank
 
 [ "$FANCY" = 1 ] && printf '\a'
