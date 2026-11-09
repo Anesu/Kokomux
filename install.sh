@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.17.1"
+KOKOMUX_VERSION="0.17.2"
 DISTRO=kokoro
 
 VERBOSE=0
@@ -3939,7 +3939,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
 # in player.sh, the colours in theme.sh (all three loaded below).
 set -euo pipefail
 
-KOKOMUX_VERSION="0.17.1"
+KOKOMUX_VERSION="0.17.2"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -4280,9 +4280,11 @@ key_cmd() {      # what KEY asks for (or a clicked button): see the player for e
 # kokoro on its own, on a terminal: the home screen.
 if [ $# = 0 ] && [ "$LIVE" = 1 ] && [ -t 0 ] && [ -t 1 ]; then
   keys_on
-  trap 'tui_close; keys_off; exit 130' INT TERM HUP
+  # However it ends, give back taps and typing (a tap opens Termux's keyboard again).
+  trap 'tui_close; keys_off' EXIT
+  trap 'exit 130' INT TERM HUP
   tui_home
-  keys_off; trap - INT TERM HUP
+  keys_off; trap - EXIT INT TERM HUP
   [ "${#HOME_CHOICE[@]}" -gt 0 ] && exec "$0" "${HOME_CHOICE[@]}"
   exit 0
 fi
@@ -4422,9 +4424,10 @@ case "${1:-}" in
   --settings)
     if [ "$LIVE" = 1 ] && [ -t 0 ]; then
       keys_on
-      trap 'tui_close; keys_off; exit 130' INT TERM HUP
+      trap 'tui_close; keys_off' EXIT
+      trap 'exit 130' INT TERM HUP
       tui_settings
-      keys_off; trap - INT TERM HUP
+      keys_off; trap - EXIT INT TERM HUP
       exit 0
     fi
     exec "$0" --status ;;

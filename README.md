@@ -315,6 +315,7 @@ The installer only keeps what's needed in the container. It skips documentation 
 - **A download failed:** run the installer again. Model downloads pick up where they stopped.
 - **`-c` hangs or fails:** you need both the Termux:API **app** and `pkg install termux-api`.
 - **No sound:** check the media volume. `mpv some.mp3` in Termux should play; if not, `pkg install mpv socat`.
+- **The keyboard won't come up:** in kokoro's screens a tap is a click on the screen, so it doesn't open the keyboard. Swipe in from the left edge and tap **KEYBOARD**.
 - **"Process completed (signal 9)", or the server keeps disappearing:** Android 12+ kills background processes it considers excessive. Search for "Termux phantom process killer" for the one-time fix.
 - **Server problems:** `kokoro --stop-server` and try again. Its log is in `$PREFIX/tmp/kokoro-server/log`.
 
