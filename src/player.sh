@@ -319,10 +319,12 @@ jump_to() {      # jump_to PART
 # which Kokoro speaks more naturally than a stretched recording. The parts
 # already heard stay on screen.
 speed_now() {    # speed_now PART: (while PART plays) $speed from this moment on
-  local at=$1 idx=${MPV_IDX[$1]} old=$tmpd parts=0 n f e files=()
-  mpv_send "\"set_property\",\"file-local-options/speed\",$(awk -v a="$speed" -v b="${MPV_SPD[idx]}" 'BEGIN { printf "%.4f", a / b }')"
+  local at=$1 idx=${MPV_IDX[$1]} old=$tmpd parts=0 n f e files=() ratio
+  ratio="$(awk -v a="$speed" -v b="${MPV_SPD[idx]}" 'BEGIN { printf "%.4f", a / b }')"
+  mpv_send "\"set_property\",\"file-local-options/speed\",$ratio"
   mpv_send '"playlist-clear"'                   # (the parts queued after it were made at the old speed)
   MPV_IDX=(["$at"]=0); MPV_PART=("$at"); MPV_SPD=("${MPV_SPD[idx]}"); MPV_N=1; MPV_POS=0; MPV_MAX=0
+  MPV_RATE=$(( 10#${ratio%.*} * 1000 + 10#${ratio#*.} / 10 )) MPV_RATE_IDX=0   # (its clock runs at that rate now)
   [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=0; }
   if [ "${parts:-0}" -gt "$at" ] || { [ -n "$NOVEL" ] && [ ! -f "$tmpd/stream/end" ]; }; then   # (a novel: more may come)
     if [ -n "$gen_pid" ]; then kill "$gen_pid" 2>/dev/null || true; wait "$gen_pid" 2>/dev/null || true; gen_pid=""; fi
@@ -403,6 +405,9 @@ listen_cmd() {   # listen_cmd CMD PART
 
 MPV_PID=""; MPV_SOCK=""; MPV_IN=""; MPV_OUT=""; MPV_CARRY=""
 MPV_T=0; MPV_POS=-1; MPV_N=0       # seconds into the current part; playlist index; entries queued
+MPV_T_AT=0                         # when mpv last said where it is (ms, now_ms's clock; 0: not yet, this part)
+MPV_EST=0                          # the last estimate of where it is (mpv_clock, ms), so it never steps back
+MPV_RATE=1000; MPV_RATE_IDX=-1     # media ms per 1000 ms of real time, for the playlist entry a new speed changed
 MPV_DUR=0; MPV_VOL=100             # the current part's length (seconds); the volume set (the sleep timer's fade)
 MPV_MAX=-1                         # the furthest playlist index reached (parts played while a menu was open)
 CMD_PENDING=""                     # a command chosen in the menu, for the player to carry out
@@ -435,8 +440,10 @@ mpv_pump() {     # take in what mpv has reported since last time
     if IFS= read -r -t 0.001 -u "$MPV_IN" line; then
       line=$MPV_CARRY$line; MPV_CARRY=""
       case "$line" in
-        *'"name":"playback-time"'*) if [[ "$line" =~ \"data\":([0-9.]+) ]]; then MPV_T=${BASH_REMATCH[1]}; fi ;;
+        *'"name":"playback-time"'*) if [[ "$line" =~ \"data\":([0-9.]+) ]]; then MPV_T=${BASH_REMATCH[1]}; now_ms; MPV_T_AT=$NOW; fi ;;
         *'"name":"playlist-pos"'*) if [[ "$line" =~ \"data\":(-?[0-9]+) ]]; then
+                                     # on to a new part: no time for it yet (a playlist-clear only renumbers the one playing)
+                                     if [ "${BASH_REMATCH[1]}" -gt "$MPV_POS" ]; then MPV_T=0 MPV_T_AT=0; fi
                                      MPV_POS=${BASH_REMATCH[1]}; [ "$MPV_POS" -gt "$MPV_MAX" ] && MPV_MAX=$MPV_POS; fi ;;
         *'"name":"duration"'*) if [[ "$line" =~ \"data\":([0-9.]+) ]]; then MPV_DUR=${BASH_REMATCH[1]}; fi ;;
       esac
@@ -452,13 +459,28 @@ mpv_ms() {       # mpv_ms [SECONDS]: SECONDS (default MPV_T) as whole millisecon
   [[ "$v" == *.* ]] && f=${v#*.}
   f="${f}000"; MS=$(( 10#${s:-0} * 1000 + 10#${f:0:3} ))
 }
+mpv_clock() {    # MS = where mpv is in the part now: its last report moved on by the time since, at its speed
+  # mpv says where it is only every 70 to 170 ms; at 2× that's most of a word,
+  # so between reports the clock runs on by itself (a quarter second at most).
+  local ahead=0 rate=1000
+  mpv_ms; now_ms
+  [ "$MPV_POS" = "$MPV_RATE_IDX" ] && rate=$MPV_RATE
+  if [ "$MPV_T_AT" -gt 0 ]; then
+    ahead=$(( (NOW - MPV_T_AT) * rate / 1000 ))
+    [ "$ahead" -le 250 ] || ahead=250
+  fi
+  MS=$(( MS + ahead ))
+  # A report a little behind the estimate: hold still rather than step back a word.
+  if [ "$MS" -lt "$MPV_EST" ] && [ "$MS" -gt $(( MPV_EST - 300 )) ]; then MS=$MPV_EST; fi
+  MPV_EST=$MS
+}
 mpv_queue() {    # mpv_queue PART WAV: add a part to the playlist (it plays at once if nothing is)
   mpv_send "\"loadfile\",\"$2\",\"append-play\""
   MPV_IDX[$1]=$MPV_N; MPV_PART[MPV_N]=$1; MPV_SPD[MPV_N]=$speed; MPV_N=$(( MPV_N + 1 ))
 }
 mpv_stop() {     # empty the playlist (a jump starts again from a new part)
   [ -n "$MPV_PID" ] && mpv_send '"stop"'
-  MPV_IDX=(); MPV_PART=(); MPV_SPD=(); MPV_N=0; MPV_POS=-1; MPV_T=0; MPV_MAX=-1
+  MPV_IDX=(); MPV_PART=(); MPV_SPD=(); MPV_N=0; MPV_POS=-1; MPV_T=0; MPV_T_AT=0; MPV_MAX=-1; MPV_RATE_IDX=-1
   return 0
 }
 mpv_quit() {     # stop mpv
@@ -486,7 +508,7 @@ go_home() {      # stop (keeping the place) and open the home screen
 play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause / next / again
   local wav=$1 i=$2 base="${1%.wav}" cur=-1 lit=-2 lit_now t label last="" cmd paused=0 started=0 idx k f waited=0
   local paused_at=0 away back
-  w_state=pending
+  w_state=pending; MPV_EST=0
   { [ -f "$tmpd/stream/words-off" ] || [ "$show_words" = 0 ]; } && w_state=off
   title_get; part_of "$i"
   bookmark_save "$i"; notify "${PART% · }"
@@ -522,6 +544,7 @@ play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause
                [ "$back" = 0 ] || { mpv_send "\"seek\",-$back,\"relative\""; cur=-1; lit=-2; }
                case "$SLEEP" in off|chapter) ;; *) SLEEP_AT=$(( SLEEP_AT + away )) ;; esac   # (paused time doesn't count)
                mpv_send '"set_property","pause",false'; paused=0; last=""
+               MPV_T_AT=$NOW                        # (the clock runs on from now, not from before the pause)
                echo playing > "$PLAYER_STATE"; notify "${PART% · }"
           else mpv_send '"set_property","pause",true'; paused=1; paused_at=$NOW; last=""
                echo paused > "$PLAYER_STATE"; notify "Paused · ${PART% · }"; fi ;;
@@ -530,6 +553,7 @@ play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause
                mpv_send '"set_property","pause",false'
                break ;;
         again) mpv_send '"seek",0,"absolute"'; mpv_send '"set_property","pause",false'
+               now_ms; MPV_T=0 MPV_T_AT=$NOW MPV_EST=0
                paused=0; cur=-1; lit=-2; last=""; continue ;;
         quit)  exit "$QUIT_RC" ;;                 # the bookmark is kept; cleanup says where
         home)  go_home ;;
@@ -552,7 +576,7 @@ play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause
     if [ "$show_words" = 1 ] && [ "$started" = 1 ]; then
       if [ "$w_state" = pending ]; then words_load "$base.words" || true; fi   # not landed yet
       if [ "$w_state" = ready ]; then
-        mpv_ms; t=$(( MS - KOKORO_WORDS_OFFSET_MS ))
+        mpv_clock; t=$(( MS - KOKORO_WORDS_OFFSET_MS ))
         if [ "$t" -lt "${w_s[$(( cur < 0 ? 0 : cur ))]:-0}" ]; then cur=-1; fi      # (after a seek back)
         while [ $(( cur + 1 )) -lt "${#w_s[@]}" ] && [ "${w_s[cur + 1]}" -le "$t" ]; do cur=$(( cur + 1 )); done
         # Keep the word lit through the pause after it; the last one goes out when it ends.

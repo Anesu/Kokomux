@@ -44,6 +44,7 @@ for n in 3 4 5; do mpv_queue "$n" "$tmpd/stream/000$n.wav"; done
 speed={speed}
 speed_now {at}
 echo "old=$old"; echo "tmpd=$tmpd"; echo "n=$MPV_N part=${{MPV_PART[0]}} idx=${{MPV_IDX[{at}]}} spd=${{MPV_SPD[0]}}"
+echo "rate=$MPV_RATE"; echo "rate_idx=$MPV_RATE_IDX"
 """, prefix)
 
 
@@ -58,6 +59,7 @@ def test_a_new_speed_plays_at_once_and_the_rest_is_made_again():
         log = open(os.path.join(d, "mpv.log")).read().splitlines()
         # The part being heard: faster in mpv, pitch kept; the parts queued after it go.
         assert '"set_property","file-local-options/speed",1.2000' in log, log
+        assert f["rate"] == "1200" and f["rate_idx"] == "0", f      # the highlight's clock runs 1.2× too
         assert '"playlist-clear"' in log
         assert "n=1 part=4 idx=0 spd=1.0" in out, out
         # The rest is made again, from the next part, at the new speed, in a new folder.
@@ -95,6 +97,69 @@ def test_end_of_chapter_fades_out_the_chapters_last_part():
         ch = "SLEEP=chapter CH_START=(1 4) CH_TITLE=(One Two) MPV_DUR=10.000000 MPV_T=3.500000"
         assert sleep_vol(d, ch, 3) == 50            # 6.5 s left of the chapter's last part
         assert sleep_vol(d, ch, 2) == 100           # not the last part
+
+
+# ---------------------------------------------------------------- the clock the highlight follows
+
+def clock(steps):
+    """Run mpv_clock after each step (bash: set the clock and what mpv said); return each MS."""
+    with tempfile.TemporaryDirectory() as d:
+        body = "".join(f"{step}; mpv_clock; echo $MS\n" for step in steps)
+        out = bash("now_ms() { NOW=$CLOCK; }; MPV_POS=0\n" + body, d)
+        return [int(x) for x in out.split()]
+
+
+def test_between_reports_the_clock_runs_on():
+    # mpv said 1.000 s at t=10 000 ms; 80 ms later it's 1.080 s
+    assert clock(["CLOCK=10000 MPV_T=1.000000 MPV_T_AT=10000", "CLOCK=10080"]) == [1000, 1080]
+
+
+def test_it_never_runs_on_more_than_a_quarter_second():
+    assert clock(["CLOCK=10000 MPV_T=1.000000 MPV_T_AT=10000", "CLOCK=12000"]) == [1000, 1250]
+
+
+def test_with_no_report_yet_it_waits():
+    assert clock(["CLOCK=10000 MPV_T=0 MPV_T_AT=0", "CLOCK=10300"]) == [0, 0]
+
+
+def test_after_a_new_speed_it_runs_at_that_rate():
+    # The part playing was sped up 1.5×: 100 ms of real time is 150 ms of it.
+    assert clock(["CLOCK=10000 MPV_T=1.000000 MPV_T_AT=10000 MPV_RATE=1500 MPV_RATE_IDX=0",
+                  "CLOCK=10100"]) == [1000, 1150]
+    # ...but only for that entry: the next part plays at its own speed.
+    assert clock(["CLOCK=10000 MPV_T=1.000000 MPV_T_AT=10000 MPV_RATE=1500 MPV_RATE_IDX=0 MPV_POS=1",
+                  "CLOCK=10100"]) == [1000, 1100]
+
+
+def test_a_report_a_little_behind_holds_it_still():
+    got = clock(["CLOCK=10000 MPV_T=1.000000 MPV_T_AT=10000", "CLOCK=10090",
+                 "MPV_T=1.050000 MPV_T_AT=10090", "CLOCK=10120"])
+    assert got == [1000, 1090, 1090, 1090], got        # not back to 1050; then on from there
+    assert clock(["CLOCK=10000 MPV_T=1.000000 MPV_T_AT=10000", "CLOCK=10090",
+                  "MPV_T=1.050000 MPV_T_AT=10090", "CLOCK=10150"])[-1] == 1110
+
+
+def test_a_seek_back_is_followed():
+    assert clock(["CLOCK=10000 MPV_T=6.000000 MPV_T_AT=10000", "MPV_T=1.000000 MPV_T_AT=10000"]) == [6000, 1000]
+
+
+def pump(lines, setup=""):
+    with tempfile.TemporaryDirectory() as d:
+        feed = "".join(f"{line}\n" for line in lines)
+        out = bash(f"""now_ms() {{ NOW=5000; }}; {setup}
+exec {{MPV_IN}}< <(printf '%s' '{feed}'); sleep 0.2; mpv_pump
+echo "$MPV_POS $MPV_T $MPV_T_AT"
+""", d)
+        return out.split()
+
+
+def test_a_new_part_starts_with_no_time_and_a_playlist_clear_keeps_it():
+    on = pump(['{"event":"property-change","id":1,"name":"playback-time","data":4.2}',
+               '{"event":"property-change","id":2,"name":"playlist-pos","data":1}'], "MPV_POS=0")
+    assert on == ["1", "0", "0"], on                        # the next part: nothing said about it yet
+    cleared = pump(['{"event":"property-change","id":1,"name":"playback-time","data":4.2}',
+                    '{"event":"property-change","id":2,"name":"playlist-pos","data":0}'], "MPV_POS=2")
+    assert cleared == ["0", "4.2", "5000"], cleared         # the same part, renumbered: its time stands
 
 
 if __name__ == "__main__":
