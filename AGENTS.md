@@ -54,6 +54,15 @@ $PREFIX/tmp  ═════════════ shared ══════�
 4. **The screens** (`src/tui.sh`): home, reader, menu, chapters, settings,
    voice picker. Colours from `src/theme.sh`, made from the terminal's own
    background (OSC 10/11 queries).
+5. **Web novels**: when a URL is a novel's chapter (`novel_chapter` in the
+   engine), the job reads on from chapter to chapter, one chapter ahead of
+   the player (which writes the part it's on into `at`). Parts are numbered
+   across the whole listen; `serial` maps them to chapter addresses, and a
+   restart mid-listen (a jump, a new speed) passes `base=`. The bookmark is
+   per novel (`kind=novel`, `source=` the chapter's address); see "web
+   novels" in `src/player.sh`. Pages are fetched with curl and a phone
+   browser's user agent, which is what the phone was checked to get through
+   with. `tests/test_novel.py` serves a made-up novel locally.
 
 `install.sh` is what the phone downloads: `src/install.sh` with the other
 files inlined by `./build.sh`. It sets up Termux packages, the container

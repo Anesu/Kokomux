@@ -279,6 +279,12 @@ control() {
 
 # Bookmarks: where a long text was stopped, as key=value lines.
 mark_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1; }
+chapter_url() {  # chapter_url URL N: CHURL = chapter N's address, where a novel's addresses count chapters (…/chapter-5)
+  local u=${1%%[?#]*}
+  u=${u%/}; CHURL=""
+  [[ "$u" =~ ^(.*/[^/]*[Cc][Hh][Aa][Pp][Tt][Ee][Rr][-_]?)([0-9]+)([^/]*)$ ]] || return 1
+  CHURL="${BASH_REMATCH[1]}$2${BASH_REMATCH[3]}"
+}
 
 stop_playback() {
   local pid
@@ -430,7 +436,7 @@ case "${1:-}" in
     [ -n "$last" ] || last="$(ls -t "$BOOKS"/*.mark 2>/dev/null | head -n 1)" || true
     [ -n "$last" ] || die "There's nothing to continue." "A bookmark is kept when you stop a long text partway."
     case "$(mark_get "$last" kind)" in
-      url)  src=(-u "$(mark_get "$last" source)") ;;
+      url|novel) src=(-u "$(mark_get "$last" source)") ;;
       text) src=(-f "${last%.mark}.txt") ;;
       *)    src=(-f "$(mark_get "$last" source)")
             [ -f "${src[1]}" ] || die "Can't find \"${src[1]}\" any more." "Has the file moved? Open it again with kokoro -p -f." ;;
@@ -480,8 +486,9 @@ case "${1:-}" in
     printf '    Idle stop %s\n' "$idle"
     last="$(ls -t "$BOOKS"/*.mark 2>/dev/null | head -n 1)" || true
     if [ -n "$last" ]; then
-      printf '    Bookmark  %s %s(part %s of %s · kokoro --continue)%s\n' "$(mark_get "$last" title)" "$D" \
-        "$(mark_get "$last" part)" "$(mark_get "$last" parts)" "$R"
+      where="part $(mark_get "$last" part) of $(mark_get "$last" parts)"
+      [ "$(mark_get "$last" kind)" = novel ] && where="$(mark_get "$last" chapter)"
+      printf '    Bookmark  %s %s(%s · kokoro --continue)%s\n' "$(mark_get "$last" title)" "$D" "$where" "$R"
     fi
     printf '    Settings  %s%s%s\n' "$D" "$(tilde "$CONF")" "$R"
     printf '    %sChange them with: kokoro --settings%s\n' "$D" "$R"
@@ -601,7 +608,11 @@ cleanup() {
   keys_off
   if [ "${ui:-none}" != none ] && [ -n "${book_id:-}" ] && [ -f "$BOOKS/$book_id.mark" ]; then
     [ "${SLEPT:-0}" = 1 ] && info "Sleep timer: good night."
-    info "Stopped at part $(mark_get "$BOOKS/$book_id.mark" part) of $(mark_get "$BOOKS/$book_id.mark" parts). ${D}kokoro --continue picks up there.${R}"
+    if [ "$(mark_get "$BOOKS/$book_id.mark" kind)" = novel ]; then
+      info "Stopped in $(mark_get "$BOOKS/$book_id.mark" chapter). ${D}kokoro --continue picks up there.${R}"
+    else
+      info "Stopped at part $(mark_get "$BOOKS/$book_id.mark" part) of $(mark_get "$BOOKS/$book_id.mark" parts). ${D}kokoro --continue picks up there.${R}"
+    fi
   fi
   if [ "${play:-0}" = 1 ]; then notify_clear; rm -f "$PLAYER_STATE"; fi
   mpv_quit
@@ -673,9 +684,21 @@ if { [ "$play" = 1 ] && [ -z "$out" ]; } || [ "$ext" = m4b ]; then   # (an audio
   if [ "$kind" = url ]; then book_id="$(printf '%s' "$url" | sha256sum | cut -c1-16)"
   else book_id="$(sha256sum < "$text" | cut -c1-16)"; fi
 fi
+skip=0
 if [ "$play" = 1 ] && [ -z "$out" ]; then
+  # A web novel's chapter: its bookmark is the novel's, which names the chapter it's at.
+  if [ "$kind" = url ]; then
+    mark="$(grep -lFx "source=$url" "$BOOKS"/*.mark 2>/dev/null | head -n 1)" || true
+    if [ -n "$mark" ] && [ "$(mark_get "$mark" kind)" = novel ]; then book_id="$(basename "$mark" .mark)"; fi
+  fi
   mark="$BOOKS/$book_id.mark"
-  if [ "$restart" = 1 ]; then rm -f "$mark" "$BOOKS/$book_id.txt"
+  if [ "$restart" = 1 ]; then [ "$(mark_get "$mark" kind)" = novel ] || rm -f "$mark" "$BOOKS/$book_id.txt"
+  elif [ "$(mark_get "$mark" "done")" = 1 ]; then          # heard to the latest chapter: on to the next
+    skip=1; info "On from $(mark_get "$mark" chapter)."
+  elif [ "$(mark_get "$mark" kind)" = novel ] && [ "$(mark_get "$mark" part)" -gt 1 ] 2>/dev/null; then
+    start="$(mark_get "$mark" part)"; was_parts="$(mark_get "$mark" parts)"
+    [[ "$was_parts" =~ ^[0-9]+$ ]] || was_parts=0
+    info "Picking up in $(mark_get "$mark" chapter), where you stopped."
   elif [ -f "$mark" ] && [ "$(mark_get "$mark" part)" -gt 1 ] 2>/dev/null; then
     start="$(mark_get "$mark" part)"; was_parts="$(mark_get "$mark" parts)"
     [[ "$was_parts" =~ ^[0-9]+$ ]] && [ "$was_parts" -gt 0 ] || was_parts=0
@@ -697,11 +720,16 @@ if [ "$play" = 1 ] && [ "$LIVE" = 1 ]; then
 fi
 
 write_job() {    # the job, for the engine (where it starts and how fast can change mid-listen)
+  local u=$url b=1
+  if [ -n "${NOVEL:-}" ]; then chapters_load; novel_at "$start"; u=$N_URL; b=$N_FIRST; fi   # (the chapter it's in)
+  echo "$start" > "$tmpd/at"
   {
     echo "voice=$voice"
     echo "speed=$speed"
     echo "lang=$lang"
-    [ -n "$url" ] && echo "url=$url"
+    [ -n "$u" ] && echo "url=$u"
+    [ "$b" -gt 1 ] && echo "base=$b"           # where that chapter starts in this listen
+    [ "$skip" = 1 ] && echo "skip=1"          # on from the chapter at url
     echo "name=$name"
     [ "$start" -gt 1 ] && echo "start=$start"
     [ "$was_parts" -gt 0 ] && echo "of=$was_parts"   # the bookmark's count: the engine maps it if its parts differ

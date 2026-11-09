@@ -125,7 +125,7 @@ The sleep timer fades the voice out over its last 13 seconds, then stops, keepin
 
 With a keyboard and mouse (DeX, a tablet, or a Bluetooth keyboard), the keys and clicks both work. On a phone, tap the buttons. When you stop, kokoro says where you stopped and how to carry on.
 
-Run `kokoro` on its own to open the **home screen**. It lists the books and long texts you're partway through, with progress bars: choose one with ↑↓ and Enter, its number, or a click. It also has one-key actions:
+Run `kokoro` on its own to open the **home screen**. Its **bookshelf** lists the books, web novels and long texts you're partway through, with progress bars: choose one with ↑↓ and Enter, its number, or a click. It also has one-key actions:
 
 | Key | Does |
 |---|---|
@@ -190,6 +190,24 @@ A part is a few sentences. With the Termux:API app installed, a notification sho
 ## Audiobooks
 
 `kokoro -f book.epub -o book.m4b` makes an audiobook: AAC in an `.m4b`, with a chapter mark for each of the book's chapters, its title and author, and its cover. Any app that plays audiobooks shows the chapters, so it works in the car, on a watch or in your favourite player. It reuses whatever you've already listened to in the same voice and speed, keeps the phone awake while it works, and shows how far it's got. Text files and web pages work too, as one chapter.
+
+## Web novels
+
+Give kokomux a chapter of a web novel, from freewebnovel.com or any site laid out like it, and it reads the novel, not just the page:
+
+```sh
+kokoro -p -u https://freewebnovel.com/novel/starting-with-an-sss-rank-goddess-summon/chapter-5
+```
+
+(or open the chapter in your browser and share it to Termux, or press **u** on the home screen.)
+
+- **The chapter, and only the chapter.** It finds the novel's title, the chapter's number and title, and the chapter's text, leaving out the site's menus, ads, comments and "read it at…" lines. Each chapter starts with its name, so you hear "Chapter 5: Weapon Haggling."
+- **On to the next chapter, without a gap.** It follows the page's "Next chapter" link, or works out `chapter-6` from `chapter-5`. The next chapter is fetched and made while you listen to this one, one chapter ahead.
+- **On the bookshelf.** The home screen shows the novel with the chapter you're on (*The Long Road · Ch 12*). Enter carries on where you stopped, in that chapter; **g** goes to any chapter by its number. `kokoro --continue` works too.
+- **In the reader**, **[** and **]** move between chapters (back past where you started, too) and **c** goes to a chapter by its number.
+- **Caught up?** When you reach the newest chapter out, it says so and keeps the novel on the shelf. Carry on later and it starts with the next chapter, once there is one.
+
+kokomux fetches pages the way your phone's browser does. A site that asks for a browser check first (Cloudflare's "Just a moment…") can't be read this way.
 
 ## The queue
 
@@ -332,6 +350,7 @@ python3 dev/screen.py --out reader.png -- dev/kokoro -p -f story.txt   # a pictu
 | `tests/test_web.py` | reading web pages (needs trafilatura) |
 | `tests/test_reader.py` | the reader's focus effect |
 | `tests/test_player.py` | a new speed heard at once, and the sleep timer's fade |
+| `tests/test_novel.py` | web novels: reading a chapter page, and listening on from chapter to chapter (a made-up novel served locally) |
 | `tests/test_settings.py` | every setting in the menu changes and is saved |
 | `tests/test_theme.py` | the colours: contrast on 15 terminal themes, the golden steps, asking the terminal |
 | `dev/check.sh` | everything to run before a commit |

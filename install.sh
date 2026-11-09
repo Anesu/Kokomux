@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.16.0"
+KOKOMUX_VERSION="0.17.0"
 DISTRO=kokoro
 
 ASSUME_YES=0; VERBOSE=0
@@ -596,6 +596,15 @@ parts"), `out.<ext>` and `chapters_ms` when saving, and with stream=1
 `stream/NNNN.wav` (its audio, with the pause after it; written last), `stream/first`
 (where it began) and `stream/end` once everything is made. With a cache, the
 stream files are relative links into it.
+
+A web novel's chapter (url, with stream=1) is read on from chapter to chapter:
+the engine fetches the next one when the player reaches the last one made (the
+player writes the part it's on into `at`). It writes `novel` (title=, url=,
+prev=: the chapter before this listen's first) and `serial` ("first-part<TAB>
+number<TAB>address", in step with `chapters`). Parts are numbered across the
+whole listen; a job that picks up mid-listen says where its chapter starts
+(base=N) and has the earlier `chapters` and `serial` lines in its folder.
+skip=1 starts at the chapter after the one at url.
 """
 import argparse
 import hmac
@@ -626,7 +635,8 @@ VOICES_SRC = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/mode
 SERVER_DIR = "/tmp/kokoro-server"
 JOB_DIR_RE = re.compile(r"^/tmp/kokoro\.[A-Za-z0-9]+$")
 FORMATS = ("wav", "mp3", "ogg", "flac")
-USER_AGENT = "Mozilla/5.0 (Linux; Android) kokomux"
+# A phone browser's: some sites (behind Cloudflare, say) turn other clients away.
+USER_AGENT = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36"
 MAX_CHUNK = 360  # characters per part: whole sentences, under Kokoro's 510 sounds
 SERVING = False
 
@@ -1019,23 +1029,47 @@ class _ChapterText(HTMLParser):
         return "\n".join(use)
 
 
-def fetch_url(url):
-    """A web page's (title, readable text)."""
+class NotFound(JobError):
+    """The address answered 404: no such page (a chapter that isn't out yet)."""
+
+
+def fetch(url):
+    """Fetch a web page with curl, as a phone browser would: (content type, text)."""
+    import subprocess
+    import tempfile
     if not re.match(r"^https?://", url):
         raise JobError(f"Not a web address: {url}")
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            ctype = r.headers.get_content_type()
-            charset = r.headers.get_content_charset() or "utf-8"
-            body = r.read(5_000_000).decode(charset, errors="replace")
-    except Exception as e:  # noqa: BLE001 - report any network error plainly
-        raise JobError(f"Couldn't fetch {url}: {e}") from e
+    with tempfile.NamedTemporaryFile(prefix="kokomux-page.") as tmp:
+        r = subprocess.run(["curl", "-sS", "-L", "--compressed", "--max-time", "30", "--max-filesize", "5000000",
+                            "-A", USER_AGENT, "-o", tmp.name, "-w", "%{http_code}\t%{content_type}", url],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise JobError(f"Couldn't fetch {url}: {r.stderr.strip() or f'curl error {r.returncode}'}")
+        code, _, ctype = r.stdout.partition("\t")
+        raw = tmp.read()
+    m = re.search(r"charset=([\w-]+)", ctype)
+    body = raw.decode(m.group(1) if m else "utf-8", errors="replace")
+    if code == "404":
+        raise NotFound(f"There's no page at {url}")
+    if re.search(r"<title>\s*Just a moment", body[:3000]):
+        raise JobError("That site wants a browser check (Cloudflare) before it shows the page")
+    if not code.startswith("2"):
+        raise JobError(f"Couldn't fetch {url}: the site answered {code}")
+    return ctype.split(";")[0].strip().lower(), body
+
+
+def read_page(url):
+    """A web page: (title, text, chapter), where chapter has a novel chapter's details, or is None."""
+    ctype, body = fetch(url)
     if ctype == "text/plain":
-        return url, body
+        return url, body, None
     if "html" not in ctype and "xml" not in ctype:
         raise JobError(f"That link is {ctype}, not a web page")
-    return page_text(body, url)
+    chapter = novel_chapter(body, url)
+    if chapter:
+        return chapter["novel"], chapter["text"], chapter
+    title, text = page_text(body, url)
+    return title, text, None
 
 
 # Where an article ends: from a heading like these on it's links, not reading.
@@ -1049,11 +1083,24 @@ def page_text(html, url):
     """A web page's (title, text to read), found by trafilatura: the article, not the menus,
     sidebars, ads or comments, and stopping where the links start ("See also", "Recent posts")."""
     import trafilatura
+    text = "\n".join(article_lines(html, url))
+    if len(text.split()) < 5:                # a menu or a "Home" link is not an article
+        raise JobError("Couldn't find any readable text on that page")
+    meta = trafilatura.extract_metadata(html, default_url=url)
+    title = (meta.title if meta is not None and meta.title else "") or url
+    short = title.split(" - ")[0].split(" | ")[0].strip()
+    if short and short not in text.split("\n", 1)[0]:
+        text = f"{short}.\n{text}"           # say what it is first
+    return title, text
+
+
+def article_lines(html, url):
+    """The article on a page, as lines (paragraphs), by trafilatura."""
+    import trafilatura
     # Two line breaks in a row are a paragraph break (older pages lay text out that way).
     html = re.sub(r"(?i)(?:<br\s*/?>\s*){2,}", "</p><p>", html)
     md = trafilatura.extract(html, url=url, output_format="markdown", include_comments=False,
                              include_images=False, include_links=False, include_tables=False) or ""
-    meta = trafilatura.extract_metadata(html, default_url=url)
     lines = []
     for line in md.splitlines():
         line = re.sub(r"<[^>]+>", "", line.replace("\\", "")).strip()       # markdown escapes, stray tags
@@ -1068,14 +1115,219 @@ def page_text(html, url):
         line = re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", line)         # list items
         if line and line != "[edit]":
             lines.append(line)
-    text = "\n".join(lines)
-    if len(text.split()) < 5:                # a menu or a "Home" link is not an article
-        raise JobError("Couldn't find any readable text on that page")
-    title = (meta.title if meta is not None and meta.title else "") or url
-    short = title.split(" - ")[0].split(" | ")[0].strip()
-    if short and short not in text.split("\n", 1)[0]:
-        text = f"{short}.\n{text}"           # say what it is first
-    return title, text
+    return lines
+
+
+# ------------------------------------------------------------------ novels
+# A chapter page of a web novel (freewebnovel.com and the like): the novel's
+# title, the chapter's number and title, its text, and the links to the
+# chapters either side. Listening goes on from chapter to chapter.
+
+CHAPTER_RE = re.compile(r"(?i)\b(?:chapter|chap\.?|ch\.)\s*(\d+)")
+CHAPTER_URL_RE = re.compile(r"(?i)chapter[-_]?(\d+)")
+# Where novel sites put the chapter's text.
+_TEXT_IDS = {"article", "chapter-content", "chr-content", "chapter-c", "chaptercontent", "content", "booktxt"}
+_TEXT_CLASSES = {"txt", "chapter-content", "chr-c", "reading-content", "chapter-body", "text-left", "entry-content",
+                 "chapter-inner", "read-content"}
+_NAV_LINE = re.compile(r"(?i)^(?:<<|>>|«|»)?\s*(?:prev(?:ious)?|next)(?: chapter)?\s*(?:<<|>>|«|»)?$|"
+                       r"^(?:index|table of contents|chapter list|report( chapter)?|bookmark|comments?)$")
+
+
+class _ChapterPage(HTMLParser):
+    """Reads what a chapter page says about itself: title, headings, links and the chapter's text."""
+    SKIP = {"script", "style", "noscript", "button", "select"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.title, self.site, self.heads, self.links, self.rel = "", "", [], [], {}
+        self.paras, self._text_depth, self._depth, self._skip = [], 0, 0, 0
+        self._tag, self._buf, self._a, self._para = None, [], None, []
+
+    def handle_starttag(self, tag, attrs):
+        a = {k: (v or "") for k, v in attrs}
+        if tag in self.SKIP:
+            self._skip += 1
+        if tag in ("title", "h1", "h2", "h3"):
+            self._tag, self._buf = tag, []
+        elif tag == "meta" and a.get("property") == "og:site_name":
+            self.site = a.get("content", "")
+        elif tag == "link" and a.get("rel", "").lower() in ("next", "prev", "previous"):
+            self.rel.setdefault(a["rel"].lower()[:4], a.get("href", ""))
+        elif tag == "a":
+            self._a = {"href": a.get("href", ""), "rel": a.get("rel", "").lower(), "text": [],
+                       "meta": " ".join((a.get("id", ""), a.get("class", ""), a.get("title", ""))).lower()}
+        if tag in ("div", "article", "section", "main", "td"):
+            self._depth += 1
+            ident = a.get("id", "").lower()
+            classes = set(a.get("class", "").lower().split())
+            if not self._text_depth and (ident in _TEXT_IDS or classes & _TEXT_CLASSES):
+                self._text_depth = self._depth
+        if self._text_depth and tag in ("p", "br", "div"):
+            self._end_para()
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP and self._skip:
+            self._skip -= 1
+        if tag == self._tag:
+            text = " ".join("".join(self._buf).split())
+            if tag == "title":
+                self.title = self.title or text
+            elif text:
+                self.heads.append(text)
+            self._tag = None
+        elif tag == "a" and self._a is not None:
+            self._a["text"] = " ".join("".join(self._a["text"]).split()).lower()
+            self.links.append(self._a)
+            self._a = None
+        if self._text_depth and tag in ("p", "div", "article", "section", "main", "td"):
+            self._end_para()
+        if tag in ("div", "article", "section", "main", "td"):
+            if self._text_depth == self._depth:
+                self._text_depth = 0
+            self._depth -= 1
+
+    def handle_data(self, data):
+        if self._tag:
+            self._buf.append(data)
+        if self._a is not None:
+            self._a["text"].append(data)
+        if self._text_depth and not self._skip:
+            self._para.append(data)
+
+    def _end_para(self):
+        text = " ".join("".join(self._para).split())
+        if text:
+            self.paras.append(text)
+        self._para = []
+
+
+def novel_url_of(url):
+    """The novel a chapter belongs to: its address up to the "chapter…" part of the path
+    (or without the last part). kokomux keeps one bookmark per novel, by this."""
+    u = urllib.parse.urlsplit(url)
+    parts = [p for p in u.path.split("/") if p]
+    for k, p in enumerate(parts):
+        if p.lower().startswith(("chapter", "chap-", "ch-")):
+            parts = parts[:k]
+            break
+    else:
+        parts = parts[:-1]
+    return urllib.parse.urlunsplit((u.scheme, u.netloc, "/" + "/".join(parts), "", ""))
+
+
+def chapter_address(url, number):
+    """The address of chapter NUMBER of the novel URL is a chapter of, where its address
+    counts chapters (…/chapter-5); None where it doesn't."""
+    u = urllib.parse.urlsplit(url)
+    head, _, last = u.path.rstrip("/").rpartition("/")
+    if not CHAPTER_URL_RE.search(last):
+        return None
+    last = CHAPTER_URL_RE.sub(lambda m: m.group(0)[:-len(m.group(1))] + str(number), last, count=1)
+    return urllib.parse.urlunsplit((u.scheme, u.netloc, f"{head}/{last}", "", ""))
+
+
+def _nav_link(page, url, novel_url, word):
+    """The link to the next (or previous) chapter: rel=next, or a link that says so."""
+    host = urllib.parse.urlsplit(url).netloc
+    best, score = None, 0
+    cands = [{"href": page.rel.get(word, ""), "rel": word, "text": "", "meta": ""}] + page.links
+    for a in cands:
+        href = urllib.parse.urljoin(url, a["href"]).split("#")[0]
+        if not a["href"] or not href.startswith("http") or urllib.parse.urlsplit(href).netloc != host:
+            continue
+        if href.rstrip("/") in (url.split("#")[0].rstrip("/"), novel_url.rstrip("/")):
+            continue
+        said = f"{a['text']} {a['meta']}"
+        if word == "prev":
+            says = re.search(r"\bprev|previous|prev_|prevchap", said)
+        else:
+            says = re.search(r"\bnext|next_|nextchap", said)
+        n = (3 if word in a["rel"] else 0) + (2 if says else 0)
+        if n == 0:
+            continue
+        n += 1 if CHAPTER_URL_RE.search(href) or "chapter" in href.lower() else 0
+        if n > score:
+            best, score = href, n
+    return best
+
+
+def novel_chapter(html, url):
+    """A novel's chapter page, read: a dict with novel (its title), novel_url, label
+    ("Chapter 5: Weapon Haggling"), number, text (to speak: the label, then the chapter),
+    next and prev (addresses or None), and guessed (next was worked out from the address,
+    not linked). None if the page isn't a chapter of something."""
+    page = _ChapterPage()
+    try:
+        page.feed(html)
+        page.close()
+    except Exception:  # noqa: BLE001 - a page this parser can't follow isn't a chapter page to us
+        return None
+    last = urllib.parse.urlsplit(url).path.rstrip("/").rpartition("/")[2]
+    m_url = CHAPTER_URL_RE.search(last)
+    # The page title: "Novel - Chapter 5: Title | Site", or "Chapter 5 - Novel - Site".
+    parts = [p.strip() for p in re.split(r"\s+\|\s+", page.title) if p.strip()]
+    with_ch = [p for p in parts if CHAPTER_RE.search(p)]
+    novel, label = "", ""
+    if with_ch:
+        t = with_ch[0]
+        m = CHAPTER_RE.search(t)
+        novel, label = t[:m.start()].strip(" -–—:|"), t[m.start():].strip()
+        if not novel:
+            bits = re.split(r"\s+[-–—]\s+", label)
+            label, novel = bits[0], (bits[1] if len(bits) > 1 else "")
+    for h in page.heads:                       # a heading names the chapter better than the title
+        if CHAPTER_RE.search(h) and len(h) < 150 and (not label or len(h) >= len(label)):
+            label = h if not novel or not h.startswith(novel) else h[len(novel):].strip(" -–—:|")
+            break
+    number = int(CHAPTER_RE.search(label).group(1)) if CHAPTER_RE.search(label) else (
+        int(m_url.group(1)) if m_url else None)
+    if number is None:
+        return None
+    novel_url = novel_url_of(url)
+    if not novel:
+        novel = next((h for h in page.heads if not CHAPTER_RE.search(h)), "") or \
+            urllib.parse.urlsplit(novel_url).path.rstrip("/").rpartition("/")[2].replace("-", " ").title()
+    label = label or f"Chapter {number}"
+    nxt, prev = _nav_link(page, url, novel_url, "next"), _nav_link(page, url, novel_url, "prev")
+    guessed = False
+    if not nxt:
+        nxt, guessed = chapter_address(url, number + 1), True
+    if not (nxt or prev or m_url):
+        return None
+
+    # The text: from where these sites keep it, else whatever trafilatura finds.
+    lines = page.paras if len(" ".join(page.paras).split()) >= 50 else article_lines(html, url)
+    site = re.sub(r"[^a-z0-9]", "", (page.site or urllib.parse.urlsplit(url).netloc.split(".")[-2]).lower())
+    names = {re.sub(r"\W", "", x.lower()) for x in (label, novel, f"chapter {number}")}
+    keep = []
+    for k, line in enumerate(lines):
+        bare = re.sub(r"\W", "", line.lower())
+        if k < 4 and not keep and (bare in names or (CHAPTER_RE.match(line.strip()) and len(line) < 100)):
+            continue                                   # the heading again (it's said first anyway)
+        if site and len(site) > 4 and site in bare:
+            continue                                   # "Read the latest chapters at freewebnovel.com"
+        if _NAV_LINE.match(line.strip()):
+            continue
+        keep.append(line)
+    if len(" ".join(keep).split()) < 20:
+        return None
+    said = label if re.search(r"[.!?:…]$", label) else label + "."
+    return {"novel": novel, "novel_url": novel_url, "url": url, "label": label, "number": number,
+            "text": said + "\n" + "\n".join(keep), "next": nxt, "prev": prev, "guessed": guessed}
+
+
+def novel_next(chapter):
+    """The chapter after this one, read, or None if there isn't one (yet)."""
+    if not chapter.get("next"):
+        return None
+    try:
+        _, html = fetch(chapter["next"])
+    except NotFound:
+        return None
+    nxt = novel_chapter(html, chapter["next"])
+    if not nxt or nxt["novel_url"] != chapter["novel_url"] or nxt["number"] <= chapter["number"]:
+        return None                                    # the "next" link left the novel, or went back
+    return nxt
 
 
 # ------------------------------------------------------------------ books
@@ -1190,8 +1442,8 @@ def read_source(jobdir, job):
     name = job.get("name", "")
     if job.get("url"):
         log(f"Fetching {job['url']}")
-        title, text = fetch_url(job["url"])
-        return title, [(title, text)]
+        title, text, chapter = read_page(job["url"])
+        return title, [(chapter["label"] if chapter else title, text)]
     file = job.get("file", "in.txt")
     if "/" in file:
         raise JobError(f"Bad input file name: {file}")
@@ -1301,6 +1553,61 @@ def silence(seconds, rate):
     return np.zeros(max(0, int(seconds * rate)), dtype=np.float32)
 
 
+def _novel_listed(jobdir, base):
+    """The chapters already in this listen, before part BASE: (chapters lines, serial lines).
+    (A jump or a new speed starts a new job folder, with these copied into it.)"""
+    got = []
+    for name in ("chapters", "serial"):
+        try:
+            with open(os.path.join(jobdir, name), encoding="utf-8") as fh:
+                got.append([ln.rstrip("\n") for ln in fh if ln.strip() and int(ln.split("\t", 1)[0]) < base])
+        except (OSError, ValueError):
+            got.append([])
+    if len(got[0]) != len(got[1]):
+        return [], []
+    return got[0], got[1]
+
+
+def _novel_add(jobdir, chapter, chunks, starts, serial, lang, new=False):
+    """Add a novel's chapter to the listen: its parts, and where it starts in the chapter
+    list (chapters: "first<TAB>label") and the novel's (serial: "first<TAB>number<TAB>address")."""
+    parts = split_text(normalise(chapter["text"], lang))
+    if not parts:
+        return
+    parts[-1] = (parts[-1][0], PAUSE["chapter"])
+    first = len(chunks) + 1
+    starts.append(f"{first}\t{chapter['label'].replace(chr(9), ' ')[:80]}")
+    serial.append(f"{first}\t{chapter['number']}\t{chapter['url']}")
+    chunks += parts
+    _write_atomic(os.path.join(jobdir, "chapters"), "\n".join(starts) + "\n")
+    _write_atomic(os.path.join(jobdir, "serial"), "\n".join(serial) + "\n")
+    if new:                                     # the novel, and the chapter before this listen's first
+        _write_atomic(os.path.join(jobdir, "novel"),
+                      f"title={chapter['novel']}\nurl={chapter['novel_url']}\nprev={chapter['prev'] or ''}\n")
+
+
+def _novel_more(jobdir, chapter, chunks, starts, serial, lang):
+    """The next chapter, added once the listener has reached the last one made (so one
+    chapter is always ready ahead, and no more). None at the end of what's out."""
+    last = int(serial[-1].split("\t", 1)[0]) if serial else 0
+    while True:
+        if not os.path.isdir(jobdir):
+            raise JobError("Cancelled")
+        try:
+            with open(os.path.join(jobdir, "at")) as fh:
+                at = int(fh.read().strip() or 0)
+        except (OSError, ValueError):
+            at = 0
+        if at >= last:
+            break
+        time.sleep(0.5)
+    log(f"Fetching {chapter['next']}")
+    nxt = novel_next(chapter)
+    if nxt:
+        _novel_add(jobdir, nxt, chunks, starts, serial, lang)
+    return nxt
+
+
 def run_job(path):
     import numpy as np
     import soundfile as sf
@@ -1339,7 +1646,18 @@ def run_job(path):
     writer = None
     total = 0.0
     try:
-        title, chapters = read_source(jobdir, job)
+        novel = None        # a web novel: read on from chapter to chapter, as the listener gets there
+        if job.get("url") and stream:
+            log(f"Fetching {job['url']}")
+            title, text, novel = read_page(job["url"])
+            if novel and job.get("skip") == "1":       # on from a chapter already heard
+                heard, novel = novel, novel_next(novel)
+                if not novel:
+                    raise JobError(f"No new chapter after {heard['label']} yet")
+                text = novel["text"]
+            chapters = [(novel["label"] if novel else title, text)]
+        else:
+            title, chapters = read_source(jobdir, job)
         _write_atomic(os.path.join(jobdir, "title"), (title or "").replace("\n", " ")[:120] + "\n")
         if job.get("meta") == "1":            # for an audiobook: who wrote it, and its cover
             src = os.path.join(jobdir, job.get("file", "in.txt"))
@@ -1351,7 +1669,16 @@ def run_job(path):
                         fh.write(cover)
         # Each chapter is split on its own, so a part never runs across chapters, and
         # where each chapter starts is written down for the player's chapter list.
-        chunks, starts = [], []
+        chunks, starts, serial = [], [], []
+        if novel:
+            try:
+                base = max(1, int(job.get("base", "1")))   # this chapter's first part, in the whole listen
+            except ValueError:
+                base = 1
+            starts, serial = _novel_listed(jobdir, base)
+            chunks = [None] * (base - 1)
+            _novel_add(jobdir, novel, chunks, starts, serial, lang, new=base == 1 or not serial)
+            chapters = []
         for heading, text in chapters:
             parts = split_text(normalise(text, lang))
             if parts:
@@ -1360,7 +1687,7 @@ def run_job(path):
                 chunks += parts
         if not chunks:
             raise JobError("No text to read")
-        if len(starts) > 1:
+        if len(starts) > 1 and not novel:
             _write_atomic(os.path.join(jobdir, "chapters"), "\n".join(starts) + "\n")
         try:
             first = int(job.get("start", "1"))
@@ -1373,17 +1700,25 @@ def run_job(path):
         if was > 1 and was != len(chunks):
             # Made with another version's parts: the same place, as a fraction of the text.
             first = 1 + round((first - 1) * len(chunks) / was)
-        if not 1 <= first <= len(chunks):
+        if novel:
+            first = max(first, int(serial[-1].split("\t", 1)[0]))   # (not before this chapter)
+        elif not 1 <= first <= len(chunks):
             first = 1   # a bookmark past the end: start again
         if stream:
             _write_atomic(os.path.join(stream, "first"), f"{first}\n")
 
-        cache = cache_dir(job.get("cache", ""), job.get("voice", "af_heart"), speed, lang)
+        # (a novel's parts aren't kept: each listen numbers them from where it began)
+        cache = None if novel else cache_dir(job.get("cache", ""), job.get("voice", "af_heart"), speed, lang)
         if cache and engine.has_timings:
             timed = True                    # kept parts carry their word timings, whatever this run shows
         chapter_at = {int(line.split("\t", 1)[0]): line.split("\t", 1)[1] for line in starts}
         chapter_times, written = [], 0
-        for i in range(first, len(chunks) + 1):
+        i = first - 1
+        while True:
+            i += 1
+            if i > len(chunks) and not (novel and (novel := _novel_more(jobdir, novel, chunks, starts,
+                                                                        serial, lang))):
+                break
             chunk, pause = chunks[i - 1]
             # The kokoro command deletes its job folder when it exits or is
             # stopped, so a vanished folder means nobody is waiting any more.
@@ -2366,7 +2701,7 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
       y=$(( y + 2 ))
     fi
     local x0=$LM
-    out '\033[%d;%dH%sContinue listening%s' "$y" "$x0" "$B" "$R"; y=$(( y + 1 ))
+    out '\033[%d;%dH%sBookshelf%s' "$y" "$x0" "$B" "$R"; y=$(( y + 1 ))
     if [ "${#marks[@]}" = 0 ]; then
       r="Nothing in progress yet. Long texts and books are remembered here."
       [ "${#r}" -gt "$CW" ] && r="Nothing in progress yet."
@@ -2377,6 +2712,10 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
       m=${marks[i]}; title="$(mark_get "$m" title)"; part="$(mark_get "$m" part)"; parts="$(mark_get "$m" parts)"
       [ "${parts:-0}" -gt 0 ] 2>/dev/null || parts=1
       pct=$(( 100 * (part - 1) / parts )); bw=12
+      if [ "$(mark_get "$m" kind)" = novel ]; then            # a web novel: the chapter it's at, and how far in
+        title="$title · Ch $(mark_get "$m" number)"
+        [ "$(mark_get "$m" "done")" = 1 ] && pct=100
+      fi
       printf -v bar '%*s' $(( pct * bw / 100 )) ''; bar="$ACC${bar// /━}$R"
       local rest; printf -v rest '%*s' $(( bw - pct * bw / 100 )) ''; bar+="$LINE${rest// /─}$R"
       local room=$(( CW - 23 )); [ "${#title}" -gt "$room" ] && title="${title:0:$(( room - 1 ))}…"
@@ -2405,8 +2744,9 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
       out '\033[%d;%dH %s%s%s  %s' "$y" "$x0" "$ACC2" "$key" "$R" "$r"
       rowact[$y]=$cmd; y=$(( y + 1 ))
     done
-    if [ "$TW" -ge 64 ]; then r="↑↓ choose · Enter play · click or tap anything · q quit"
-    else r="↑↓ · Enter play · tap · q quit"; fi
+    local novel=0; [ "${#marks[@]}" -gt 0 ] && [ "$(mark_get "${marks[sel]}" kind)" = novel ] && novel=1
+    if [ "$TW" -ge 64 ]; then r="↑↓ choose · Enter play$( [ "$novel" = 1 ] && echo " · g go to chapter") · click or tap anything · q quit"
+    else r="↑↓ · Enter play$( [ "$novel" = 1 ] && echo " · g chapter") · tap · q quit"; fi
     out '\033[%d;%dH%s%s%s' "$TH" "$LM" "$D" "$r" "$R"
     out '%s' "$SYNC_OFF"
 
@@ -2421,11 +2761,19 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
       $'\033[B'|$'\033OB'|j|$'\033[<65;'*M) [ "$sel" -lt $(( ${#marks[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
       c) cmd="clip" ;; f) cmd="file" ;; u) cmd="url" ;; t) cmd="text" ;; v) cmd="voice" ;; s|o|,) cmd="settings" ;;
       p) [ "$qn" -gt 0 ] && cmd="queue" ;;
+      g) [ "${#marks[@]}" -gt 0 ] && [ "$(mark_get "${marks[sel]}" kind)" = novel ] && cmd="chapter" ;;
       q|Q|$'\033') break ;;
       $'\033[<0;'*M) [[ "$KEY" =~ \;([0-9]+)M$ ]] && cmd="${rowact[${BASH_REMATCH[1]}]:-}" ;;
     esac
     case "$cmd" in
       mark:*)  HOME_CHOICE=(--continue "${marks[${cmd#mark:}]}"); break ;;
+      chapter)                                  # a web novel, from another chapter
+        m=${marks[sel]}
+        tui_prompt "Go to chapter:" "$(mark_get "$m" number)"
+        if [[ "$ANSWER" =~ ^[0-9]+$ ]] && chapter_url "$(mark_get "$m" source)" "$ANSWER"; then
+          HOME_CHOICE=(-p -v "$(mark_get "$m" voice)" -s "$(mark_get "$m" speed)" -l "$(mark_get "$m" lang)" -u "$CHURL")
+          break
+        fi ;;
       clip)    HOME_CHOICE=(-p -c); break ;;
       queue)   HOME_CHOICE=(--queue); break ;;
       file)    tui_prompt "File to read:"; [ -n "$ANSWER" ] && { HOME_CHOICE=(-p -f "${ANSWER/#\~/$HOME}"); break; } ;;
@@ -2836,7 +3184,7 @@ part_of() {      # PART="part I of N · " while a job has more than one part; MA
   local parts=1 made=0
   [ -f "$tmpd/progress" ] && { read -r made parts < "$tmpd/progress" || parts=1; }
   PART=""; [ "${parts:-1}" -gt 1 ] && PART="part $1 of $parts · "
-  MADE=""; [ "${parts:-1}" -gt 1 ] && [ ! -f "$tmpd/stream/end" ] && MADE="made $(( made * 100 / parts ))%"
+  MADE=""; [ "${parts:-1}" -gt 1 ] && [ ! -f "$tmpd/stream/end" ] && [ -z "$NOVEL" ] && MADE="made $(( made * 100 / parts ))%"   # (a novel: no end to measure)
   return 0
 }
 
@@ -2897,7 +3245,7 @@ view_part() {    # view_part IDX BASE: a part starts playing
     TUI_TITLE=${book_title:-$name}
     chapters_load; chapter_of "$1"
     TUI_CHAPTER=""; [ "$CH" -ge 0 ] && TUI_CHAPTER=${CH_TITLE[CH]}
-    TUI_HAS_CHAPTERS=$(( ${#CH_START[@]} > 1 ))
+    TUI_HAS_CHAPTERS=$(( ${#CH_START[@]} > 1 )); [ -n "$NOVEL" ] && TUI_HAS_CHAPTERS=1
     tui_part "$1" "$parts"
     [ "$w_state" = off ] && tui_light -1 -1
   elif [ "$show_words" = 1 ]; then
@@ -2934,7 +3282,10 @@ title_get() { [ -n "$book_title" ] || { [ -f "$tmpd/title" ] && read -r book_tit
 
 bookmark_save() {   # bookmark_save PART: so the same command, or kokoro --continue, picks up here
   local parts=1
+  echo "$1" > "$tmpd/at"                                  # (where the player is: a novel's engine waits for it)
+  novel_load
   [ -n "$book_id" ] || return 0
+  if [ -n "$NOVEL" ]; then novel_mark "$1"; return 0; fi
   [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
   [ "${parts:-1}" -gt 1 ] || return 0                     # nothing to come back to
   [ -d "$BOOKS" ] || mkdir -p "$BOOKS"
@@ -2943,8 +3294,73 @@ bookmark_save() {   # bookmark_save PART: so the same command, or kokoro --conti
     "$1" "$parts" "${book_title:-$name}" "$kind" "$source" "$voice" "$speed" "$lang" > "$BOOKS/$book_id.mark"
 }
 bookmark_done() {  # read to the end: the bookmark and the book's kept audio go
+  if [ -n "$NOVEL" ]; then                                # a novel stays on the shelf, up to date
+    local last=1
+    [ -f "$tmpd/progress" ] && { read -r _ last < "$tmpd/progress" || last=1; }
+    novel_mark "$last" "done"
+    info "You're up to date with ${book_title:-$name}: ${N_LABEL:-that} is the latest chapter."
+    printf '  %skokoro --continue carries on once the next one is out.%s\n' "$D" "$R" >&2
+    return 0
+  fi
   [ -n "$book_id" ] && rm -rf "$BOOKS/$book_id.mark" "$BOOKS/$book_id.txt" "${CACHE:?}/${book_id:?}"
   return 0
+}
+
+# ------------------------------------------------------------ web novels
+# A chapter of a web novel (the engine writes "novel" when the page is one) is
+# read on from chapter to chapter. The bookmark is the novel's: the chapter's
+# address and the part in it, so it's on the shelf (the home screen) and
+# kokoro --continue picks up in that chapter.
+NOVEL=""                                  # the novel's address, once we know it's one
+NV_URL=(); NV_NUM=()                      # each chapter of this listen: its address and number (with CH_START)
+N_URL=""; N_FIRST=1; N_NUM=""; N_LABEL=""; N_PARTS=1
+novel_load() {
+  [ -z "$NOVEL" ] && [ -f "$tmpd/novel" ] || return 0
+  NOVEL="$(mark_get "$tmpd/novel" url)"
+  [ -n "$NOVEL" ] || return 0
+  [ -n "$book_id" ] && { rmdir "$CACHE/$book_id" 2>/dev/null || true; }   # (a novel's parts aren't kept)
+  book_id="$(printf '%s' "$NOVEL" | sha256sum | cut -c1-16)"; kind=novel; skip=0
+  title_get
+}
+novel_at() {     # novel_at PART: the chapter PART is in: N_URL N_FIRST N_NUM N_LABEL, and N_PARTS (its length)
+  local k total=0
+  chapter_of "$1"; k=$CH; [ "$k" -ge 0 ] || k=0
+  N_URL=${NV_URL[k]:-$url} N_FIRST=${CH_START[k]:-1} N_NUM=${NV_NUM[k]:-} N_LABEL=${CH_TITLE[k]:-}
+  if [ $(( k + 1 )) -lt "${#CH_START[@]}" ]; then N_PARTS=$(( CH_START[k + 1] - N_FIRST ))
+  else
+    [ -f "$tmpd/progress" ] && { read -r _ total < "$tmpd/progress" || total=0; }
+    N_PARTS=$(( ${total:-0} - N_FIRST + 1 ))
+  fi
+  [ "$N_PARTS" -gt 0 ] || N_PARTS=1
+  return 0
+}
+novel_mark() {   # novel_mark PART [done]: the novel's bookmark (done: heard to the latest chapter)
+  chapters_load; novel_at "$1"
+  [ -d "$BOOKS" ] || mkdir -p "$BOOKS"
+  {
+    printf 'part=%s\nparts=%s\ntitle=%s\nkind=novel\nsource=%s\nchapter=%s\nnumber=%s\nnovel=%s\n' \
+      $(( $1 - N_FIRST + 1 )) "$N_PARTS" "${book_title:-$name}" "$N_URL" "$N_LABEL" "$N_NUM" "$NOVEL"
+    printf 'voice=%s\nspeed=%s\nlang=%s\n' "$voice" "$speed" "$lang"
+    [ -z "${2:-}" ] || echo "done=1"
+  } > "$BOOKS/$book_id.mark"
+}
+novel_go() {     # novel_go URL: start the novel again at another chapter
+  book_id=""                              # (the new run keeps the bookmark from here)
+  trap - EXIT; cleanup
+  exec "$0" -p -v "$voice" -s "$speed" -l "$lang" -u "$1"
+}
+novel_pick() {   # novel_pick PART: go to a chapter by its number
+  local n k
+  chapter_of "$1"
+  tui_prompt "Go to chapter:" "${NV_NUM[CH]:-}"
+  n=$ANSWER
+  if [[ "$n" =~ ^[0-9]+$ ]]; then
+    for k in "${!NV_NUM[@]}"; do
+      if [ "${NV_NUM[k]}" = "$n" ]; then JUMP=${CH_START[k]}; tui_draw; return 0; fi   # (made already)
+    done
+    if chapter_url "${NV_URL[0]:-$url}" "$n"; then novel_go "$CHURL"; fi
+  fi
+  tui_draw
 }
 
 # The notification: what's playing, with pause / next / again buttons that run
@@ -2965,12 +3381,15 @@ notify_clear() {
   return 0
 }
 
-# Chapters (EPUBs): where each starts, read once the engine writes them.
+# Chapters (EPUBs, web novels): where each starts, from the engine.
 CH_START=(); CH_TITLE=()
-chapters_load() {
-  [ "${#CH_START[@]}" -gt 0 ] || [ ! -f "$tmpd/chapters" ] && return 0
-  local n t
+chapters_load() {   # (read again each time: a novel's chapters arrive as it's heard)
+  [ -f "$tmpd/chapters" ] || return 0
+  local n t u
+  CH_START=(); CH_TITLE=(); NV_NUM=(); NV_URL=()
   while IFS=$'\t' read -r n t; do CH_START+=("$n"); CH_TITLE+=("$t"); done < "$tmpd/chapters"
+  [ -f "$tmpd/serial" ] || return 0
+  while IFS=$'\t' read -r n t u; do NV_NUM+=("$t"); NV_URL+=("$u"); done < "$tmpd/serial"
 }
 chapter_of() {   # chapter_of PART: CH = the index of the chapter PART is in (-1: none)
   local k; CH=-1
@@ -3030,7 +3449,7 @@ jump_to() {      # jump_to PART
   mpv_stop
   if [ -n "$gen_pid" ]; then kill "$gen_pid" 2>/dev/null || true; wait "$gen_pid" 2>/dev/null || true; gen_pid=""; fi
   tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
-  for f in in.txt title chapters; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
+  for f in in.txt title chapters serial novel; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
   rm -rf "$old"
   start=$target; i=$target; was_parts=0          # (a part in this run's own numbering)
   write_job
@@ -3048,10 +3467,10 @@ speed_now() {    # speed_now PART: (while PART plays) $speed from this moment on
   mpv_send '"playlist-clear"'                   # (the parts queued after it were made at the old speed)
   MPV_IDX=(["$at"]=0); MPV_PART=("$at"); MPV_SPD=("${MPV_SPD[idx]}"); MPV_N=1; MPV_POS=0; MPV_MAX=0
   [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=0; }
-  if [ "${parts:-0}" -gt "$at" ]; then
+  if [ "${parts:-0}" -gt "$at" ] || { [ -n "$NOVEL" ] && [ ! -f "$tmpd/stream/end" ]; }; then   # (a novel: more may come)
     if [ -n "$gen_pid" ]; then kill "$gen_pid" 2>/dev/null || true; wait "$gen_pid" 2>/dev/null || true; gen_pid=""; fi
     tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
-    for f in in.txt title chapters progress; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
+    for f in in.txt title chapters serial novel progress; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
     mkdir "$tmpd/stream"
     for (( n = at > 40 ? at - 40 : 1; n <= at; n++ )); do   # this part and the ones on screen above it
       printf -v f '%s/stream/%04d' "$old" "$n"
@@ -3081,13 +3500,17 @@ listen_cmd() {   # listen_cmd CMD PART
       if [ "$in_line" = 1 ]; then speed_now "$at"; else JUMP=$at; fi ;;
     sleep) sleep_cycle ;;
     chapters)
+      if [ -n "$NOVEL" ] && [ "$ui" = tui ]; then novel_pick "$at"; return 0; fi
       [ "${#CH_START[@]}" -gt 1 ] && [ "$ui" = tui ] || return 0
       chapter_of "$at"; tui_chapters "$CH"
       [ -n "$CHOSEN" ] && JUMP=${CH_START[CHOSEN]} ;;
     next_chapter) chapter_of "$at"; [ $(( CH + 1 )) -lt "${#CH_START[@]}" ] && JUMP=${CH_START[CH + 1]} ;;
     prev_chapter) chapter_of "$at"
                   if [ "$CH" -ge 0 ] && [ "$at" -gt "${CH_START[CH]}" ]; then JUMP=${CH_START[CH]}   # start of this one
-                  elif [ "$CH" -gt 0 ]; then JUMP=${CH_START[CH - 1]}; fi ;;
+                  elif [ "$CH" -gt 0 ]; then JUMP=${CH_START[CH - 1]}
+                  elif [ -n "$NOVEL" ]; then                 # before this listen's first chapter
+                    t="$(mark_get "$tmpd/novel" prev)"; [ -n "$t" ] && novel_go "$t"
+                  fi ;;
     seek:*) JUMP=${cmd#seek:} ;;
     menu)                                       # the menu: some choices are the player's to carry out
       [ "$ui" = tui ] || return 0
@@ -3545,7 +3968,7 @@ path-exclude=/usr/share/locale/*
 path-include=/usr/share/locale/locale.alias
 CFG
     apt-get update
-    apt-get install -y --no-install-recommends python3 python3-venv ca-certificates
+    apt-get install -y --no-install-recommends python3 python3-venv ca-certificates curl
     ;;
   pip)
     mkdir -p "$APP"
@@ -3592,7 +4015,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
 # in player.sh, the colours in theme.sh (all three loaded below).
 set -euo pipefail
 
-KOKOMUX_VERSION="0.16.0"
+KOKOMUX_VERSION="0.17.0"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -3858,6 +4281,12 @@ control() {
 
 # Bookmarks: where a long text was stopped, as key=value lines.
 mark_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1; }
+chapter_url() {  # chapter_url URL N: CHURL = chapter N's address, where a novel's addresses count chapters (…/chapter-5)
+  local u=${1%%[?#]*}
+  u=${u%/}; CHURL=""
+  [[ "$u" =~ ^(.*/[^/]*[Cc][Hh][Aa][Pp][Tt][Ee][Rr][-_]?)([0-9]+)([^/]*)$ ]] || return 1
+  CHURL="${BASH_REMATCH[1]}$2${BASH_REMATCH[3]}"
+}
 
 stop_playback() {
   local pid
@@ -4009,7 +4438,7 @@ case "${1:-}" in
     [ -n "$last" ] || last="$(ls -t "$BOOKS"/*.mark 2>/dev/null | head -n 1)" || true
     [ -n "$last" ] || die "There's nothing to continue." "A bookmark is kept when you stop a long text partway."
     case "$(mark_get "$last" kind)" in
-      url)  src=(-u "$(mark_get "$last" source)") ;;
+      url|novel) src=(-u "$(mark_get "$last" source)") ;;
       text) src=(-f "${last%.mark}.txt") ;;
       *)    src=(-f "$(mark_get "$last" source)")
             [ -f "${src[1]}" ] || die "Can't find \"${src[1]}\" any more." "Has the file moved? Open it again with kokoro -p -f." ;;
@@ -4059,8 +4488,9 @@ case "${1:-}" in
     printf '    Idle stop %s\n' "$idle"
     last="$(ls -t "$BOOKS"/*.mark 2>/dev/null | head -n 1)" || true
     if [ -n "$last" ]; then
-      printf '    Bookmark  %s %s(part %s of %s · kokoro --continue)%s\n' "$(mark_get "$last" title)" "$D" \
-        "$(mark_get "$last" part)" "$(mark_get "$last" parts)" "$R"
+      where="part $(mark_get "$last" part) of $(mark_get "$last" parts)"
+      [ "$(mark_get "$last" kind)" = novel ] && where="$(mark_get "$last" chapter)"
+      printf '    Bookmark  %s %s(%s · kokoro --continue)%s\n' "$(mark_get "$last" title)" "$D" "$where" "$R"
     fi
     printf '    Settings  %s%s%s\n' "$D" "$(tilde "$CONF")" "$R"
     printf '    %sChange them with: kokoro --settings%s\n' "$D" "$R"
@@ -4180,7 +4610,11 @@ cleanup() {
   keys_off
   if [ "${ui:-none}" != none ] && [ -n "${book_id:-}" ] && [ -f "$BOOKS/$book_id.mark" ]; then
     [ "${SLEPT:-0}" = 1 ] && info "Sleep timer: good night."
-    info "Stopped at part $(mark_get "$BOOKS/$book_id.mark" part) of $(mark_get "$BOOKS/$book_id.mark" parts). ${D}kokoro --continue picks up there.${R}"
+    if [ "$(mark_get "$BOOKS/$book_id.mark" kind)" = novel ]; then
+      info "Stopped in $(mark_get "$BOOKS/$book_id.mark" chapter). ${D}kokoro --continue picks up there.${R}"
+    else
+      info "Stopped at part $(mark_get "$BOOKS/$book_id.mark" part) of $(mark_get "$BOOKS/$book_id.mark" parts). ${D}kokoro --continue picks up there.${R}"
+    fi
   fi
   if [ "${play:-0}" = 1 ]; then notify_clear; rm -f "$PLAYER_STATE"; fi
   mpv_quit
@@ -4252,9 +4686,21 @@ if { [ "$play" = 1 ] && [ -z "$out" ]; } || [ "$ext" = m4b ]; then   # (an audio
   if [ "$kind" = url ]; then book_id="$(printf '%s' "$url" | sha256sum | cut -c1-16)"
   else book_id="$(sha256sum < "$text" | cut -c1-16)"; fi
 fi
+skip=0
 if [ "$play" = 1 ] && [ -z "$out" ]; then
+  # A web novel's chapter: its bookmark is the novel's, which names the chapter it's at.
+  if [ "$kind" = url ]; then
+    mark="$(grep -lFx "source=$url" "$BOOKS"/*.mark 2>/dev/null | head -n 1)" || true
+    if [ -n "$mark" ] && [ "$(mark_get "$mark" kind)" = novel ]; then book_id="$(basename "$mark" .mark)"; fi
+  fi
   mark="$BOOKS/$book_id.mark"
-  if [ "$restart" = 1 ]; then rm -f "$mark" "$BOOKS/$book_id.txt"
+  if [ "$restart" = 1 ]; then [ "$(mark_get "$mark" kind)" = novel ] || rm -f "$mark" "$BOOKS/$book_id.txt"
+  elif [ "$(mark_get "$mark" "done")" = 1 ]; then          # heard to the latest chapter: on to the next
+    skip=1; info "On from $(mark_get "$mark" chapter)."
+  elif [ "$(mark_get "$mark" kind)" = novel ] && [ "$(mark_get "$mark" part)" -gt 1 ] 2>/dev/null; then
+    start="$(mark_get "$mark" part)"; was_parts="$(mark_get "$mark" parts)"
+    [[ "$was_parts" =~ ^[0-9]+$ ]] || was_parts=0
+    info "Picking up in $(mark_get "$mark" chapter), where you stopped."
   elif [ -f "$mark" ] && [ "$(mark_get "$mark" part)" -gt 1 ] 2>/dev/null; then
     start="$(mark_get "$mark" part)"; was_parts="$(mark_get "$mark" parts)"
     [[ "$was_parts" =~ ^[0-9]+$ ]] && [ "$was_parts" -gt 0 ] || was_parts=0
@@ -4276,11 +4722,16 @@ if [ "$play" = 1 ] && [ "$LIVE" = 1 ]; then
 fi
 
 write_job() {    # the job, for the engine (where it starts and how fast can change mid-listen)
+  local u=$url b=1
+  if [ -n "${NOVEL:-}" ]; then chapters_load; novel_at "$start"; u=$N_URL; b=$N_FIRST; fi   # (the chapter it's in)
+  echo "$start" > "$tmpd/at"
   {
     echo "voice=$voice"
     echo "speed=$speed"
     echo "lang=$lang"
-    [ -n "$url" ] && echo "url=$url"
+    [ -n "$u" ] && echo "url=$u"
+    [ "$b" -gt 1 ] && echo "base=$b"           # where that chapter starts in this listen
+    [ "$skip" = 1 ] && echo "skip=1"          # on from the chapter at url
     echo "name=$name"
     [ "$start" -gt 1 ] && echo "start=$start"
     [ "$was_parts" -gt 0 ] && echo "of=$was_parts"   # the bookmark's count: the engine maps it if its parts differ

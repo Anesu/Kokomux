@@ -30,6 +30,15 @@ parts"), `out.<ext>` and `chapters_ms` when saving, and with stream=1
 `stream/NNNN.wav` (its audio, with the pause after it; written last), `stream/first`
 (where it began) and `stream/end` once everything is made. With a cache, the
 stream files are relative links into it.
+
+A web novel's chapter (url, with stream=1) is read on from chapter to chapter:
+the engine fetches the next one when the player reaches the last one made (the
+player writes the part it's on into `at`). It writes `novel` (title=, url=,
+prev=: the chapter before this listen's first) and `serial` ("first-part<TAB>
+number<TAB>address", in step with `chapters`). Parts are numbered across the
+whole listen; a job that picks up mid-listen says where its chapter starts
+(base=N) and has the earlier `chapters` and `serial` lines in its folder.
+skip=1 starts at the chapter after the one at url.
 """
 import argparse
 import hmac
@@ -60,7 +69,8 @@ VOICES_SRC = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/mode
 SERVER_DIR = "/tmp/kokoro-server"
 JOB_DIR_RE = re.compile(r"^/tmp/kokoro\.[A-Za-z0-9]+$")
 FORMATS = ("wav", "mp3", "ogg", "flac")
-USER_AGENT = "Mozilla/5.0 (Linux; Android) kokomux"
+# A phone browser's: some sites (behind Cloudflare, say) turn other clients away.
+USER_AGENT = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36"
 MAX_CHUNK = 360  # characters per part: whole sentences, under Kokoro's 510 sounds
 SERVING = False
 
@@ -453,23 +463,47 @@ class _ChapterText(HTMLParser):
         return "\n".join(use)
 
 
-def fetch_url(url):
-    """A web page's (title, readable text)."""
+class NotFound(JobError):
+    """The address answered 404: no such page (a chapter that isn't out yet)."""
+
+
+def fetch(url):
+    """Fetch a web page with curl, as a phone browser would: (content type, text)."""
+    import subprocess
+    import tempfile
     if not re.match(r"^https?://", url):
         raise JobError(f"Not a web address: {url}")
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            ctype = r.headers.get_content_type()
-            charset = r.headers.get_content_charset() or "utf-8"
-            body = r.read(5_000_000).decode(charset, errors="replace")
-    except Exception as e:  # noqa: BLE001 - report any network error plainly
-        raise JobError(f"Couldn't fetch {url}: {e}") from e
+    with tempfile.NamedTemporaryFile(prefix="kokomux-page.") as tmp:
+        r = subprocess.run(["curl", "-sS", "-L", "--compressed", "--max-time", "30", "--max-filesize", "5000000",
+                            "-A", USER_AGENT, "-o", tmp.name, "-w", "%{http_code}\t%{content_type}", url],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise JobError(f"Couldn't fetch {url}: {r.stderr.strip() or f'curl error {r.returncode}'}")
+        code, _, ctype = r.stdout.partition("\t")
+        raw = tmp.read()
+    m = re.search(r"charset=([\w-]+)", ctype)
+    body = raw.decode(m.group(1) if m else "utf-8", errors="replace")
+    if code == "404":
+        raise NotFound(f"There's no page at {url}")
+    if re.search(r"<title>\s*Just a moment", body[:3000]):
+        raise JobError("That site wants a browser check (Cloudflare) before it shows the page")
+    if not code.startswith("2"):
+        raise JobError(f"Couldn't fetch {url}: the site answered {code}")
+    return ctype.split(";")[0].strip().lower(), body
+
+
+def read_page(url):
+    """A web page: (title, text, chapter), where chapter has a novel chapter's details, or is None."""
+    ctype, body = fetch(url)
     if ctype == "text/plain":
-        return url, body
+        return url, body, None
     if "html" not in ctype and "xml" not in ctype:
         raise JobError(f"That link is {ctype}, not a web page")
-    return page_text(body, url)
+    chapter = novel_chapter(body, url)
+    if chapter:
+        return chapter["novel"], chapter["text"], chapter
+    title, text = page_text(body, url)
+    return title, text, None
 
 
 # Where an article ends: from a heading like these on it's links, not reading.
@@ -483,11 +517,24 @@ def page_text(html, url):
     """A web page's (title, text to read), found by trafilatura: the article, not the menus,
     sidebars, ads or comments, and stopping where the links start ("See also", "Recent posts")."""
     import trafilatura
+    text = "\n".join(article_lines(html, url))
+    if len(text.split()) < 5:                # a menu or a "Home" link is not an article
+        raise JobError("Couldn't find any readable text on that page")
+    meta = trafilatura.extract_metadata(html, default_url=url)
+    title = (meta.title if meta is not None and meta.title else "") or url
+    short = title.split(" - ")[0].split(" | ")[0].strip()
+    if short and short not in text.split("\n", 1)[0]:
+        text = f"{short}.\n{text}"           # say what it is first
+    return title, text
+
+
+def article_lines(html, url):
+    """The article on a page, as lines (paragraphs), by trafilatura."""
+    import trafilatura
     # Two line breaks in a row are a paragraph break (older pages lay text out that way).
     html = re.sub(r"(?i)(?:<br\s*/?>\s*){2,}", "</p><p>", html)
     md = trafilatura.extract(html, url=url, output_format="markdown", include_comments=False,
                              include_images=False, include_links=False, include_tables=False) or ""
-    meta = trafilatura.extract_metadata(html, default_url=url)
     lines = []
     for line in md.splitlines():
         line = re.sub(r"<[^>]+>", "", line.replace("\\", "")).strip()       # markdown escapes, stray tags
@@ -502,14 +549,219 @@ def page_text(html, url):
         line = re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", line)         # list items
         if line and line != "[edit]":
             lines.append(line)
-    text = "\n".join(lines)
-    if len(text.split()) < 5:                # a menu or a "Home" link is not an article
-        raise JobError("Couldn't find any readable text on that page")
-    title = (meta.title if meta is not None and meta.title else "") or url
-    short = title.split(" - ")[0].split(" | ")[0].strip()
-    if short and short not in text.split("\n", 1)[0]:
-        text = f"{short}.\n{text}"           # say what it is first
-    return title, text
+    return lines
+
+
+# ------------------------------------------------------------------ novels
+# A chapter page of a web novel (freewebnovel.com and the like): the novel's
+# title, the chapter's number and title, its text, and the links to the
+# chapters either side. Listening goes on from chapter to chapter.
+
+CHAPTER_RE = re.compile(r"(?i)\b(?:chapter|chap\.?|ch\.)\s*(\d+)")
+CHAPTER_URL_RE = re.compile(r"(?i)chapter[-_]?(\d+)")
+# Where novel sites put the chapter's text.
+_TEXT_IDS = {"article", "chapter-content", "chr-content", "chapter-c", "chaptercontent", "content", "booktxt"}
+_TEXT_CLASSES = {"txt", "chapter-content", "chr-c", "reading-content", "chapter-body", "text-left", "entry-content",
+                 "chapter-inner", "read-content"}
+_NAV_LINE = re.compile(r"(?i)^(?:<<|>>|«|»)?\s*(?:prev(?:ious)?|next)(?: chapter)?\s*(?:<<|>>|«|»)?$|"
+                       r"^(?:index|table of contents|chapter list|report( chapter)?|bookmark|comments?)$")
+
+
+class _ChapterPage(HTMLParser):
+    """Reads what a chapter page says about itself: title, headings, links and the chapter's text."""
+    SKIP = {"script", "style", "noscript", "button", "select"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.title, self.site, self.heads, self.links, self.rel = "", "", [], [], {}
+        self.paras, self._text_depth, self._depth, self._skip = [], 0, 0, 0
+        self._tag, self._buf, self._a, self._para = None, [], None, []
+
+    def handle_starttag(self, tag, attrs):
+        a = {k: (v or "") for k, v in attrs}
+        if tag in self.SKIP:
+            self._skip += 1
+        if tag in ("title", "h1", "h2", "h3"):
+            self._tag, self._buf = tag, []
+        elif tag == "meta" and a.get("property") == "og:site_name":
+            self.site = a.get("content", "")
+        elif tag == "link" and a.get("rel", "").lower() in ("next", "prev", "previous"):
+            self.rel.setdefault(a["rel"].lower()[:4], a.get("href", ""))
+        elif tag == "a":
+            self._a = {"href": a.get("href", ""), "rel": a.get("rel", "").lower(), "text": [],
+                       "meta": " ".join((a.get("id", ""), a.get("class", ""), a.get("title", ""))).lower()}
+        if tag in ("div", "article", "section", "main", "td"):
+            self._depth += 1
+            ident = a.get("id", "").lower()
+            classes = set(a.get("class", "").lower().split())
+            if not self._text_depth and (ident in _TEXT_IDS or classes & _TEXT_CLASSES):
+                self._text_depth = self._depth
+        if self._text_depth and tag in ("p", "br", "div"):
+            self._end_para()
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP and self._skip:
+            self._skip -= 1
+        if tag == self._tag:
+            text = " ".join("".join(self._buf).split())
+            if tag == "title":
+                self.title = self.title or text
+            elif text:
+                self.heads.append(text)
+            self._tag = None
+        elif tag == "a" and self._a is not None:
+            self._a["text"] = " ".join("".join(self._a["text"]).split()).lower()
+            self.links.append(self._a)
+            self._a = None
+        if self._text_depth and tag in ("p", "div", "article", "section", "main", "td"):
+            self._end_para()
+        if tag in ("div", "article", "section", "main", "td"):
+            if self._text_depth == self._depth:
+                self._text_depth = 0
+            self._depth -= 1
+
+    def handle_data(self, data):
+        if self._tag:
+            self._buf.append(data)
+        if self._a is not None:
+            self._a["text"].append(data)
+        if self._text_depth and not self._skip:
+            self._para.append(data)
+
+    def _end_para(self):
+        text = " ".join("".join(self._para).split())
+        if text:
+            self.paras.append(text)
+        self._para = []
+
+
+def novel_url_of(url):
+    """The novel a chapter belongs to: its address up to the "chapter…" part of the path
+    (or without the last part). kokomux keeps one bookmark per novel, by this."""
+    u = urllib.parse.urlsplit(url)
+    parts = [p for p in u.path.split("/") if p]
+    for k, p in enumerate(parts):
+        if p.lower().startswith(("chapter", "chap-", "ch-")):
+            parts = parts[:k]
+            break
+    else:
+        parts = parts[:-1]
+    return urllib.parse.urlunsplit((u.scheme, u.netloc, "/" + "/".join(parts), "", ""))
+
+
+def chapter_address(url, number):
+    """The address of chapter NUMBER of the novel URL is a chapter of, where its address
+    counts chapters (…/chapter-5); None where it doesn't."""
+    u = urllib.parse.urlsplit(url)
+    head, _, last = u.path.rstrip("/").rpartition("/")
+    if not CHAPTER_URL_RE.search(last):
+        return None
+    last = CHAPTER_URL_RE.sub(lambda m: m.group(0)[:-len(m.group(1))] + str(number), last, count=1)
+    return urllib.parse.urlunsplit((u.scheme, u.netloc, f"{head}/{last}", "", ""))
+
+
+def _nav_link(page, url, novel_url, word):
+    """The link to the next (or previous) chapter: rel=next, or a link that says so."""
+    host = urllib.parse.urlsplit(url).netloc
+    best, score = None, 0
+    cands = [{"href": page.rel.get(word, ""), "rel": word, "text": "", "meta": ""}] + page.links
+    for a in cands:
+        href = urllib.parse.urljoin(url, a["href"]).split("#")[0]
+        if not a["href"] or not href.startswith("http") or urllib.parse.urlsplit(href).netloc != host:
+            continue
+        if href.rstrip("/") in (url.split("#")[0].rstrip("/"), novel_url.rstrip("/")):
+            continue
+        said = f"{a['text']} {a['meta']}"
+        if word == "prev":
+            says = re.search(r"\bprev|previous|prev_|prevchap", said)
+        else:
+            says = re.search(r"\bnext|next_|nextchap", said)
+        n = (3 if word in a["rel"] else 0) + (2 if says else 0)
+        if n == 0:
+            continue
+        n += 1 if CHAPTER_URL_RE.search(href) or "chapter" in href.lower() else 0
+        if n > score:
+            best, score = href, n
+    return best
+
+
+def novel_chapter(html, url):
+    """A novel's chapter page, read: a dict with novel (its title), novel_url, label
+    ("Chapter 5: Weapon Haggling"), number, text (to speak: the label, then the chapter),
+    next and prev (addresses or None), and guessed (next was worked out from the address,
+    not linked). None if the page isn't a chapter of something."""
+    page = _ChapterPage()
+    try:
+        page.feed(html)
+        page.close()
+    except Exception:  # noqa: BLE001 - a page this parser can't follow isn't a chapter page to us
+        return None
+    last = urllib.parse.urlsplit(url).path.rstrip("/").rpartition("/")[2]
+    m_url = CHAPTER_URL_RE.search(last)
+    # The page title: "Novel - Chapter 5: Title | Site", or "Chapter 5 - Novel - Site".
+    parts = [p.strip() for p in re.split(r"\s+\|\s+", page.title) if p.strip()]
+    with_ch = [p for p in parts if CHAPTER_RE.search(p)]
+    novel, label = "", ""
+    if with_ch:
+        t = with_ch[0]
+        m = CHAPTER_RE.search(t)
+        novel, label = t[:m.start()].strip(" -–—:|"), t[m.start():].strip()
+        if not novel:
+            bits = re.split(r"\s+[-–—]\s+", label)
+            label, novel = bits[0], (bits[1] if len(bits) > 1 else "")
+    for h in page.heads:                       # a heading names the chapter better than the title
+        if CHAPTER_RE.search(h) and len(h) < 150 and (not label or len(h) >= len(label)):
+            label = h if not novel or not h.startswith(novel) else h[len(novel):].strip(" -–—:|")
+            break
+    number = int(CHAPTER_RE.search(label).group(1)) if CHAPTER_RE.search(label) else (
+        int(m_url.group(1)) if m_url else None)
+    if number is None:
+        return None
+    novel_url = novel_url_of(url)
+    if not novel:
+        novel = next((h for h in page.heads if not CHAPTER_RE.search(h)), "") or \
+            urllib.parse.urlsplit(novel_url).path.rstrip("/").rpartition("/")[2].replace("-", " ").title()
+    label = label or f"Chapter {number}"
+    nxt, prev = _nav_link(page, url, novel_url, "next"), _nav_link(page, url, novel_url, "prev")
+    guessed = False
+    if not nxt:
+        nxt, guessed = chapter_address(url, number + 1), True
+    if not (nxt or prev or m_url):
+        return None
+
+    # The text: from where these sites keep it, else whatever trafilatura finds.
+    lines = page.paras if len(" ".join(page.paras).split()) >= 50 else article_lines(html, url)
+    site = re.sub(r"[^a-z0-9]", "", (page.site or urllib.parse.urlsplit(url).netloc.split(".")[-2]).lower())
+    names = {re.sub(r"\W", "", x.lower()) for x in (label, novel, f"chapter {number}")}
+    keep = []
+    for k, line in enumerate(lines):
+        bare = re.sub(r"\W", "", line.lower())
+        if k < 4 and not keep and (bare in names or (CHAPTER_RE.match(line.strip()) and len(line) < 100)):
+            continue                                   # the heading again (it's said first anyway)
+        if site and len(site) > 4 and site in bare:
+            continue                                   # "Read the latest chapters at freewebnovel.com"
+        if _NAV_LINE.match(line.strip()):
+            continue
+        keep.append(line)
+    if len(" ".join(keep).split()) < 20:
+        return None
+    said = label if re.search(r"[.!?:…]$", label) else label + "."
+    return {"novel": novel, "novel_url": novel_url, "url": url, "label": label, "number": number,
+            "text": said + "\n" + "\n".join(keep), "next": nxt, "prev": prev, "guessed": guessed}
+
+
+def novel_next(chapter):
+    """The chapter after this one, read, or None if there isn't one (yet)."""
+    if not chapter.get("next"):
+        return None
+    try:
+        _, html = fetch(chapter["next"])
+    except NotFound:
+        return None
+    nxt = novel_chapter(html, chapter["next"])
+    if not nxt or nxt["novel_url"] != chapter["novel_url"] or nxt["number"] <= chapter["number"]:
+        return None                                    # the "next" link left the novel, or went back
+    return nxt
 
 
 # ------------------------------------------------------------------ books
@@ -624,8 +876,8 @@ def read_source(jobdir, job):
     name = job.get("name", "")
     if job.get("url"):
         log(f"Fetching {job['url']}")
-        title, text = fetch_url(job["url"])
-        return title, [(title, text)]
+        title, text, chapter = read_page(job["url"])
+        return title, [(chapter["label"] if chapter else title, text)]
     file = job.get("file", "in.txt")
     if "/" in file:
         raise JobError(f"Bad input file name: {file}")
@@ -735,6 +987,61 @@ def silence(seconds, rate):
     return np.zeros(max(0, int(seconds * rate)), dtype=np.float32)
 
 
+def _novel_listed(jobdir, base):
+    """The chapters already in this listen, before part BASE: (chapters lines, serial lines).
+    (A jump or a new speed starts a new job folder, with these copied into it.)"""
+    got = []
+    for name in ("chapters", "serial"):
+        try:
+            with open(os.path.join(jobdir, name), encoding="utf-8") as fh:
+                got.append([ln.rstrip("\n") for ln in fh if ln.strip() and int(ln.split("\t", 1)[0]) < base])
+        except (OSError, ValueError):
+            got.append([])
+    if len(got[0]) != len(got[1]):
+        return [], []
+    return got[0], got[1]
+
+
+def _novel_add(jobdir, chapter, chunks, starts, serial, lang, new=False):
+    """Add a novel's chapter to the listen: its parts, and where it starts in the chapter
+    list (chapters: "first<TAB>label") and the novel's (serial: "first<TAB>number<TAB>address")."""
+    parts = split_text(normalise(chapter["text"], lang))
+    if not parts:
+        return
+    parts[-1] = (parts[-1][0], PAUSE["chapter"])
+    first = len(chunks) + 1
+    starts.append(f"{first}\t{chapter['label'].replace(chr(9), ' ')[:80]}")
+    serial.append(f"{first}\t{chapter['number']}\t{chapter['url']}")
+    chunks += parts
+    _write_atomic(os.path.join(jobdir, "chapters"), "\n".join(starts) + "\n")
+    _write_atomic(os.path.join(jobdir, "serial"), "\n".join(serial) + "\n")
+    if new:                                     # the novel, and the chapter before this listen's first
+        _write_atomic(os.path.join(jobdir, "novel"),
+                      f"title={chapter['novel']}\nurl={chapter['novel_url']}\nprev={chapter['prev'] or ''}\n")
+
+
+def _novel_more(jobdir, chapter, chunks, starts, serial, lang):
+    """The next chapter, added once the listener has reached the last one made (so one
+    chapter is always ready ahead, and no more). None at the end of what's out."""
+    last = int(serial[-1].split("\t", 1)[0]) if serial else 0
+    while True:
+        if not os.path.isdir(jobdir):
+            raise JobError("Cancelled")
+        try:
+            with open(os.path.join(jobdir, "at")) as fh:
+                at = int(fh.read().strip() or 0)
+        except (OSError, ValueError):
+            at = 0
+        if at >= last:
+            break
+        time.sleep(0.5)
+    log(f"Fetching {chapter['next']}")
+    nxt = novel_next(chapter)
+    if nxt:
+        _novel_add(jobdir, nxt, chunks, starts, serial, lang)
+    return nxt
+
+
 def run_job(path):
     import numpy as np
     import soundfile as sf
@@ -773,7 +1080,18 @@ def run_job(path):
     writer = None
     total = 0.0
     try:
-        title, chapters = read_source(jobdir, job)
+        novel = None        # a web novel: read on from chapter to chapter, as the listener gets there
+        if job.get("url") and stream:
+            log(f"Fetching {job['url']}")
+            title, text, novel = read_page(job["url"])
+            if novel and job.get("skip") == "1":       # on from a chapter already heard
+                heard, novel = novel, novel_next(novel)
+                if not novel:
+                    raise JobError(f"No new chapter after {heard['label']} yet")
+                text = novel["text"]
+            chapters = [(novel["label"] if novel else title, text)]
+        else:
+            title, chapters = read_source(jobdir, job)
         _write_atomic(os.path.join(jobdir, "title"), (title or "").replace("\n", " ")[:120] + "\n")
         if job.get("meta") == "1":            # for an audiobook: who wrote it, and its cover
             src = os.path.join(jobdir, job.get("file", "in.txt"))
@@ -785,7 +1103,16 @@ def run_job(path):
                         fh.write(cover)
         # Each chapter is split on its own, so a part never runs across chapters, and
         # where each chapter starts is written down for the player's chapter list.
-        chunks, starts = [], []
+        chunks, starts, serial = [], [], []
+        if novel:
+            try:
+                base = max(1, int(job.get("base", "1")))   # this chapter's first part, in the whole listen
+            except ValueError:
+                base = 1
+            starts, serial = _novel_listed(jobdir, base)
+            chunks = [None] * (base - 1)
+            _novel_add(jobdir, novel, chunks, starts, serial, lang, new=base == 1 or not serial)
+            chapters = []
         for heading, text in chapters:
             parts = split_text(normalise(text, lang))
             if parts:
@@ -794,7 +1121,7 @@ def run_job(path):
                 chunks += parts
         if not chunks:
             raise JobError("No text to read")
-        if len(starts) > 1:
+        if len(starts) > 1 and not novel:
             _write_atomic(os.path.join(jobdir, "chapters"), "\n".join(starts) + "\n")
         try:
             first = int(job.get("start", "1"))
@@ -807,17 +1134,25 @@ def run_job(path):
         if was > 1 and was != len(chunks):
             # Made with another version's parts: the same place, as a fraction of the text.
             first = 1 + round((first - 1) * len(chunks) / was)
-        if not 1 <= first <= len(chunks):
+        if novel:
+            first = max(first, int(serial[-1].split("\t", 1)[0]))   # (not before this chapter)
+        elif not 1 <= first <= len(chunks):
             first = 1   # a bookmark past the end: start again
         if stream:
             _write_atomic(os.path.join(stream, "first"), f"{first}\n")
 
-        cache = cache_dir(job.get("cache", ""), job.get("voice", "af_heart"), speed, lang)
+        # (a novel's parts aren't kept: each listen numbers them from where it began)
+        cache = None if novel else cache_dir(job.get("cache", ""), job.get("voice", "af_heart"), speed, lang)
         if cache and engine.has_timings:
             timed = True                    # kept parts carry their word timings, whatever this run shows
         chapter_at = {int(line.split("\t", 1)[0]): line.split("\t", 1)[1] for line in starts}
         chapter_times, written = [], 0
-        for i in range(first, len(chunks) + 1):
+        i = first - 1
+        while True:
+            i += 1
+            if i > len(chunks) and not (novel and (novel := _novel_more(jobdir, novel, chunks, starts,
+                                                                        serial, lang))):
+                break
             chunk, pause = chunks[i - 1]
             # The kokoro command deletes its job folder when it exits or is
             # stopped, so a vanished folder means nobody is waiting any more.

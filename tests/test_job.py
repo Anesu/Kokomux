@@ -44,12 +44,13 @@ class FakeKokoro:
         return np.full(len(text) * PER_CHAR, 0.5, dtype=np.float32), RATE
 
 
-def run(text, *, stream=True, out=None, g2p=None, **job):
-    """Run a job with FakeKokoro; return (jobdir, fake)."""
-    jobdir = f"/tmp/kokoro.{secrets.token_hex(6)}"          # as kokoro names them (the engine checks)
+def run(text, *, stream=True, out=None, g2p=None, jobdir=None, files=None, **job):
+    """Run a job with FakeKokoro; return (jobdir, fake). FILES: more files for the job folder."""
+    jobdir = jobdir or f"/tmp/kokoro.{secrets.token_hex(6)}"          # as kokoro names them (the engine checks)
     os.mkdir(jobdir)
-    with open(os.path.join(jobdir, "in.txt"), "w") as f:
-        f.write(text)
+    for name, content in {"in.txt": text, **(files or {})}.items():
+        with open(os.path.join(jobdir, name), "w") as f:
+            f.write(content)
     job.setdefault("voice", "af_heart")
     if stream:
         job["stream"] = "1"

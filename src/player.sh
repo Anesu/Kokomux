@@ -42,7 +42,7 @@ part_of() {      # PART="part I of N · " while a job has more than one part; MA
   local parts=1 made=0
   [ -f "$tmpd/progress" ] && { read -r made parts < "$tmpd/progress" || parts=1; }
   PART=""; [ "${parts:-1}" -gt 1 ] && PART="part $1 of $parts · "
-  MADE=""; [ "${parts:-1}" -gt 1 ] && [ ! -f "$tmpd/stream/end" ] && MADE="made $(( made * 100 / parts ))%"
+  MADE=""; [ "${parts:-1}" -gt 1 ] && [ ! -f "$tmpd/stream/end" ] && [ -z "$NOVEL" ] && MADE="made $(( made * 100 / parts ))%"   # (a novel: no end to measure)
   return 0
 }
 
@@ -103,7 +103,7 @@ view_part() {    # view_part IDX BASE: a part starts playing
     TUI_TITLE=${book_title:-$name}
     chapters_load; chapter_of "$1"
     TUI_CHAPTER=""; [ "$CH" -ge 0 ] && TUI_CHAPTER=${CH_TITLE[CH]}
-    TUI_HAS_CHAPTERS=$(( ${#CH_START[@]} > 1 ))
+    TUI_HAS_CHAPTERS=$(( ${#CH_START[@]} > 1 )); [ -n "$NOVEL" ] && TUI_HAS_CHAPTERS=1
     tui_part "$1" "$parts"
     [ "$w_state" = off ] && tui_light -1 -1
   elif [ "$show_words" = 1 ]; then
@@ -140,7 +140,10 @@ title_get() { [ -n "$book_title" ] || { [ -f "$tmpd/title" ] && read -r book_tit
 
 bookmark_save() {   # bookmark_save PART: so the same command, or kokoro --continue, picks up here
   local parts=1
+  echo "$1" > "$tmpd/at"                                  # (where the player is: a novel's engine waits for it)
+  novel_load
   [ -n "$book_id" ] || return 0
+  if [ -n "$NOVEL" ]; then novel_mark "$1"; return 0; fi
   [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
   [ "${parts:-1}" -gt 1 ] || return 0                     # nothing to come back to
   [ -d "$BOOKS" ] || mkdir -p "$BOOKS"
@@ -149,8 +152,73 @@ bookmark_save() {   # bookmark_save PART: so the same command, or kokoro --conti
     "$1" "$parts" "${book_title:-$name}" "$kind" "$source" "$voice" "$speed" "$lang" > "$BOOKS/$book_id.mark"
 }
 bookmark_done() {  # read to the end: the bookmark and the book's kept audio go
+  if [ -n "$NOVEL" ]; then                                # a novel stays on the shelf, up to date
+    local last=1
+    [ -f "$tmpd/progress" ] && { read -r _ last < "$tmpd/progress" || last=1; }
+    novel_mark "$last" "done"
+    info "You're up to date with ${book_title:-$name}: ${N_LABEL:-that} is the latest chapter."
+    printf '  %skokoro --continue carries on once the next one is out.%s\n' "$D" "$R" >&2
+    return 0
+  fi
   [ -n "$book_id" ] && rm -rf "$BOOKS/$book_id.mark" "$BOOKS/$book_id.txt" "${CACHE:?}/${book_id:?}"
   return 0
+}
+
+# ------------------------------------------------------------ web novels
+# A chapter of a web novel (the engine writes "novel" when the page is one) is
+# read on from chapter to chapter. The bookmark is the novel's: the chapter's
+# address and the part in it, so it's on the shelf (the home screen) and
+# kokoro --continue picks up in that chapter.
+NOVEL=""                                  # the novel's address, once we know it's one
+NV_URL=(); NV_NUM=()                      # each chapter of this listen: its address and number (with CH_START)
+N_URL=""; N_FIRST=1; N_NUM=""; N_LABEL=""; N_PARTS=1
+novel_load() {
+  [ -z "$NOVEL" ] && [ -f "$tmpd/novel" ] || return 0
+  NOVEL="$(mark_get "$tmpd/novel" url)"
+  [ -n "$NOVEL" ] || return 0
+  [ -n "$book_id" ] && { rmdir "$CACHE/$book_id" 2>/dev/null || true; }   # (a novel's parts aren't kept)
+  book_id="$(printf '%s' "$NOVEL" | sha256sum | cut -c1-16)"; kind=novel; skip=0
+  title_get
+}
+novel_at() {     # novel_at PART: the chapter PART is in: N_URL N_FIRST N_NUM N_LABEL, and N_PARTS (its length)
+  local k total=0
+  chapter_of "$1"; k=$CH; [ "$k" -ge 0 ] || k=0
+  N_URL=${NV_URL[k]:-$url} N_FIRST=${CH_START[k]:-1} N_NUM=${NV_NUM[k]:-} N_LABEL=${CH_TITLE[k]:-}
+  if [ $(( k + 1 )) -lt "${#CH_START[@]}" ]; then N_PARTS=$(( CH_START[k + 1] - N_FIRST ))
+  else
+    [ -f "$tmpd/progress" ] && { read -r _ total < "$tmpd/progress" || total=0; }
+    N_PARTS=$(( ${total:-0} - N_FIRST + 1 ))
+  fi
+  [ "$N_PARTS" -gt 0 ] || N_PARTS=1
+  return 0
+}
+novel_mark() {   # novel_mark PART [done]: the novel's bookmark (done: heard to the latest chapter)
+  chapters_load; novel_at "$1"
+  [ -d "$BOOKS" ] || mkdir -p "$BOOKS"
+  {
+    printf 'part=%s\nparts=%s\ntitle=%s\nkind=novel\nsource=%s\nchapter=%s\nnumber=%s\nnovel=%s\n' \
+      $(( $1 - N_FIRST + 1 )) "$N_PARTS" "${book_title:-$name}" "$N_URL" "$N_LABEL" "$N_NUM" "$NOVEL"
+    printf 'voice=%s\nspeed=%s\nlang=%s\n' "$voice" "$speed" "$lang"
+    [ -z "${2:-}" ] || echo "done=1"
+  } > "$BOOKS/$book_id.mark"
+}
+novel_go() {     # novel_go URL: start the novel again at another chapter
+  book_id=""                              # (the new run keeps the bookmark from here)
+  trap - EXIT; cleanup
+  exec "$0" -p -v "$voice" -s "$speed" -l "$lang" -u "$1"
+}
+novel_pick() {   # novel_pick PART: go to a chapter by its number
+  local n k
+  chapter_of "$1"
+  tui_prompt "Go to chapter:" "${NV_NUM[CH]:-}"
+  n=$ANSWER
+  if [[ "$n" =~ ^[0-9]+$ ]]; then
+    for k in "${!NV_NUM[@]}"; do
+      if [ "${NV_NUM[k]}" = "$n" ]; then JUMP=${CH_START[k]}; tui_draw; return 0; fi   # (made already)
+    done
+    if chapter_url "${NV_URL[0]:-$url}" "$n"; then novel_go "$CHURL"; fi
+  fi
+  tui_draw
 }
 
 # The notification: what's playing, with pause / next / again buttons that run
@@ -171,12 +239,15 @@ notify_clear() {
   return 0
 }
 
-# Chapters (EPUBs): where each starts, read once the engine writes them.
+# Chapters (EPUBs, web novels): where each starts, from the engine.
 CH_START=(); CH_TITLE=()
-chapters_load() {
-  [ "${#CH_START[@]}" -gt 0 ] || [ ! -f "$tmpd/chapters" ] && return 0
-  local n t
+chapters_load() {   # (read again each time: a novel's chapters arrive as it's heard)
+  [ -f "$tmpd/chapters" ] || return 0
+  local n t u
+  CH_START=(); CH_TITLE=(); NV_NUM=(); NV_URL=()
   while IFS=$'\t' read -r n t; do CH_START+=("$n"); CH_TITLE+=("$t"); done < "$tmpd/chapters"
+  [ -f "$tmpd/serial" ] || return 0
+  while IFS=$'\t' read -r n t u; do NV_NUM+=("$t"); NV_URL+=("$u"); done < "$tmpd/serial"
 }
 chapter_of() {   # chapter_of PART: CH = the index of the chapter PART is in (-1: none)
   local k; CH=-1
@@ -236,7 +307,7 @@ jump_to() {      # jump_to PART
   mpv_stop
   if [ -n "$gen_pid" ]; then kill "$gen_pid" 2>/dev/null || true; wait "$gen_pid" 2>/dev/null || true; gen_pid=""; fi
   tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
-  for f in in.txt title chapters; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
+  for f in in.txt title chapters serial novel; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
   rm -rf "$old"
   start=$target; i=$target; was_parts=0          # (a part in this run's own numbering)
   write_job
@@ -254,10 +325,10 @@ speed_now() {    # speed_now PART: (while PART plays) $speed from this moment on
   mpv_send '"playlist-clear"'                   # (the parts queued after it were made at the old speed)
   MPV_IDX=(["$at"]=0); MPV_PART=("$at"); MPV_SPD=("${MPV_SPD[idx]}"); MPV_N=1; MPV_POS=0; MPV_MAX=0
   [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=0; }
-  if [ "${parts:-0}" -gt "$at" ]; then
+  if [ "${parts:-0}" -gt "$at" ] || { [ -n "$NOVEL" ] && [ ! -f "$tmpd/stream/end" ]; }; then   # (a novel: more may come)
     if [ -n "$gen_pid" ]; then kill "$gen_pid" 2>/dev/null || true; wait "$gen_pid" 2>/dev/null || true; gen_pid=""; fi
     tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
-    for f in in.txt title chapters progress; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
+    for f in in.txt title chapters serial novel progress; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
     mkdir "$tmpd/stream"
     for (( n = at > 40 ? at - 40 : 1; n <= at; n++ )); do   # this part and the ones on screen above it
       printf -v f '%s/stream/%04d' "$old" "$n"
@@ -287,13 +358,17 @@ listen_cmd() {   # listen_cmd CMD PART
       if [ "$in_line" = 1 ]; then speed_now "$at"; else JUMP=$at; fi ;;
     sleep) sleep_cycle ;;
     chapters)
+      if [ -n "$NOVEL" ] && [ "$ui" = tui ]; then novel_pick "$at"; return 0; fi
       [ "${#CH_START[@]}" -gt 1 ] && [ "$ui" = tui ] || return 0
       chapter_of "$at"; tui_chapters "$CH"
       [ -n "$CHOSEN" ] && JUMP=${CH_START[CHOSEN]} ;;
     next_chapter) chapter_of "$at"; [ $(( CH + 1 )) -lt "${#CH_START[@]}" ] && JUMP=${CH_START[CH + 1]} ;;
     prev_chapter) chapter_of "$at"
                   if [ "$CH" -ge 0 ] && [ "$at" -gt "${CH_START[CH]}" ]; then JUMP=${CH_START[CH]}   # start of this one
-                  elif [ "$CH" -gt 0 ]; then JUMP=${CH_START[CH - 1]}; fi ;;
+                  elif [ "$CH" -gt 0 ]; then JUMP=${CH_START[CH - 1]}
+                  elif [ -n "$NOVEL" ]; then                 # before this listen's first chapter
+                    t="$(mark_get "$tmpd/novel" prev)"; [ -n "$t" ] && novel_go "$t"
+                  fi ;;
     seek:*) JUMP=${cmd#seek:} ;;
     menu)                                       # the menu: some choices are the player's to carry out
       [ "$ui" = tui ] || return 0

@@ -530,7 +530,7 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
       y=$(( y + 2 ))
     fi
     local x0=$LM
-    out '\033[%d;%dH%sContinue listening%s' "$y" "$x0" "$B" "$R"; y=$(( y + 1 ))
+    out '\033[%d;%dH%sBookshelf%s' "$y" "$x0" "$B" "$R"; y=$(( y + 1 ))
     if [ "${#marks[@]}" = 0 ]; then
       r="Nothing in progress yet. Long texts and books are remembered here."
       [ "${#r}" -gt "$CW" ] && r="Nothing in progress yet."
@@ -541,6 +541,10 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
       m=${marks[i]}; title="$(mark_get "$m" title)"; part="$(mark_get "$m" part)"; parts="$(mark_get "$m" parts)"
       [ "${parts:-0}" -gt 0 ] 2>/dev/null || parts=1
       pct=$(( 100 * (part - 1) / parts )); bw=12
+      if [ "$(mark_get "$m" kind)" = novel ]; then            # a web novel: the chapter it's at, and how far in
+        title="$title · Ch $(mark_get "$m" number)"
+        [ "$(mark_get "$m" "done")" = 1 ] && pct=100
+      fi
       printf -v bar '%*s' $(( pct * bw / 100 )) ''; bar="$ACC${bar// /━}$R"
       local rest; printf -v rest '%*s' $(( bw - pct * bw / 100 )) ''; bar+="$LINE${rest// /─}$R"
       local room=$(( CW - 23 )); [ "${#title}" -gt "$room" ] && title="${title:0:$(( room - 1 ))}…"
@@ -569,8 +573,9 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
       out '\033[%d;%dH %s%s%s  %s' "$y" "$x0" "$ACC2" "$key" "$R" "$r"
       rowact[$y]=$cmd; y=$(( y + 1 ))
     done
-    if [ "$TW" -ge 64 ]; then r="↑↓ choose · Enter play · click or tap anything · q quit"
-    else r="↑↓ · Enter play · tap · q quit"; fi
+    local novel=0; [ "${#marks[@]}" -gt 0 ] && [ "$(mark_get "${marks[sel]}" kind)" = novel ] && novel=1
+    if [ "$TW" -ge 64 ]; then r="↑↓ choose · Enter play$( [ "$novel" = 1 ] && echo " · g go to chapter") · click or tap anything · q quit"
+    else r="↑↓ · Enter play$( [ "$novel" = 1 ] && echo " · g chapter") · tap · q quit"; fi
     out '\033[%d;%dH%s%s%s' "$TH" "$LM" "$D" "$r" "$R"
     out '%s' "$SYNC_OFF"
 
@@ -585,11 +590,19 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
       $'\033[B'|$'\033OB'|j|$'\033[<65;'*M) [ "$sel" -lt $(( ${#marks[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
       c) cmd="clip" ;; f) cmd="file" ;; u) cmd="url" ;; t) cmd="text" ;; v) cmd="voice" ;; s|o|,) cmd="settings" ;;
       p) [ "$qn" -gt 0 ] && cmd="queue" ;;
+      g) [ "${#marks[@]}" -gt 0 ] && [ "$(mark_get "${marks[sel]}" kind)" = novel ] && cmd="chapter" ;;
       q|Q|$'\033') break ;;
       $'\033[<0;'*M) [[ "$KEY" =~ \;([0-9]+)M$ ]] && cmd="${rowact[${BASH_REMATCH[1]}]:-}" ;;
     esac
     case "$cmd" in
       mark:*)  HOME_CHOICE=(--continue "${marks[${cmd#mark:}]}"); break ;;
+      chapter)                                  # a web novel, from another chapter
+        m=${marks[sel]}
+        tui_prompt "Go to chapter:" "$(mark_get "$m" number)"
+        if [[ "$ANSWER" =~ ^[0-9]+$ ]] && chapter_url "$(mark_get "$m" source)" "$ANSWER"; then
+          HOME_CHOICE=(-p -v "$(mark_get "$m" voice)" -s "$(mark_get "$m" speed)" -l "$(mark_get "$m" lang)" -u "$CHURL")
+          break
+        fi ;;
       clip)    HOME_CHOICE=(-p -c); break ;;
       queue)   HOME_CHOICE=(--queue); break ;;
       file)    tui_prompt "File to read:"; [ -n "$ANSWER" ] && { HOME_CHOICE=(-p -f "${ANSWER/#\~/$HOME}"); break; } ;;

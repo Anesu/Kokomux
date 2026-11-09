@@ -20,7 +20,7 @@ path-exclude=/usr/share/locale/*
 path-include=/usr/share/locale/locale.alias
 CFG
     apt-get update
-    apt-get install -y --no-install-recommends python3 python3-venv ca-certificates
+    apt-get install -y --no-install-recommends python3 python3-venv ca-certificates curl
     ;;
   pip)
     mkdir -p "$APP"
