@@ -17,14 +17,14 @@ SRC = os.path.join(HERE, "..", "src")
 DEFAULTS = dict(KOKORO_VOICE="af_heart", KOKORO_BLEND="", KOKORO_SPEED="1.0", KOKORO_LANG="en-us",
                 KOKORO_OUT="kokoro.wav", KOKORO_TUI="1", KOKORO_THEME="auto", KOKORO_FOCUS="1",
                 KOKORO_WORDS="1", KOKORO_WORDS_OFFSET_MS="0", KOKORO_NOTIFY="1", KOKORO_AUTOSERVE="1",
-                KOKORO_IDLE_MINUTES="30", KOKORO_PORT="8880")
+                KOKORO_IDLE_MINUTES="0", KOKORO_PORT="8880")
 # setting -> (what it changes, its value after one step right)
 EXPECTED = {
     "speed": ("KOKORO_SPEED", "1.1"),
     "lang": ("KOKORO_LANG", "en-gb"),
     "theme": ("KOKORO_THEME", "dark"),
     "offset": ("KOKORO_WORDS_OFFSET_MS", "20"),
-    "idle": ("KOKORO_IDLE_MINUTES", "60"),
+    "idle": ("KOKORO_IDLE_MINUTES", "5"),           # (from never, round to the first)
     "blendamt": ("KOKORO_BLEND", "bf_emma:40"),
     "KOKORO_TUI": ("KOKORO_TUI", "0"),
     "KOKORO_FOCUS": ("KOKORO_FOCUS", "0"),

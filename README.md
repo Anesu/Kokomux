@@ -182,7 +182,7 @@ kokoro --stop      # stop (the bookmark is kept)
 
 A part is a few sentences. With the Termux:API app installed, a notification shows the title and which part is playing, with **previous** (again), **pause**, **play** and **next** buttons. They work from the lock screen too. Swiping the notification away stops playback. To turn the notification off, set `KOKORO_NOTIFY=0`.
 
-**Gapless, and made ahead.** One mpv plays the whole listen as a playlist, so each part runs straight into the next, and pause stops mid-word and carries on from there. Behind it, the whole text is made as fast as the phone can (the reader shows "made 40%" until it's done), so skipping, chapters and seeking are instant once a part exists. Everything made is kept per book, voice and speed in `$PREFIX/tmp/kokomux-cache`, so listening again, or making the audiobook, reuses it. A book's audio is deleted once you've heard it to the end; the cache never grows past `KOKORO_CACHE_GB` (50 GB), letting go of the books heard least recently.
+**Gapless, and made ahead.** One mpv plays the whole listen as a playlist, so each part runs straight into the next, and pause stops mid-word and carries on from there. Behind it, Kokoro stays about ten minutes ahead of you and then makes one part as each is heard, so a long book doesn't keep the phone busy and warm for hours. Skipping and seeking within what's made are instant; a jump further on starts making from there. Everything made is kept per book, voice and speed in `$PREFIX/tmp/kokomux-cache`, so listening again, or making the audiobook, reuses it. A book's audio is deleted once you've heard it to the end; the cache never grows past `KOKORO_CACHE_GB` (50 GB), letting go of the books heard least recently.
 
 ## Audiobooks
 
@@ -272,7 +272,7 @@ KOKORO_VOICE=bm_george kokoro -p "Just this once"
 
 ## Speed: the background server
 
-Starting Kokoro takes a few seconds: it has to start the Debian container and load the model. To avoid paying that every time, the first `kokoro` command starts a **background server** that keeps the model loaded. After that, each command starts almost instantly. The server stops by itself after 30 minutes without use.
+Starting Kokoro takes a few seconds: it has to start the Debian container and load the model. To avoid paying that every time, the first `kokoro` command starts a **background server** that keeps the model loaded. After that, each command starts almost instantly. It stays loaded until you stop it (`kokoro --stop-server`); to have it unload after a while without use, set **Unload after** in `kokoro --settings`.
 
 ```sh
 kokoro --status        # is it running? what are my settings?

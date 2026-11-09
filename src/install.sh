@@ -366,9 +366,9 @@ KOKORO_LANG=en-us         # en-us en-gb es fr-fr it pt-br hi
 KOKORO_OUT=kokoro.wav     # file name when -o isn't given (.wav .mp3 .ogg .flac)
 
 # Keep Kokoro loaded in the background so each command starts instantly.
-# It stops by itself after KOKORO_IDLE_MINUTES without use.
+# KOKORO_IDLE_MINUTES unloads it after that long without use (0: never).
 KOKORO_AUTOSERVE=1
-KOKORO_IDLE_MINUTES=30
+KOKORO_IDLE_MINUTES=0
 KOKORO_PORT=8880
 
 # Light up each word as it's spoken (with -p, on a terminal), from Kokoro's own
@@ -395,6 +395,9 @@ KOKORO_THEME=auto
 KOKORO_FOCUS=1
 CFG
   fi
+  # v0.18.0 keeps Kokoro loaded: a settings file still on the old default (30) moves
+  # to never. (Remove in the next clean-up.)
+  sed -i 's/^KOKORO_IDLE_MINUTES=30\( \|$\)/KOKORO_IDLE_MINUTES=0\1/' "$conf"
 
   # Shared links, text and files go to the queue (kokoro --queue plays it).
   put "$HOME/bin/termux-url-opener" 'kokoro --add -u "$1"; sleep 1'

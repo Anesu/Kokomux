@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.17.4"
+KOKOMUX_VERSION="0.18.0"
 DISTRO=kokoro
 
 VERBOSE=0
@@ -520,6 +520,11 @@ parts"), `out.<ext>` and `chapters_ms` when saving, and with stream=1
 `stream/NNNN.wav` (its audio, with the pause after it; written last), `stream/first`
 (where it began) and `stream/end` once everything is made. With a cache, the
 stream files are relative links into it.
+
+While listening (stream=1, no out), the engine makes only AHEAD seconds of
+speech ahead of the part the player is on (the player writes its number into
+`at`), so a long book doesn't keep the phone's CPU busy for hours; parts
+already kept in the cache are linked at once.
 
 A web novel's chapter (url, with stream=1) is read on from chapter to chapter:
 the engine fetches the next one when the player reaches the last one made (the
@@ -1510,6 +1515,32 @@ def _novel_add(jobdir, chapter, chunks, starts, serial, lang, new=False):
                       f"title={chapter['novel']}\nurl={chapter['novel_url']}\nprev={chapter['prev'] or ''}\n")
 
 
+# While listening, how much speech is made ahead of the player: about ten minutes
+# (a Fibonacci number of seconds), plenty to ride out a busy or throttled phone.
+AHEAD = 610
+
+
+def _listener_at(jobdir):
+    """The part the player is on (it writes it into `at`); 0 before it starts."""
+    try:
+        with open(os.path.join(jobdir, "at")) as fh:
+            return int(fh.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def _keep_ahead(jobdir, made):
+    """Wait until less than AHEAD seconds of speech is ready ahead of the player.
+    MADE: each part made in this job, and its length in seconds."""
+    while True:
+        if not os.path.isdir(jobdir):
+            raise JobError("Cancelled")
+        at = _listener_at(jobdir)
+        if sum(secs for part, secs in made.items() if part >= at) < AHEAD:
+            return
+        time.sleep(0.5)
+
+
 def _novel_more(jobdir, chapter, chunks, starts, serial, lang):
     """The next chapter, added once the listener has reached the last one made (so one
     chapter is always ready ahead, and no more). None at the end of what's out."""
@@ -1517,12 +1548,7 @@ def _novel_more(jobdir, chapter, chunks, starts, serial, lang):
     while True:
         if not os.path.isdir(jobdir):
             raise JobError("Cancelled")
-        try:
-            with open(os.path.join(jobdir, "at")) as fh:
-                at = int(fh.read().strip() or 0)
-        except (OSError, ValueError):
-            at = 0
-        if at >= last:
+        if _listener_at(jobdir) >= last:
             break
         time.sleep(0.5)
     log(f"Fetching {chapter['next']}")
@@ -1637,6 +1663,7 @@ def run_job(path):
             timed = True                    # kept parts carry their word timings, whatever this run shows
         chapter_at = {int(line.split("\t", 1)[0]): line.split("\t", 1)[1] for line in starts}
         chapter_times, written = [], 0
+        made = {}                           # part -> seconds of speech, for keeping just ahead of the listener
         i = first - 1
         while True:
             i += 1
@@ -1651,6 +1678,8 @@ def run_job(path):
             _write_atomic(os.path.join(jobdir, "progress"), f"{i} {len(chunks)}\n")
             name = f"{i:04d}"
             got = cached_part(cache, name, chunk) if cache else None
+            if not got and stream and not out:
+                _keep_ahead(jobdir, made)       # (a kept part costs nothing: it's linked at once)
             if got:
                 info = sf.info(got)
                 rate, length = info.samplerate, info.frames
@@ -1676,6 +1705,7 @@ def run_job(path):
             if chapter_at.get(i) is not None and out:
                 chapter_times.append((round(written / rate * 1000), chapter_at[i]))
             total += length / rate
+            made[i] = length / rate
             if out:
                 # Written as it's made, so a whole book never has to fit in memory.
                 if writer is None:
@@ -3111,11 +3141,10 @@ w_s=(); w_e=(); w_a=(); w_b=(); w_state=none
 TERM_ROWS=24
 in_line=0
 
-part_of() {      # PART="part I of N · " while a job has more than one part; MADE="made 40%" until all is
-  local parts=1 made=0
-  [ -f "$tmpd/progress" ] && { read -r made parts < "$tmpd/progress" || parts=1; }
+part_of() {      # PART="part I of N · " while a job has more than one part
+  local parts=1
+  [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
   PART=""; [ "${parts:-1}" -gt 1 ] && PART="part $1 of $parts · "
-  MADE=""; [ "${parts:-1}" -gt 1 ] && [ ! -f "$tmpd/stream/end" ] && [ -z "$NOVEL" ] && MADE="made $(( made * 100 / parts ))%"   # (a novel: no end to measure)
   return 0
 }
 
@@ -3644,8 +3673,8 @@ play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause
     if [ "$VOL" != "$MPV_VOL" ]; then mpv_send "\"set_property\",\"volume\",$VOL"; MPV_VOL=$VOL; fi
     if [ "$VOL" = 0 ] && [ "$SLEEP" != chapter ]; then SLEPT=1; exit "$QUIT_RC"; fi   # time's up (the bookmark is this part)
     part_of "$i"; sleep_label
-    if [ "$ui" = tui ]; then label="$SLEEP_LABEL${SLEEP_LABEL:+${MADE:+ · }}$MADE"
-    else label="${PART}${SLEEP_LABEL:+$SLEEP_LABEL · }${MADE:+$MADE · }␣ pause · → next · q stop"; fi
+    if [ "$ui" = tui ]; then label=$SLEEP_LABEL
+    else label="${PART}${SLEEP_LABEL:+$SLEEP_LABEL · }␣ pause · → next · q stop"; fi
     if [ "$label|playing" != "$last" ]; then view_state "Playing" "$label" "▶"; last="$label|playing"; fi
     tick 0.03
   done
@@ -3946,7 +3975,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
 # in player.sh, the colours in theme.sh (all three loaded below).
 set -euo pipefail
 
-KOKOMUX_VERSION="0.17.4"
+KOKOMUX_VERSION="0.18.0"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -3964,7 +3993,7 @@ KOKORO_DEFAULTS=(
   KOKORO_LANG=en-us
   KOKORO_OUT=kokoro.wav         # file name when -o isn't given
   KOKORO_AUTOSERVE=1            # keep Kokoro loaded in the background
-  KOKORO_IDLE_MINUTES=30        # ...until unused this long (0: never stop)
+  KOKORO_IDLE_MINUTES=0         # unload it after this long unused (0: never; the phone has the memory)
   KOKORO_PORT=8880
   KOKORO_WORDS=1                # light up each word as it's spoken (-p on a terminal)
   KOKORO_WORDS_OFFSET_MS=0      # moves the highlight against mpv's clock (+: later, -: earlier)
@@ -4403,7 +4432,8 @@ case "${1:-}" in
   --serve)
     if server_up; then info "The server is already running."; exit 0; fi
     start_server || exit 1
-    done_msg "Server ready." "port $(server_port) · stops after ${KOKORO_IDLE_MINUTES} min unused"
+    stays="stays loaded"; [ "$KOKORO_IDLE_MINUTES" = 0 ] || stays="stops after ${KOKORO_IDLE_MINUTES} min unused"
+    done_msg "Server ready." "port $(server_port) · $stays"
     exit 0 ;;
   --stop-server) stop_server; exit 0 ;;
   --benchmark)   # time each way of running Kokoro here, and keep the fastest
@@ -4941,9 +4971,9 @@ KOKORO_LANG=en-us         # en-us en-gb es fr-fr it pt-br hi
 KOKORO_OUT=kokoro.wav     # file name when -o isn't given (.wav .mp3 .ogg .flac)
 
 # Keep Kokoro loaded in the background so each command starts instantly.
-# It stops by itself after KOKORO_IDLE_MINUTES without use.
+# KOKORO_IDLE_MINUTES unloads it after that long without use (0: never).
 KOKORO_AUTOSERVE=1
-KOKORO_IDLE_MINUTES=30
+KOKORO_IDLE_MINUTES=0
 KOKORO_PORT=8880
 
 # Light up each word as it's spoken (with -p, on a terminal), from Kokoro's own
@@ -4970,6 +5000,9 @@ KOKORO_THEME=auto
 KOKORO_FOCUS=1
 CFG
   fi
+  # v0.18.0 keeps Kokoro loaded: a settings file still on the old default (30) moves
+  # to never. (Remove in the next clean-up.)
+  sed -i 's/^KOKORO_IDLE_MINUTES=30\( \|$\)/KOKORO_IDLE_MINUTES=0\1/' "$conf"
 
   # Shared links, text and files go to the queue (kokoro --queue plays it).
   put "$HOME/bin/termux-url-opener" 'kokoro --add -u "$1"; sleep 1'

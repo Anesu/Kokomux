@@ -38,11 +38,10 @@ w_s=(); w_e=(); w_a=(); w_b=(); w_state=none
 TERM_ROWS=24
 in_line=0
 
-part_of() {      # PART="part I of N · " while a job has more than one part; MADE="made 40%" until all is
-  local parts=1 made=0
-  [ -f "$tmpd/progress" ] && { read -r made parts < "$tmpd/progress" || parts=1; }
+part_of() {      # PART="part I of N · " while a job has more than one part
+  local parts=1
+  [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
   PART=""; [ "${parts:-1}" -gt 1 ] && PART="part $1 of $parts · "
-  MADE=""; [ "${parts:-1}" -gt 1 ] && [ ! -f "$tmpd/stream/end" ] && [ -z "$NOVEL" ] && MADE="made $(( made * 100 / parts ))%"   # (a novel: no end to measure)
   return 0
 }
 
@@ -571,8 +570,8 @@ play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause
     if [ "$VOL" != "$MPV_VOL" ]; then mpv_send "\"set_property\",\"volume\",$VOL"; MPV_VOL=$VOL; fi
     if [ "$VOL" = 0 ] && [ "$SLEEP" != chapter ]; then SLEPT=1; exit "$QUIT_RC"; fi   # time's up (the bookmark is this part)
     part_of "$i"; sleep_label
-    if [ "$ui" = tui ]; then label="$SLEEP_LABEL${SLEEP_LABEL:+${MADE:+ · }}$MADE"
-    else label="${PART}${SLEEP_LABEL:+$SLEEP_LABEL · }${MADE:+$MADE · }␣ pause · → next · q stop"; fi
+    if [ "$ui" = tui ]; then label=$SLEEP_LABEL
+    else label="${PART}${SLEEP_LABEL:+$SLEEP_LABEL · }␣ pause · → next · q stop"; fi
     if [ "$label|playing" != "$last" ]; then view_state "Playing" "$label" "▶"; last="$label|playing"; fi
     tick 0.03
   done

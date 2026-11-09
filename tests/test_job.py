@@ -9,6 +9,7 @@ import os
 import secrets
 import shutil
 import sys
+import time
 
 HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(HERE, "..", "src"))
@@ -310,6 +311,46 @@ def test_a_saved_book_records_where_each_chapter_starts():
     finally:
         engine.read_source, engine.tts = old
         shutil.rmtree(jobdir)
+
+
+def made_parts(jobdir):
+    stream = os.path.join(jobdir, "stream")
+    return sorted(f for f in os.listdir(stream) if f.endswith(".wav") and ".tmp" not in f) if os.path.isdir(stream) else []
+
+
+@needs_audio
+def test_listening_makes_only_a_little_ahead_of_the_player():
+    import threading
+    # Ten sentences of about a second each, and "a little ahead" made two seconds.
+    text = " ".join(f"Sentence number {n} goes on for a while, about a second of it." for n in range(10))
+    jobdir = f"/tmp/kokoro.{secrets.token_hex(6)}"
+    old_ahead, engine.AHEAD = engine.AHEAD, 2.0
+    try:
+        job = threading.Thread(target=run, args=(text,), kwargs={"jobdir": jobdir})
+        job.start()
+        time.sleep(1.5)
+        ahead = len(made_parts(jobdir))
+        assert 1 <= ahead <= 4, made_parts(jobdir)                 # it waits for the player
+        with open(os.path.join(jobdir, "at"), "w") as f:            # the player moves on to the end
+            f.write("99\n")
+        job.join(10)
+        assert not job.is_alive()
+        assert len(made_parts(jobdir)) > ahead and os.path.exists(os.path.join(jobdir, "stream", "end"))
+    finally:
+        engine.AHEAD = old_ahead
+        shutil.rmtree(jobdir, ignore_errors=True)
+
+
+@needs_audio
+def test_saving_a_file_does_not_wait():
+    old_ahead, engine.AHEAD = engine.AHEAD, 0.5
+    try:
+        text = " ".join(f"Sentence number {n} goes on for a while, about a second of it." for n in range(6))
+        jobdir, _ = run(text, stream=False, out="out.wav")         # (returns only once it's all made)
+        assert os.path.getsize(os.path.join(jobdir, "out.wav")) > 0
+        shutil.rmtree(jobdir)
+    finally:
+        engine.AHEAD = old_ahead
 
 
 if __name__ == "__main__":

@@ -31,6 +31,11 @@ parts"), `out.<ext>` and `chapters_ms` when saving, and with stream=1
 (where it began) and `stream/end` once everything is made. With a cache, the
 stream files are relative links into it.
 
+While listening (stream=1, no out), the engine makes only AHEAD seconds of
+speech ahead of the part the player is on (the player writes its number into
+`at`), so a long book doesn't keep the phone's CPU busy for hours; parts
+already kept in the cache are linked at once.
+
 A web novel's chapter (url, with stream=1) is read on from chapter to chapter:
 the engine fetches the next one when the player reaches the last one made (the
 player writes the part it's on into `at`). It writes `novel` (title=, url=,
@@ -1020,6 +1025,32 @@ def _novel_add(jobdir, chapter, chunks, starts, serial, lang, new=False):
                       f"title={chapter['novel']}\nurl={chapter['novel_url']}\nprev={chapter['prev'] or ''}\n")
 
 
+# While listening, how much speech is made ahead of the player: about ten minutes
+# (a Fibonacci number of seconds), plenty to ride out a busy or throttled phone.
+AHEAD = 610
+
+
+def _listener_at(jobdir):
+    """The part the player is on (it writes it into `at`); 0 before it starts."""
+    try:
+        with open(os.path.join(jobdir, "at")) as fh:
+            return int(fh.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def _keep_ahead(jobdir, made):
+    """Wait until less than AHEAD seconds of speech is ready ahead of the player.
+    MADE: each part made in this job, and its length in seconds."""
+    while True:
+        if not os.path.isdir(jobdir):
+            raise JobError("Cancelled")
+        at = _listener_at(jobdir)
+        if sum(secs for part, secs in made.items() if part >= at) < AHEAD:
+            return
+        time.sleep(0.5)
+
+
 def _novel_more(jobdir, chapter, chunks, starts, serial, lang):
     """The next chapter, added once the listener has reached the last one made (so one
     chapter is always ready ahead, and no more). None at the end of what's out."""
@@ -1027,12 +1058,7 @@ def _novel_more(jobdir, chapter, chunks, starts, serial, lang):
     while True:
         if not os.path.isdir(jobdir):
             raise JobError("Cancelled")
-        try:
-            with open(os.path.join(jobdir, "at")) as fh:
-                at = int(fh.read().strip() or 0)
-        except (OSError, ValueError):
-            at = 0
-        if at >= last:
+        if _listener_at(jobdir) >= last:
             break
         time.sleep(0.5)
     log(f"Fetching {chapter['next']}")
@@ -1147,6 +1173,7 @@ def run_job(path):
             timed = True                    # kept parts carry their word timings, whatever this run shows
         chapter_at = {int(line.split("\t", 1)[0]): line.split("\t", 1)[1] for line in starts}
         chapter_times, written = [], 0
+        made = {}                           # part -> seconds of speech, for keeping just ahead of the listener
         i = first - 1
         while True:
             i += 1
@@ -1161,6 +1188,8 @@ def run_job(path):
             _write_atomic(os.path.join(jobdir, "progress"), f"{i} {len(chunks)}\n")
             name = f"{i:04d}"
             got = cached_part(cache, name, chunk) if cache else None
+            if not got and stream and not out:
+                _keep_ahead(jobdir, made)       # (a kept part costs nothing: it's linked at once)
             if got:
                 info = sf.info(got)
                 rate, length = info.samplerate, info.frames
@@ -1186,6 +1215,7 @@ def run_job(path):
             if chapter_at.get(i) is not None and out:
                 chapter_times.append((round(written / rate * 1000), chapter_at[i]))
             total += length / rate
+            made[i] = length / rate
             if out:
                 # Written as it's made, so a whole book never has to fit in memory.
                 if writer is None:

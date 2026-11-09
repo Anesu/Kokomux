@@ -31,7 +31,7 @@ KOKORO_DEFAULTS=(
   KOKORO_LANG=en-us
   KOKORO_OUT=kokoro.wav         # file name when -o isn't given
   KOKORO_AUTOSERVE=1            # keep Kokoro loaded in the background
-  KOKORO_IDLE_MINUTES=30        # ...until unused this long (0: never stop)
+  KOKORO_IDLE_MINUTES=0         # unload it after this long unused (0: never; the phone has the memory)
   KOKORO_PORT=8880
   KOKORO_WORDS=1                # light up each word as it's spoken (-p on a terminal)
   KOKORO_WORDS_OFFSET_MS=0      # moves the highlight against mpv's clock (+: later, -: earlier)
@@ -470,7 +470,8 @@ case "${1:-}" in
   --serve)
     if server_up; then info "The server is already running."; exit 0; fi
     start_server || exit 1
-    done_msg "Server ready." "port $(server_port) · stops after ${KOKORO_IDLE_MINUTES} min unused"
+    stays="stays loaded"; [ "$KOKORO_IDLE_MINUTES" = 0 ] || stays="stops after ${KOKORO_IDLE_MINUTES} min unused"
+    done_msg "Server ready." "port $(server_port) · $stays"
     exit 0 ;;
   --stop-server) stop_server; exit 0 ;;
   --benchmark)   # time each way of running Kokoro here, and keep the fastest
