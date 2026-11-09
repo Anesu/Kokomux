@@ -1,15 +1,28 @@
 # kokomux: the player. Sourced by `kokoro` (bash) once a listening run is set up.
 # shellcheck shell=bash disable=SC2034,SC2153,SC2154  # shares its globals with kokoro
 #
-#   play_line WAV IDX     plays one part: the inline view or the full-screen
-#                         reader (via the view API below), word highlights,
-#                         pause / next / again, bookmarks and the notification
-#   listen_cmd CMD PART   chapters, speed, the sleep timer and seeking, which
-#                         restart the reading at a part (jump_to)
+#   play_line WAV IDX     plays one part through mpv: the inline view or the
+#                         full-screen reader (via tui.sh's view API), word
+#                         highlights, keys and clicks, bookmarks, the notification
+#   listen_cmd CMD PART   pause, next/again, speed, the sleep timer, chapters,
+#                         seeking, the menu, settings and the voice picker; those
+#                         that change what's heard restart the reading at a part
+#                         (jump_to), reusing parts already made
+#   go_home               stop, keeping the place, and open the home screen
+#
+# Sections: the inline view (the line being heard), listening (bookmarks,
+# notifications, chapters, the sleep timer, commands), mpv (one gapless
+# playlist for the whole listen, driven over its IPC socket), play_line.
+#
+# The engine writes each part into $tmpd/stream as NNNN.txt, NNNN.words and
+# NNNN.wav (links into the cache, $CACHE/BOOK_ID/SETTINGS/), and stream/end
+# when it has made the last one. play_line plays part i; player_bg queues
+# the next part to mpv as soon as it exists, also while an overlay is open.
 #
 # Expects from kokoro: the run's globals (tmpd, play, ui, show_words, voice,
-# speed, lang, name, kind, source, text, book_id, start, i), the colours (HL),
-# status/status_clear, tick, now_ms, write_job and run_engine.
+# speed, lang, name, kind, source, text, book_id, start, i), CACHE, QUIT_RC,
+# the colours (HL), status/status_clear, die, tick, now_ms, cleanup,
+# write_job and run_engine.
 
 # ------------------------------------------------------------ the line being heard
 # Each line is printed wrapped to the screen while it plays, and a soft
@@ -280,7 +293,6 @@ mpv_start() {
   # shellcheck disable=SC2086  # KOKORO_MPV_ARGS: extra mpv options, word by word
   mpv --idle=yes --no-video --no-terminal --really-quiet --gapless-audio=yes --audio-display=no \
       --input-ipc-server="$MPV_SOCK" ${KOKORO_MPV_ARGS:-} </dev/null >/dev/null 2>&1 & MPV_PID=$!
-  play_pid=$MPV_PID                # (cleanup stops it)
   local n=0
   while [ ! -S "$MPV_SOCK" ]; do
     n=$(( n + 1 )); [ "$n" -lt 250 ] || die "mpv didn't start." "Try: mpv --version"

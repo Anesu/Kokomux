@@ -2,9 +2,15 @@
 # kokomux: the `kokoro` command. https://github.com/Anesu/kokomux
 #
 # Turns text into speech with Kokoro, which lives in the "kokoro"
-# proot-distro container. Jobs go through $PREFIX/tmp, which the container
-# sees as /tmp. If the background server is running, jobs go to it over
-# localhost (fast); otherwise each call starts the container (slower).
+# proot-distro container (/opt/kokoro: engine.py, its venv and the models).
+# Each run writes a job folder in $PREFIX/tmp, which the container sees as
+# /tmp, and the engine fills its stream/ folder part by part. If the
+# background server is running, jobs go to it over localhost (fast);
+# otherwise each run starts the container (slower).
+#
+# This file: settings, admin commands (--status, --update, the queue, ...),
+# options, the job folder, then the run. The screens are in tui.sh, playing
+# in player.sh, the colours in theme.sh (all three loaded below).
 set -euo pipefail
 
 KOKOMUX_VERSION="@@VERSION@@"
@@ -69,26 +75,25 @@ esac
 # Messages go to stderr. Colours and live status only on a terminal, so
 # scripts and pipes get plain, quiet output.
 
-# The colours (theme.sh) follow the terminal: a dark or light palette, made
-# from its own background where it has told us what that is.
+# The rest of kokomux lives beside this command, in $PREFIX/share/kokomux:
+# theme.sh (the colours), tui.sh (the full-screen screens) and player.sh
+# (playing a text). The installer puts all three there.
+LIB="$PREFIX/share/kokomux"
+for f in theme.sh tui.sh player.sh; do
+  [ -f "$LIB/$f" ] || { echo "kokomux is only partly installed ($f is missing). Run the installer again." >&2; exit 1; }
+done
+# shellcheck source=src/theme.sh
+. "$LIB/theme.sh"
+# shellcheck source=src/tui.sh
+. "$LIB/tui.sh"
+# shellcheck source=src/player.sh
+. "$LIB/player.sh"
+
+# The colours follow the terminal: a dark or light palette, made from its own
+# background where it has told us what that is.
 LIVE=0
 if [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then LIVE=1; fi
-THEME_MODE=dark THEME_PAINT=0 THEME_ON=0 THEME_ASKED=0   # (theme.sh sets these properly)
-THEME_LIB="$PREFIX/share/kokomux/theme.sh"
-# shellcheck source=src/theme.sh
-[ -f "$THEME_LIB" ] && . "$THEME_LIB"
-# shellcheck disable=SC2034  # the screens and the player use them
-if [ "$LIVE" = 1 ] && declare -F theme_apply >/dev/null; then
-  theme_apply
-elif [ "$LIVE" = 1 ]; then                    # theme.sh missing (a half-finished update)
-  R=$'\033[0m' B=$'\033[1m' D=$'\033[2m' ACC=$'\033[38;5;141m' ACC2=$'\033[38;5;117m'
-  GRN=$'\033[38;5;114m' RED=$'\033[38;5;203m' YEL=$'\033[38;5;221m'
-  PAST=$'\033[38;5;245m' LINE=$D GHOST=$'\033[38;5;237m' HL=$'\033[48;5;61m\033[38;5;231m'
-  SURF=$'\033[48;5;236m' SEL=$'\033[48;5;237m' PSEL=$'\033[48;5;238m' BASE="" ACC_SGR="38;5;141" D_SGR=2
-else
-  R="" B="" D="" ACC="" ACC2="" GRN="" RED="" YEL="" PAST="" LINE="" GHOST="" HL=""
-  SURF="" SEL="" PSEL="" BASE="" ACC_SGR="" D_SGR=""
-fi
+if [ "$LIVE" = 1 ]; then theme_apply; else theme_off; fi
 SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
 frame=0
 
@@ -100,7 +105,7 @@ cols() {
 
 # die "what went wrong" ["what to do about it"]
 die() {
-  declare -F tui_close >/dev/null && tui_close
+  tui_close
   status_clear
   printf '%s✗%s %s\n' "$RED" "$R" "$1" >&2
   [ -n "${2:-}" ] && printf '  %s%s%s\n' "$D" "$2" "$R" >&2
@@ -340,12 +345,8 @@ key_cmd() {      # what KEY asks for (or a clicked button): see the player for e
   KEY=""
 }
 
-TUI_LIB="$PREFIX/share/kokomux/tui.sh"
-# shellcheck source=src/tui.sh
-[ -f "$TUI_LIB" ] && . "$TUI_LIB"
-
 # kokoro on its own, on a terminal: the home screen.
-if [ $# = 0 ] && [ "$LIVE" = 1 ] && [ -t 0 ] && [ -t 1 ] && declare -F tui_home >/dev/null; then
+if [ $# = 0 ] && [ "$LIVE" = 1 ] && [ -t 0 ] && [ -t 1 ]; then
   keys_on
   trap 'tui_close; keys_off; exit 130' INT TERM HUP
   tui_home
@@ -486,7 +487,7 @@ case "${1:-}" in
     printf '    %sChange them with: kokoro --settings%s\n' "$D" "$R"
     exit 0 ;;
   --settings)
-    if [ "$LIVE" = 1 ] && [ -t 0 ] && declare -F tui_settings >/dev/null; then
+    if [ "$LIVE" = 1 ] && [ -t 0 ]; then
       keys_on
       trap 'tui_close; keys_off; exit 130' INT TERM HUP
       tui_settings
@@ -524,7 +525,7 @@ case "${1:-}" in
              "$HOME/.shortcuts/tasks/"Kokoro*; do
       if [ -f "$f" ] && grep -q '^# kokomux' "$f"; then rm -f "$f"; done_msg "Removed $(tilde "$f")"; fi
     done
-    rm -rf "$CONF_DIR" "$SRV_DIR" "$HOME/kokoro-test.wav" "$HOME/.cache/kokomux" "$HOME/.local/share/kokomux" "$PREFIX/share/kokomux" "$CACHE"
+    rm -rf "$CONF_DIR" "$SRV_DIR" "$HOME/.cache/kokomux" "$HOME/.local/share/kokomux" "$PREFIX/share/kokomux" "$CACHE"
     done_msg "Settings removed"
     rm -f "$0"
     done_msg "kokomux is uninstalled." "Thanks for trying it!"
@@ -591,20 +592,19 @@ fi
 # ------------------------------------------------------------ job folder
 
 tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
-gen_pid=""; play_pid=""
+gen_pid=""
 cleanup() {
   set +e   # best effort from here: a process that's already gone mustn't change the exit code
   status_clear
-  # (the player's functions exist only once player.sh is loaded: a run can stop before that)
-  [ "${in_line:-0}" = 1 ] && [ "${ui:-}" = inline ] && [ "${show_words:-0}" = 1 ] && declare -F block_finish >/dev/null && block_finish
-  declare -F tui_close >/dev/null && tui_close
+  [ "${in_line:-0}" = 1 ] && [ "${ui:-}" = inline ] && [ "${show_words:-0}" = 1 ] && block_finish
+  tui_close
   keys_off
   if [ "${ui:-none}" != none ] && [ -n "${book_id:-}" ] && [ -f "$BOOKS/$book_id.mark" ]; then
     [ "${SLEPT:-0}" = 1 ] && info "Sleep timer: good night."
     info "Stopped at part $(mark_get "$BOOKS/$book_id.mark" part) of $(mark_get "$BOOKS/$book_id.mark" parts). ${D}kokoro --continue picks up there.${R}"
   fi
-  if [ "${play:-0}" = 1 ]; then declare -F notify_clear >/dev/null && notify_clear; rm -f "$PLAYER_STATE"; fi
-  declare -F mpv_quit >/dev/null && mpv_quit
+  if [ "${play:-0}" = 1 ]; then notify_clear; rm -f "$PLAYER_STATE"; fi
+  mpv_quit
   [ "${WAKE:-0}" = 1 ] && termux-wake-unlock >/dev/null 2>&1
   [ -n "$gen_pid" ] && kill "$gen_pid" 2>/dev/null
   rm -rf "$tmpd"
@@ -693,7 +693,7 @@ show_words=0
 ui=none
 if [ "$play" = 1 ] && [ "$LIVE" = 1 ]; then
   ui=inline; keys_on
-  if [ "$KOKORO_TUI" = 1 ] && [ -n "$KBD" ] && declare -F tui_open >/dev/null && tui_fits; then ui=tui; fi
+  if [ "$KOKORO_TUI" = 1 ] && [ -n "$KBD" ] && tui_fits; then ui=tui; fi
 fi
 
 write_job() {    # the job, for the engine (where it starts and how fast can change mid-listen)
@@ -804,14 +804,6 @@ make_audiobook() { # make_audiobook WAV M4B
   [ "$rc" = 0 ] || die "ffmpeg couldn't make the audiobook." "$(tail -n 2 "$tmpd/ffmpeg.log")"
 }
 
-# ------------------------------------------------------------ the player
-# play_line and everything it needs live in player.sh, beside tui.sh.
-
-PLAYER_LIB="$PREFIX/share/kokomux/player.sh"
-[ -f "$PLAYER_LIB" ] || die "kokomux is only partly installed." "Run the installer again: kokoro --update"
-# shellcheck source=src/player.sh
-. "$PLAYER_LIB"
-
 # ------------------------------------------------------------ run
 
 if [ "$play" = 1 ]; then
@@ -856,7 +848,7 @@ while :; do
 done
 rc=0; wait "$gen_pid" || rc=$?
 gen_pid=""
-declare -F tui_close >/dev/null && tui_close
+tui_close
 status_clear
 if [ "$play" = 1 ] && [ "$rc" = 0 ]; then bookmark_done; book_id=""; fi   # read to the end: no bookmark
 

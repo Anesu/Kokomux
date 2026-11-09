@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Run kokoro from src/ against the stand-in phone that dev/rig.sh made in .dev/.
+# Sound goes nowhere (mpv --ao=null; its log is .dev/mpv.log); no server, no notifications.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DEV="$ROOT/.dev"
+[ -x "$DEV/bin/proot-distro" ] || { echo "Run dev/rig.sh first." >&2; exit 1; }
+export PREFIX="$DEV/prefix" HOME="$DEV/home" PATH="$DEV/bin:$DEV/prefix/bin:$PATH"
+export KOKORO_AUTOSERVE="${KOKORO_AUTOSERVE:-0}" KOKORO_NOTIFY=0
+export KOKORO_MPV_ARGS="--ao=null --log-file=$DEV/mpv.log"
+# kokoro runs itself again by "$0", so it needs a copy with a shebang that works here.
+{ echo '#!/usr/bin/env bash'; tail -n +2 "$ROOT/src/kokoro"; } > "$PREFIX/bin/kokoro"
+chmod +x "$PREFIX/bin/kokoro"
+exec "$PREFIX/bin/kokoro" "$@"

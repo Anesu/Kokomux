@@ -8,13 +8,28 @@ or through the background server:
   engine.py job /tmp/kokoro.XXXXXX/job      run one job
   engine.py serve [--port N] [--idle SECS]  keep the model loaded, serve jobs
   engine.py voices                          list voice names
-  engine.py download                        fetch model files (resumable)
+  engine.py download                        fetch the model and voices (resumable)
+  engine.py bench                           time Kokoro each way it can run here
+  (job and serve also take --threads N --block N: how onnxruntime runs)
 
-A job folder holds `job` (key=value lines: voice, speed, lang, and optionally
-url, out, stream, words, start, of) and `in.txt` (the text,
-unless url is set). A voice can be a blend: af_heart:70+bf_emma:30. Output goes into
-the same folder: `out.<ext>` for a saved file, and with stream=1 one WAV per
-chunk in `stream/0001.wav`, `stream/0002.wav`, ... followed by `stream/end`.
+A job folder holds `job` and `in.txt` (the text, unless url is set). `job` is
+key=value lines:
+
+  voice   a voice, or a blend: af_heart:70+bf_emma:30     speed  0.5 to 2.0
+  lang    en-us, en-gb, es, fr-fr, it, pt-br, hi, ja, cmn  name   what it's called
+  url     read this page instead of in.txt               out    out.<ext>: save a file
+  stream  1: one part at a time, for listening           words  1: word timings too
+  start   the part to begin at                          of     the bookmark's count of parts
+  cache   the book's id: keep parts in /tmp/kokomux-cache/<id>/, reuse them
+  meta    1: write the EPUB's author and cover (for an audiobook)
+
+What it writes into the folder: `title`, `progress` ("part total"), `chapters`
+("first-part<TAB>title" per line), `result` ("seconds-of-audio seconds-taken
+parts"), `out.<ext>` and `chapters_ms` when saving, and with stream=1
+`stream/NNNN.txt` (the part's text), `stream/NNNN.words` (its word timings),
+`stream/NNNN.wav` (its audio, with the pause after it; written last), `stream/first`
+(where it began) and `stream/end` once everything is made. With a cache, the
+stream files are relative links into it.
 """
 import argparse
 import hmac
@@ -38,7 +53,6 @@ MODELS = os.path.join(APP, "models")
 MODEL = os.path.join(MODELS, "kokoro-v1.0-timestamped.fp32.onnx")
 MODEL_SRC = ("https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX-timestamped/resolve/"
              "dd4401a9add81ac692d20e240d22ec9dda82cc29/onnx/model.onnx")
-OLD_MODELS = [os.path.join(MODELS, f) for f in ("kokoro-v1.0.int8.onnx", "kokoro-v1.0-timestamped.int8.onnx")]
 # A voice, or several blended: "af_heart", "af_heart+af_bella", "af_heart:70+af_bella:30"
 VOICE_SPEC = re.compile(r"^[a-z]{2}_[a-z]+(?::\d{1,3})?(?:\+[a-z]{2}_[a-z]+(?::\d{1,3})?){0,3}$")
 VOICES = os.path.join(MODELS, "voices-v1.0.bin")
@@ -347,10 +361,10 @@ def split_text(text):
     return chunks
 
 
-class _Extractor(HTMLParser):
-    """Pull readable text out of a web page: paragraphs, headings, list items.
-    Skips menus, sidebars, tables and citations, prefers <article>/<main>
-    content when there's enough of it, and stops at "References" etc."""
+class _ChapterText(HTMLParser):
+    """An EPUB chapter's readable text: paragraphs, headings, list items. Skips
+    navigation, tables and citations, prefers <article>/<main> content when there's
+    enough of it, and stops at "References" etc. (Web pages go through trafilatura.)"""
     SKIP_TAGS = {"script", "style", "noscript", "nav", "header", "footer", "aside",
                  "form", "svg", "button", "select", "template", "iframe", "table",
                  "figure", "sup", "math"}
@@ -377,9 +391,7 @@ class _Extractor(HTMLParser):
         self.block = None
         self.buf = []
         self.blocks = []  # (in_article, text)
-        self.heading = ""  # the first heading: an EPUB chapter's title
-        self.title = ""
-        self.in_title = False
+        self.heading = ""  # the first heading: the chapter's title
         self.done = False
 
     def handle_starttag(self, tag, attrs):
@@ -398,8 +410,6 @@ class _Extractor(HTMLParser):
             self.skip_tag, self.skip_depth = tag, 1
         elif tag in ("article", "main"):
             self.article += 1
-        elif tag == "title":
-            self.in_title = True
         elif tag in self.BLOCK:
             self._flush()
             self.block = tag
@@ -413,15 +423,11 @@ class _Extractor(HTMLParser):
             return
         if tag in ("article", "main") and self.article:
             self.article -= 1
-        elif tag == "title":
-            self.in_title = False
         elif tag in self.BLOCK:
             self._flush()
 
     def handle_data(self, data):
-        if self.in_title:
-            self.title += data
-        elif not self.skip_tag and self.block and not self.done:
+        if not self.skip_tag and self.block and not self.done:
             self.buf.append(data)
 
     def _flush(self):
@@ -437,20 +443,14 @@ class _Extractor(HTMLParser):
         self.buf = []
         self.block = None
 
-    def text(self, with_title=True):
+    def text(self):
         self._flush()
         art = [t for a, t in self.blocks if a]
         use = art if sum(map(len, art)) > 500 else [t for _, t in self.blocks]
         # Headings and list items often lack a full stop; end each block so it
         # gets its own pause.
         use = [t if t[-1] in ".!?…:;" else t + "." for t in use]
-        title = self.page_title()
-        if with_title and title and (not use or title.split(" - ")[0].split(" | ")[0] not in use[0]):
-            use.insert(0, title + ".")
         return "\n".join(use)
-
-    def page_title(self):
-        return re.sub(r"\s+", " ", self.title).strip()
 
 
 def fetch_url(url):
@@ -473,7 +473,7 @@ def fetch_url(url):
 
 
 # Where an article ends: from a heading like these on it's links, not reading.
-_PAGE_END = set(_Extractor.END_SECTIONS) | {
+_PAGE_END = set(_ChapterText.END_SECTIONS) | {
     "more recent articles", "recent articles", "recent posts", "related", "related posts", "related stories",
     "read more", "more from", "more stories", "you might also like", "you may also like", "popular",
     "most popular", "most read", "share this", "share", "tags", "about the author", "newsletter", "sign up"}
@@ -543,9 +543,9 @@ def read_epub(path, name):
                 inner = posixpath.normpath(posixpath.join(base, urllib.parse.unquote(href.split("#")[0])))
                 if inner not in names:
                     continue
-                ex = _Extractor()
+                ex = _ChapterText()
                 ex.feed(z.read(inner).decode("utf-8", "replace"))
-                chapter = ex.text(with_title=False)
+                chapter = ex.text()
                 if chapter.strip():
                     parts.append((ex.heading or f"Part {len(parts) + 1}", chapter))
     except JobError:
@@ -980,7 +980,7 @@ def serve(port, idle):
             pass
 
 
-# ------------------------------------------------------------------ download
+# ------------------------------------------------------------------ benchmark and download
 
 BENCH_TEXT = ("The road left the village at first light and climbed into the hills, where the fields "
               "gave way to heather. For three days she walked without meeting anyone, sleeping in the "
@@ -1046,10 +1046,6 @@ def download():
                 time.sleep(2 * attempt)
         else:
             sys.exit(f"Couldn't download {name}. Try again: it picks up where it stopped.")
-    for old in OLD_MODELS:     # the 8-bit models of earlier versions
-        for f in (old, old + ".part"):
-            if os.path.exists(f):
-                os.remove(f)
 
 
 # ------------------------------------------------------------------ voices

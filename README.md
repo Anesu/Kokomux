@@ -301,23 +301,36 @@ The installer only keeps what's needed in the container. It skips documentation 
 
 ## Development
 
-The files in `src/` are the source. `./build.sh` bundles them into the single `install.sh` that people download, so after editing anything in `src/`, run `./build.sh` and commit both.
+The files in `src/` are the source. `./build.sh` bundles them into the single `install.sh` that people download, so after editing anything in `src/`, run `./build.sh` and commit both. [AGENTS.md](AGENTS.md) explains how the pieces fit, the conventions and the traps.
+
+```
+dev/check.sh                 # build, then shellcheck, pyflakes and every test
+dev/rig.sh                   # once: a stand-in phone in .dev/ with the real Kokoro model
+dev/kokoro -p -f story.txt   # run kokoro from src/ on it
+python3 dev/screen.py --out reader.png -- dev/kokoro -p -f story.txt   # a picture of the screen
+```
 
 | File | What it is |
 |---|---|
 | `src/kokoro` | the `kokoro` command (Termux side) |
-| `src/player.sh` | playing a text: highlights, controls, bookmarks, chapters, sleep timer (Termux side) |
-| `src/tui.sh` | the full-screen reader, home screen and settings (Termux side) |
+| `src/player.sh` | playing a text: mpv, highlights, controls, bookmarks, chapters, sleep timer (Termux side) |
+| `src/tui.sh` | the full-screen reader, menu, home screen and settings (Termux side) |
 | `src/theme.sh` | the colours: dark and light palettes built from the terminal's background (Termux side and installer) |
 | `src/engine.py` | Kokoro engine, server, web-page reader and model downloader (container side) |
 | `src/words.py` | word timings from Kokoro's per-sound timings (container side) |
-| `tests/test_words.py` | tests for word timings, on recorded Kokoro output: `python3 tests/test_words.py` |
-| `tests/test_books.py` | tests for reading EPUB, PDF and text: `python3 tests/test_books.py` |
-| `tests/test_text.py` | tests for tidying text and splitting it into parts: `python3 tests/test_text.py` |
-| `tests/test_job.py` | tests for running a job with a stand-in for Kokoro (pauses, kept parts, blends, misaki, chapter times, old bookmarks): `python3 tests/test_job.py` |
-| `tests/test_web.py` | tests for reading web pages (needs trafilatura): `python3 tests/test_web.py` |
-| `tests/test_reader.py` | tests for the reader's focus effect: `python3 tests/test_reader.py` |
-| `tests/test_theme.py` | tests for the colours: contrast on 15 terminal themes, the golden steps, asking the terminal: `python3 tests/test_theme.py` |
 | `src/setup-container.sh` | installs everything inside the container |
 | `src/install.sh` | installer template (UI, checks, steps) |
 | `VERSION` | the version stamped into both by `build.sh` |
+| `tests/test_words.py` | word timings, on recorded Kokoro output |
+| `tests/test_books.py` | reading EPUB, PDF and text |
+| `tests/test_text.py` | tidying text and splitting it into parts |
+| `tests/test_job.py` | running a job with a stand-in for Kokoro: pauses, kept parts, blends, misaki, chapter times, bookmarks |
+| `tests/test_web.py` | reading web pages (needs trafilatura) |
+| `tests/test_reader.py` | the reader's focus effect |
+| `tests/test_settings.py` | every setting in the menu changes and is saved |
+| `tests/test_theme.py` | the colours: contrast on 15 terminal themes, the golden steps, asking the terminal |
+| `dev/check.sh` | everything to run before a commit |
+| `dev/rig.sh`, `dev/kokoro` | a stand-in phone (fake `$PREFIX`, container venv, models) to run kokoro for real |
+| `dev/screen.py`, `dev/shot.js` | runs a command in a terminal and saves its screen as HTML and PNG |
+
+Each test file runs on its own (`python3 tests/test_text.py`) or with pytest.

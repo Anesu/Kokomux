@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # kokomux: runs inside the "kokoro" Debian container (as root), one phase
 # per call, from install.sh:  bash setup.sh apt|pip|models|tidy
 set -euo pipefail
@@ -31,13 +32,8 @@ CFG
       "misaki>=0.7.4,<0.8" num2words "spacy>=3.8,<3.9" \
       "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" \
       | tee /tmp/kokoro-setup/.pip
-    # Before 0.8, Whistle (cactus-compute) timed the words; Kokoro does that itself now.
-    # It and the packages only it needed are removed (spaCy needs tqdm, click, anyio and h11).
-    "$APP/venv/bin/pip" uninstall -y cactus-compute pillow huggingface-hub hf-xet fsspec filelock \
-      pyyaml httpcore2 httpx2 truststore 2>/dev/null || true
     grep -q '^Successfully installed' /tmp/kokoro-setup/.pip || printf 'up to date' > "$SRC/.note"
     cp "$SRC/engine.py" "$SRC/words.py" "$APP/"
-    rm -f "$APP/speak.py"   # from older versions
     ;;
   models)
     if [ -s "$APP/models/kokoro-v1.0-timestamped.fp32.onnx" ] && [ -s "$APP/models/voices-v1.0.bin" ]; then
@@ -48,7 +44,6 @@ CFG
   tidy)
     apt-get clean
     rm -rf /var/lib/apt/lists/* /root/.cache/pip /usr/share/man/* /usr/share/info/*
-    rm -rf /root/.cache/cactus /root/.cache/cactus-needle /root/.cache/huggingface/hub/models--Cactus-Compute--*   # old Whistle files
     find /usr/share/doc -mindepth 2 ! -name copyright -delete 2>/dev/null || true
     ;;
   *)

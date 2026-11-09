@@ -1,15 +1,30 @@
 # kokomux: the full-screen interface. Sourced by `kokoro` (bash).
 # shellcheck shell=bash disable=SC2034,SC2153,SC2154  # shares its globals with kokoro
 #
-#   tui_home              the home screen: books in progress, and ways to start
-#   tui_open / tui_close  the reader: header, a centred reading column with the
-#                         spoken word lit, a progress bar and clickable buttons
+#   tui_home              the home screen: books in progress, the queue, ways to start
+#   tui_open / tui_close  the reader: a header, a centred reading column with the
+#                         spoken word lit, and a footer (state, progress bar,
+#                         Again / Pause / Next, speed, sleep and Menu)
+#   tui_menu, tui_chapters  overlays on the reader (they leave a choice in CMD_PENDING)
+#   tui_settings, tui_voices  the settings screen and the voice picker
+#
+# Sections: core (size, frames, raw keys), drawing, the reader's view API (what
+# player.sh calls), the home screen, settings.
+#
+# Drawing rules:
+#   - Never write to the terminal directly: `out FORMAT ARGS` adds to FRAME and
+#     `flush` writes it in one go. tick (in kokoro) flushes before it waits for
+#     a key, so each frame reaches Termux whole (no flicker).
+#   - Redraw only what changed: in the view API, tui_part redraws the reader,
+#     tui_light only the reading column, tui_state only the footer (and only
+#     when it changed), tui_anim the column while the part just heard eases out.
+#   - Rows and widths come from tui_size/tui_layout (TW TH CW LM and the footer
+#     rows FT_*); recompute them, don't hard-code.
 #
 # Built for any terminal size: a phone held upright, or Samsung DeX with a
-# keyboard and mouse. It uses the alternate screen (your scrollback is left as
-# it was), redraws only what changes, wraps each frame in synchronised output
-# where the terminal supports it, and redraws on resize. Mouse clicks and taps
-# are read as SGR mouse reports.
+# keyboard and mouse. It uses the alternate screen (scrollback is left as it
+# was), wraps each frame in synchronised output, and redraws on resize. Mouse
+# clicks and taps are read as SGR mouse reports (TUI_BTN holds the buttons).
 #
 # Colours come from theme.sh (R B D PAST LINE GHOST ACC ACC2 GRN HL SURF SEL
 # PSEL): when a screen opens it asks the terminal for its colours, so the greys
@@ -24,9 +39,12 @@
 # φ⁻⁴ at the edges. Ahead of the voice the next words are in sharpest focus,
 # and the part just heard eases out of focus over 382 ms.
 #
+# Adding a setting: KOKORO_DEFAULTS (kokoro), TUI_SETTINGS, setting_value and
+# setting_change (here), and tests/test_settings.py.
+#
 # Expects from kokoro: the colours, $tmpd, $KBD (a read descriptor on
-# /dev/tty), KEY (set by tick), and for the home screen BOOKS, CONF, mark_get,
-# KOKORO_VOICE and KOKORO_SPEED.
+# /dev/tty), tick (sets KEY; runs $TICK_BG while it waits), now_ms,
+# and for the home screen BOOKS, QUEUE, CONF, mark_get and the KOKORO_* settings.
 
 TUI=0; TUI_TTY=""; TUI_RESIZED=0
 TW=80; TH=24; CW=72; LM=4             # screen size; reading column width and margin
@@ -86,7 +104,6 @@ tui_enter() {    # the alternate screen, raw keys, and the colours for a full sc
 }
 
 tui_theme() {    # ask the terminal its colours (once), then pick the palette
-  declare -F theme_apply >/dev/null || return 0
   [ "$THEME_ON" = 1 ] || return 0                             # no colours (NO_COLOR)
   [ "$THEME_ASKED" = 1 ] || theme_detect || true
   theme_apply screen
@@ -107,7 +124,7 @@ tui_close() {
   trap - WINCH
   TUI=0
   # back to the terminal's own colours for what's printed after
-  [ "$THEME_PAINT" = 1 ] && declare -F theme_apply >/dev/null && theme_apply
+  [ "$THEME_PAINT" = 1 ] && theme_apply
   return 0
 }
 

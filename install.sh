@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.15.3"
+KOKOMUX_VERSION="0.15.4"
 DISTRO=kokoro
 
 ASSUME_YES=0; VERBOSE=0
@@ -574,13 +574,28 @@ or through the background server:
   engine.py job /tmp/kokoro.XXXXXX/job      run one job
   engine.py serve [--port N] [--idle SECS]  keep the model loaded, serve jobs
   engine.py voices                          list voice names
-  engine.py download                        fetch model files (resumable)
+  engine.py download                        fetch the model and voices (resumable)
+  engine.py bench                           time Kokoro each way it can run here
+  (job and serve also take --threads N --block N: how onnxruntime runs)
 
-A job folder holds `job` (key=value lines: voice, speed, lang, and optionally
-url, out, stream, words, start, of) and `in.txt` (the text,
-unless url is set). A voice can be a blend: af_heart:70+bf_emma:30. Output goes into
-the same folder: `out.<ext>` for a saved file, and with stream=1 one WAV per
-chunk in `stream/0001.wav`, `stream/0002.wav`, ... followed by `stream/end`.
+A job folder holds `job` and `in.txt` (the text, unless url is set). `job` is
+key=value lines:
+
+  voice   a voice, or a blend: af_heart:70+bf_emma:30     speed  0.5 to 2.0
+  lang    en-us, en-gb, es, fr-fr, it, pt-br, hi, ja, cmn  name   what it's called
+  url     read this page instead of in.txt               out    out.<ext>: save a file
+  stream  1: one part at a time, for listening           words  1: word timings too
+  start   the part to begin at                          of     the bookmark's count of parts
+  cache   the book's id: keep parts in /tmp/kokomux-cache/<id>/, reuse them
+  meta    1: write the EPUB's author and cover (for an audiobook)
+
+What it writes into the folder: `title`, `progress` ("part total"), `chapters`
+("first-part<TAB>title" per line), `result` ("seconds-of-audio seconds-taken
+parts"), `out.<ext>` and `chapters_ms` when saving, and with stream=1
+`stream/NNNN.txt` (the part's text), `stream/NNNN.words` (its word timings),
+`stream/NNNN.wav` (its audio, with the pause after it; written last), `stream/first`
+(where it began) and `stream/end` once everything is made. With a cache, the
+stream files are relative links into it.
 """
 import argparse
 import hmac
@@ -604,7 +619,6 @@ MODELS = os.path.join(APP, "models")
 MODEL = os.path.join(MODELS, "kokoro-v1.0-timestamped.fp32.onnx")
 MODEL_SRC = ("https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX-timestamped/resolve/"
              "dd4401a9add81ac692d20e240d22ec9dda82cc29/onnx/model.onnx")
-OLD_MODELS = [os.path.join(MODELS, f) for f in ("kokoro-v1.0.int8.onnx", "kokoro-v1.0-timestamped.int8.onnx")]
 # A voice, or several blended: "af_heart", "af_heart+af_bella", "af_heart:70+af_bella:30"
 VOICE_SPEC = re.compile(r"^[a-z]{2}_[a-z]+(?::\d{1,3})?(?:\+[a-z]{2}_[a-z]+(?::\d{1,3})?){0,3}$")
 VOICES = os.path.join(MODELS, "voices-v1.0.bin")
@@ -913,10 +927,10 @@ def split_text(text):
     return chunks
 
 
-class _Extractor(HTMLParser):
-    """Pull readable text out of a web page: paragraphs, headings, list items.
-    Skips menus, sidebars, tables and citations, prefers <article>/<main>
-    content when there's enough of it, and stops at "References" etc."""
+class _ChapterText(HTMLParser):
+    """An EPUB chapter's readable text: paragraphs, headings, list items. Skips
+    navigation, tables and citations, prefers <article>/<main> content when there's
+    enough of it, and stops at "References" etc. (Web pages go through trafilatura.)"""
     SKIP_TAGS = {"script", "style", "noscript", "nav", "header", "footer", "aside",
                  "form", "svg", "button", "select", "template", "iframe", "table",
                  "figure", "sup", "math"}
@@ -943,9 +957,7 @@ class _Extractor(HTMLParser):
         self.block = None
         self.buf = []
         self.blocks = []  # (in_article, text)
-        self.heading = ""  # the first heading: an EPUB chapter's title
-        self.title = ""
-        self.in_title = False
+        self.heading = ""  # the first heading: the chapter's title
         self.done = False
 
     def handle_starttag(self, tag, attrs):
@@ -964,8 +976,6 @@ class _Extractor(HTMLParser):
             self.skip_tag, self.skip_depth = tag, 1
         elif tag in ("article", "main"):
             self.article += 1
-        elif tag == "title":
-            self.in_title = True
         elif tag in self.BLOCK:
             self._flush()
             self.block = tag
@@ -979,15 +989,11 @@ class _Extractor(HTMLParser):
             return
         if tag in ("article", "main") and self.article:
             self.article -= 1
-        elif tag == "title":
-            self.in_title = False
         elif tag in self.BLOCK:
             self._flush()
 
     def handle_data(self, data):
-        if self.in_title:
-            self.title += data
-        elif not self.skip_tag and self.block and not self.done:
+        if not self.skip_tag and self.block and not self.done:
             self.buf.append(data)
 
     def _flush(self):
@@ -1003,20 +1009,14 @@ class _Extractor(HTMLParser):
         self.buf = []
         self.block = None
 
-    def text(self, with_title=True):
+    def text(self):
         self._flush()
         art = [t for a, t in self.blocks if a]
         use = art if sum(map(len, art)) > 500 else [t for _, t in self.blocks]
         # Headings and list items often lack a full stop; end each block so it
         # gets its own pause.
         use = [t if t[-1] in ".!?…:;" else t + "." for t in use]
-        title = self.page_title()
-        if with_title and title and (not use or title.split(" - ")[0].split(" | ")[0] not in use[0]):
-            use.insert(0, title + ".")
         return "\n".join(use)
-
-    def page_title(self):
-        return re.sub(r"\s+", " ", self.title).strip()
 
 
 def fetch_url(url):
@@ -1039,7 +1039,7 @@ def fetch_url(url):
 
 
 # Where an article ends: from a heading like these on it's links, not reading.
-_PAGE_END = set(_Extractor.END_SECTIONS) | {
+_PAGE_END = set(_ChapterText.END_SECTIONS) | {
     "more recent articles", "recent articles", "recent posts", "related", "related posts", "related stories",
     "read more", "more from", "more stories", "you might also like", "you may also like", "popular",
     "most popular", "most read", "share this", "share", "tags", "about the author", "newsletter", "sign up"}
@@ -1109,9 +1109,9 @@ def read_epub(path, name):
                 inner = posixpath.normpath(posixpath.join(base, urllib.parse.unquote(href.split("#")[0])))
                 if inner not in names:
                     continue
-                ex = _Extractor()
+                ex = _ChapterText()
                 ex.feed(z.read(inner).decode("utf-8", "replace"))
-                chapter = ex.text(with_title=False)
+                chapter = ex.text()
                 if chapter.strip():
                     parts.append((ex.heading or f"Part {len(parts) + 1}", chapter))
     except JobError:
@@ -1546,7 +1546,7 @@ def serve(port, idle):
             pass
 
 
-# ------------------------------------------------------------------ download
+# ------------------------------------------------------------------ benchmark and download
 
 BENCH_TEXT = ("The road left the village at first light and climbed into the hills, where the fields "
               "gave way to heather. For three days she walked without meeting anyone, sleeping in the "
@@ -1612,10 +1612,6 @@ def download():
                 time.sleep(2 * attempt)
         else:
             sys.exit(f"Couldn't download {name}. Try again: it picks up where it stopped.")
-    for old in OLD_MODELS:     # the 8-bit models of earlier versions
-        for f in (old, old + ".part"):
-            if os.path.exists(f):
-                os.remove(f)
 
 
 # ------------------------------------------------------------------ voices
@@ -1841,15 +1837,30 @@ cat > "$WORK/tui.sh" <<'__KOKOMUX_TUI__'
 # kokomux: the full-screen interface. Sourced by `kokoro` (bash).
 # shellcheck shell=bash disable=SC2034,SC2153,SC2154  # shares its globals with kokoro
 #
-#   tui_home              the home screen: books in progress, and ways to start
-#   tui_open / tui_close  the reader: header, a centred reading column with the
-#                         spoken word lit, a progress bar and clickable buttons
+#   tui_home              the home screen: books in progress, the queue, ways to start
+#   tui_open / tui_close  the reader: a header, a centred reading column with the
+#                         spoken word lit, and a footer (state, progress bar,
+#                         Again / Pause / Next, speed, sleep and Menu)
+#   tui_menu, tui_chapters  overlays on the reader (they leave a choice in CMD_PENDING)
+#   tui_settings, tui_voices  the settings screen and the voice picker
+#
+# Sections: core (size, frames, raw keys), drawing, the reader's view API (what
+# player.sh calls), the home screen, settings.
+#
+# Drawing rules:
+#   - Never write to the terminal directly: `out FORMAT ARGS` adds to FRAME and
+#     `flush` writes it in one go. tick (in kokoro) flushes before it waits for
+#     a key, so each frame reaches Termux whole (no flicker).
+#   - Redraw only what changed: in the view API, tui_part redraws the reader,
+#     tui_light only the reading column, tui_state only the footer (and only
+#     when it changed), tui_anim the column while the part just heard eases out.
+#   - Rows and widths come from tui_size/tui_layout (TW TH CW LM and the footer
+#     rows FT_*); recompute them, don't hard-code.
 #
 # Built for any terminal size: a phone held upright, or Samsung DeX with a
-# keyboard and mouse. It uses the alternate screen (your scrollback is left as
-# it was), redraws only what changes, wraps each frame in synchronised output
-# where the terminal supports it, and redraws on resize. Mouse clicks and taps
-# are read as SGR mouse reports.
+# keyboard and mouse. It uses the alternate screen (scrollback is left as it
+# was), wraps each frame in synchronised output, and redraws on resize. Mouse
+# clicks and taps are read as SGR mouse reports (TUI_BTN holds the buttons).
 #
 # Colours come from theme.sh (R B D PAST LINE GHOST ACC ACC2 GRN HL SURF SEL
 # PSEL): when a screen opens it asks the terminal for its colours, so the greys
@@ -1864,9 +1875,12 @@ cat > "$WORK/tui.sh" <<'__KOKOMUX_TUI__'
 # φ⁻⁴ at the edges. Ahead of the voice the next words are in sharpest focus,
 # and the part just heard eases out of focus over 382 ms.
 #
+# Adding a setting: KOKORO_DEFAULTS (kokoro), TUI_SETTINGS, setting_value and
+# setting_change (here), and tests/test_settings.py.
+#
 # Expects from kokoro: the colours, $tmpd, $KBD (a read descriptor on
-# /dev/tty), KEY (set by tick), and for the home screen BOOKS, CONF, mark_get,
-# KOKORO_VOICE and KOKORO_SPEED.
+# /dev/tty), tick (sets KEY; runs $TICK_BG while it waits), now_ms,
+# and for the home screen BOOKS, QUEUE, CONF, mark_get and the KOKORO_* settings.
 
 TUI=0; TUI_TTY=""; TUI_RESIZED=0
 TW=80; TH=24; CW=72; LM=4             # screen size; reading column width and margin
@@ -1926,7 +1940,6 @@ tui_enter() {    # the alternate screen, raw keys, and the colours for a full sc
 }
 
 tui_theme() {    # ask the terminal its colours (once), then pick the palette
-  declare -F theme_apply >/dev/null || return 0
   [ "$THEME_ON" = 1 ] || return 0                             # no colours (NO_COLOR)
   [ "$THEME_ASKED" = 1 ] || theme_detect || true
   theme_apply screen
@@ -1947,7 +1960,7 @@ tui_close() {
   trap - WINCH
   TUI=0
   # back to the terminal's own colours for what's printed after
-  [ "$THEME_PAINT" = 1 ] && declare -F theme_apply >/dev/null && theme_apply
+  [ "$THEME_PAINT" = 1 ] && theme_apply
   return 0
 }
 
@@ -2782,15 +2795,28 @@ cat > "$WORK/player.sh" <<'__KOKOMUX_PLAYER__'
 # kokomux: the player. Sourced by `kokoro` (bash) once a listening run is set up.
 # shellcheck shell=bash disable=SC2034,SC2153,SC2154  # shares its globals with kokoro
 #
-#   play_line WAV IDX     plays one part: the inline view or the full-screen
-#                         reader (via the view API below), word highlights,
-#                         pause / next / again, bookmarks and the notification
-#   listen_cmd CMD PART   chapters, speed, the sleep timer and seeking, which
-#                         restart the reading at a part (jump_to)
+#   play_line WAV IDX     plays one part through mpv: the inline view or the
+#                         full-screen reader (via tui.sh's view API), word
+#                         highlights, keys and clicks, bookmarks, the notification
+#   listen_cmd CMD PART   pause, next/again, speed, the sleep timer, chapters,
+#                         seeking, the menu, settings and the voice picker; those
+#                         that change what's heard restart the reading at a part
+#                         (jump_to), reusing parts already made
+#   go_home               stop, keeping the place, and open the home screen
+#
+# Sections: the inline view (the line being heard), listening (bookmarks,
+# notifications, chapters, the sleep timer, commands), mpv (one gapless
+# playlist for the whole listen, driven over its IPC socket), play_line.
+#
+# The engine writes each part into $tmpd/stream as NNNN.txt, NNNN.words and
+# NNNN.wav (links into the cache, $CACHE/BOOK_ID/SETTINGS/), and stream/end
+# when it has made the last one. play_line plays part i; player_bg queues
+# the next part to mpv as soon as it exists, also while an overlay is open.
 #
 # Expects from kokoro: the run's globals (tmpd, play, ui, show_words, voice,
-# speed, lang, name, kind, source, text, book_id, start, i), the colours (HL),
-# status/status_clear, tick, now_ms, write_job and run_engine.
+# speed, lang, name, kind, source, text, book_id, start, i), CACHE, QUIT_RC,
+# the colours (HL), status/status_clear, die, tick, now_ms, cleanup,
+# write_job and run_engine.
 
 # ------------------------------------------------------------ the line being heard
 # Each line is printed wrapped to the screen while it plays, and a soft
@@ -3061,7 +3087,6 @@ mpv_start() {
   # shellcheck disable=SC2086  # KOKORO_MPV_ARGS: extra mpv options, word by word
   mpv --idle=yes --no-video --no-terminal --really-quiet --gapless-audio=yes --audio-display=no \
       --input-ipc-server="$MPV_SOCK" ${KOKORO_MPV_ARGS:-} </dev/null >/dev/null 2>&1 & MPV_PID=$!
-  play_pid=$MPV_PID                # (cleanup stops it)
   local n=0
   while [ ! -S "$MPV_SOCK" ]; do
     n=$(( n + 1 )); [ "$n" -lt 250 ] || die "mpv didn't start." "Try: mpv --version"
@@ -3432,6 +3457,7 @@ theme_name() {   # what the settings menu shows beside "Colours"
 __KOKOMUX_THEME__
 
 cat > "$WORK/setup.sh" <<'__KOKOMUX_SETUP__'
+# shellcheck shell=bash
 # kokomux: runs inside the "kokoro" Debian container (as root), one phase
 # per call, from install.sh:  bash setup.sh apt|pip|models|tidy
 set -euo pipefail
@@ -3465,13 +3491,8 @@ CFG
       "misaki>=0.7.4,<0.8" num2words "spacy>=3.8,<3.9" \
       "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" \
       | tee /tmp/kokoro-setup/.pip
-    # Before 0.8, Whistle (cactus-compute) timed the words; Kokoro does that itself now.
-    # It and the packages only it needed are removed (spaCy needs tqdm, click, anyio and h11).
-    "$APP/venv/bin/pip" uninstall -y cactus-compute pillow huggingface-hub hf-xet fsspec filelock \
-      pyyaml httpcore2 httpx2 truststore 2>/dev/null || true
     grep -q '^Successfully installed' /tmp/kokoro-setup/.pip || printf 'up to date' > "$SRC/.note"
     cp "$SRC/engine.py" "$SRC/words.py" "$APP/"
-    rm -f "$APP/speak.py"   # from older versions
     ;;
   models)
     if [ -s "$APP/models/kokoro-v1.0-timestamped.fp32.onnx" ] && [ -s "$APP/models/voices-v1.0.bin" ]; then
@@ -3482,7 +3503,6 @@ CFG
   tidy)
     apt-get clean
     rm -rf /var/lib/apt/lists/* /root/.cache/pip /usr/share/man/* /usr/share/info/*
-    rm -rf /root/.cache/cactus /root/.cache/cactus-needle /root/.cache/huggingface/hub/models--Cactus-Compute--*   # old Whistle files
     find /usr/share/doc -mindepth 2 ! -name copyright -delete 2>/dev/null || true
     ;;
   *)
@@ -3495,12 +3515,18 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
 # kokomux: the `kokoro` command. https://github.com/Anesu/kokomux
 #
 # Turns text into speech with Kokoro, which lives in the "kokoro"
-# proot-distro container. Jobs go through $PREFIX/tmp, which the container
-# sees as /tmp. If the background server is running, jobs go to it over
-# localhost (fast); otherwise each call starts the container (slower).
+# proot-distro container (/opt/kokoro: engine.py, its venv and the models).
+# Each run writes a job folder in $PREFIX/tmp, which the container sees as
+# /tmp, and the engine fills its stream/ folder part by part. If the
+# background server is running, jobs go to it over localhost (fast);
+# otherwise each run starts the container (slower).
+#
+# This file: settings, admin commands (--status, --update, the queue, ...),
+# options, the job folder, then the run. The screens are in tui.sh, playing
+# in player.sh, the colours in theme.sh (all three loaded below).
 set -euo pipefail
 
-KOKOMUX_VERSION="0.15.3"
+KOKOMUX_VERSION="0.15.4"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -3562,26 +3588,25 @@ esac
 # Messages go to stderr. Colours and live status only on a terminal, so
 # scripts and pipes get plain, quiet output.
 
-# The colours (theme.sh) follow the terminal: a dark or light palette, made
-# from its own background where it has told us what that is.
+# The rest of kokomux lives beside this command, in $PREFIX/share/kokomux:
+# theme.sh (the colours), tui.sh (the full-screen screens) and player.sh
+# (playing a text). The installer puts all three there.
+LIB="$PREFIX/share/kokomux"
+for f in theme.sh tui.sh player.sh; do
+  [ -f "$LIB/$f" ] || { echo "kokomux is only partly installed ($f is missing). Run the installer again." >&2; exit 1; }
+done
+# shellcheck source=src/theme.sh
+. "$LIB/theme.sh"
+# shellcheck source=src/tui.sh
+. "$LIB/tui.sh"
+# shellcheck source=src/player.sh
+. "$LIB/player.sh"
+
+# The colours follow the terminal: a dark or light palette, made from its own
+# background where it has told us what that is.
 LIVE=0
 if [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then LIVE=1; fi
-THEME_MODE=dark THEME_PAINT=0 THEME_ON=0 THEME_ASKED=0   # (theme.sh sets these properly)
-THEME_LIB="$PREFIX/share/kokomux/theme.sh"
-# shellcheck source=src/theme.sh
-[ -f "$THEME_LIB" ] && . "$THEME_LIB"
-# shellcheck disable=SC2034  # the screens and the player use them
-if [ "$LIVE" = 1 ] && declare -F theme_apply >/dev/null; then
-  theme_apply
-elif [ "$LIVE" = 1 ]; then                    # theme.sh missing (a half-finished update)
-  R=$'\033[0m' B=$'\033[1m' D=$'\033[2m' ACC=$'\033[38;5;141m' ACC2=$'\033[38;5;117m'
-  GRN=$'\033[38;5;114m' RED=$'\033[38;5;203m' YEL=$'\033[38;5;221m'
-  PAST=$'\033[38;5;245m' LINE=$D GHOST=$'\033[38;5;237m' HL=$'\033[48;5;61m\033[38;5;231m'
-  SURF=$'\033[48;5;236m' SEL=$'\033[48;5;237m' PSEL=$'\033[48;5;238m' BASE="" ACC_SGR="38;5;141" D_SGR=2
-else
-  R="" B="" D="" ACC="" ACC2="" GRN="" RED="" YEL="" PAST="" LINE="" GHOST="" HL=""
-  SURF="" SEL="" PSEL="" BASE="" ACC_SGR="" D_SGR=""
-fi
+if [ "$LIVE" = 1 ]; then theme_apply; else theme_off; fi
 SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
 frame=0
 
@@ -3593,7 +3618,7 @@ cols() {
 
 # die "what went wrong" ["what to do about it"]
 die() {
-  declare -F tui_close >/dev/null && tui_close
+  tui_close
   status_clear
   printf '%s✗%s %s\n' "$RED" "$R" "$1" >&2
   [ -n "${2:-}" ] && printf '  %s%s%s\n' "$D" "$2" "$R" >&2
@@ -3833,12 +3858,8 @@ key_cmd() {      # what KEY asks for (or a clicked button): see the player for e
   KEY=""
 }
 
-TUI_LIB="$PREFIX/share/kokomux/tui.sh"
-# shellcheck source=src/tui.sh
-[ -f "$TUI_LIB" ] && . "$TUI_LIB"
-
 # kokoro on its own, on a terminal: the home screen.
-if [ $# = 0 ] && [ "$LIVE" = 1 ] && [ -t 0 ] && [ -t 1 ] && declare -F tui_home >/dev/null; then
+if [ $# = 0 ] && [ "$LIVE" = 1 ] && [ -t 0 ] && [ -t 1 ]; then
   keys_on
   trap 'tui_close; keys_off; exit 130' INT TERM HUP
   tui_home
@@ -3979,7 +4000,7 @@ case "${1:-}" in
     printf '    %sChange them with: kokoro --settings%s\n' "$D" "$R"
     exit 0 ;;
   --settings)
-    if [ "$LIVE" = 1 ] && [ -t 0 ] && declare -F tui_settings >/dev/null; then
+    if [ "$LIVE" = 1 ] && [ -t 0 ]; then
       keys_on
       trap 'tui_close; keys_off; exit 130' INT TERM HUP
       tui_settings
@@ -4017,7 +4038,7 @@ case "${1:-}" in
              "$HOME/.shortcuts/tasks/"Kokoro*; do
       if [ -f "$f" ] && grep -q '^# kokomux' "$f"; then rm -f "$f"; done_msg "Removed $(tilde "$f")"; fi
     done
-    rm -rf "$CONF_DIR" "$SRV_DIR" "$HOME/kokoro-test.wav" "$HOME/.cache/kokomux" "$HOME/.local/share/kokomux" "$PREFIX/share/kokomux" "$CACHE"
+    rm -rf "$CONF_DIR" "$SRV_DIR" "$HOME/.cache/kokomux" "$HOME/.local/share/kokomux" "$PREFIX/share/kokomux" "$CACHE"
     done_msg "Settings removed"
     rm -f "$0"
     done_msg "kokomux is uninstalled." "Thanks for trying it!"
@@ -4084,20 +4105,19 @@ fi
 # ------------------------------------------------------------ job folder
 
 tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
-gen_pid=""; play_pid=""
+gen_pid=""
 cleanup() {
   set +e   # best effort from here: a process that's already gone mustn't change the exit code
   status_clear
-  # (the player's functions exist only once player.sh is loaded: a run can stop before that)
-  [ "${in_line:-0}" = 1 ] && [ "${ui:-}" = inline ] && [ "${show_words:-0}" = 1 ] && declare -F block_finish >/dev/null && block_finish
-  declare -F tui_close >/dev/null && tui_close
+  [ "${in_line:-0}" = 1 ] && [ "${ui:-}" = inline ] && [ "${show_words:-0}" = 1 ] && block_finish
+  tui_close
   keys_off
   if [ "${ui:-none}" != none ] && [ -n "${book_id:-}" ] && [ -f "$BOOKS/$book_id.mark" ]; then
     [ "${SLEPT:-0}" = 1 ] && info "Sleep timer: good night."
     info "Stopped at part $(mark_get "$BOOKS/$book_id.mark" part) of $(mark_get "$BOOKS/$book_id.mark" parts). ${D}kokoro --continue picks up there.${R}"
   fi
-  if [ "${play:-0}" = 1 ]; then declare -F notify_clear >/dev/null && notify_clear; rm -f "$PLAYER_STATE"; fi
-  declare -F mpv_quit >/dev/null && mpv_quit
+  if [ "${play:-0}" = 1 ]; then notify_clear; rm -f "$PLAYER_STATE"; fi
+  mpv_quit
   [ "${WAKE:-0}" = 1 ] && termux-wake-unlock >/dev/null 2>&1
   [ -n "$gen_pid" ] && kill "$gen_pid" 2>/dev/null
   rm -rf "$tmpd"
@@ -4186,7 +4206,7 @@ show_words=0
 ui=none
 if [ "$play" = 1 ] && [ "$LIVE" = 1 ]; then
   ui=inline; keys_on
-  if [ "$KOKORO_TUI" = 1 ] && [ -n "$KBD" ] && declare -F tui_open >/dev/null && tui_fits; then ui=tui; fi
+  if [ "$KOKORO_TUI" = 1 ] && [ -n "$KBD" ] && tui_fits; then ui=tui; fi
 fi
 
 write_job() {    # the job, for the engine (where it starts and how fast can change mid-listen)
@@ -4297,14 +4317,6 @@ make_audiobook() { # make_audiobook WAV M4B
   [ "$rc" = 0 ] || die "ffmpeg couldn't make the audiobook." "$(tail -n 2 "$tmpd/ffmpeg.log")"
 }
 
-# ------------------------------------------------------------ the player
-# play_line and everything it needs live in player.sh, beside tui.sh.
-
-PLAYER_LIB="$PREFIX/share/kokomux/player.sh"
-[ -f "$PLAYER_LIB" ] || die "kokomux is only partly installed." "Run the installer again: kokoro --update"
-# shellcheck source=src/player.sh
-. "$PLAYER_LIB"
-
 # ------------------------------------------------------------ run
 
 if [ "$play" = 1 ]; then
@@ -4349,7 +4361,7 @@ while :; do
 done
 rc=0; wait "$gen_pid" || rc=$?
 gen_pid=""
-declare -F tui_close >/dev/null && tui_close
+tui_close
 status_clear
 if [ "$play" = 1 ] && [ "$rc" = 0 ]; then bookmark_done; book_id=""; fi   # read to the end: no bookmark
 
@@ -4399,7 +4411,6 @@ termux_packages() {
   pkg upgrade "${apt_opts[@]}"
   # mpv plays (gaplessly), socat talks to it, ffmpeg makes audiobooks.
   pkg install "${apt_opts[@]}" proot-distro curl mpv socat ffmpeg termux-api
-  pkg uninstall -y play-audio >/dev/null 2>&1 || true     # (before 0.15)
 }
 
 debian_container() {
@@ -4485,13 +4496,8 @@ KOKORO_THEME=auto
 KOKORO_FOCUS=1
 CFG
   fi
-  # Settings from 0.11-0.13 that no longer exist: the model is always full precision,
-  # and English always goes through misaki. And play-audio's 100 ms start-up delay,
-  # which mpv's clock doesn't have.
-  sed -i '/^KOKORO_QUALITY=/d; /^KOKORO_PRONUNCIATION=/d; s/^KOKORO_WORDS_OFFSET_MS=100\b/KOKORO_WORDS_OFFSET_MS=0/' "$conf"
 
-  # Share a link to Termux -> read the page. Share text or a file -> read it.
-  # Shared links and files go to the queue (kokoro --queue plays it).
+  # Shared links, text and files go to the queue (kokoro --queue plays it).
   put "$HOME/bin/termux-url-opener" 'kokoro --add -u "$1"; sleep 1'
   put "$HOME/bin/termux-file-editor" 'case "$(head -c 4 "$1")" in %PDF*|PK*) kokoro --add -f "$1"; sleep 1; exit ;; esac   # PDF, EPUB
 if grep -Iq . "$1"; then kokoro --add -f "$1"; sleep 1; exit; fi
@@ -4509,7 +4515,6 @@ echo "kokoro: that file is not text, an EPUB or a PDF"; sleep 3'
 
 GREETING="Hi! kokomux is ready. Type kokoro, dash p, and some text, and I'll read it to you."
 voice_test() {
-  rm -f "$HOME/kokoro-test.wav"   # left by older versions
   kokoro -o "$WORK/hello.wav" "$GREETING"
   # Is the Termux:API app there? (termux-* commands hang without it.)
   mkdir -p "$HOME/.config/kokoro"
