@@ -112,14 +112,14 @@ view_part() {    # view_part IDX BASE: a part starts playing
   fi
   return 0
 }
-view_light() { if [ "$ui" = tui ]; then tui_light "$@"; elif [ "$show_words" = 1 ]; then block_redraw "$@"; fi; }
+view_light() { if [ "$ui" = tui ]; then tui_light "$@"; elif [ "$show_words" = 1 ]; then block_redraw "$@"; fi; }   # view_light A B: light bytes A..B of the part (-1 -1: nothing lit)
 view_state() {   # view_state TEXT EXTRA [SYMBOL] [PAUSED]: what's happening (a spinner if no symbol)
   local sym=${3:-${SPIN[frame % 10]}}
   frame=$(( frame + 1 ))
   if [ "$ui" = tui ]; then tui_state "$1" "$2" "$sym" "${4:-0}"; else status "$1" "$2" "$sym"; fi
 }
-view_part_end() { if [ "$ui" = tui ]; then tui_light -1 -1; elif [ "$show_words" = 1 ]; then block_finish; fi; }
-view_refresh() { [ "$ui" = tui ] && { tui_refresh; tui_anim; }; return 0; }
+view_part_end() { if [ "$ui" = tui ]; then tui_light -1 -1; elif [ "$show_words" = 1 ]; then block_finish; fi; }   # a part has been heard: nothing lit
+view_refresh() { [ "$ui" = tui ] && { tui_refresh; tui_anim; }; return 0; }   # after a resize, and while the part just heard eases out of focus
 
 words_load() {   # read NNNN.words once it lands
   local f=$1 s e a b
@@ -136,7 +136,7 @@ words_load() {   # read NNNN.words once it lands
 # Bookmarks, the notification and the controls that work while a text plays.
 
 book_title=""
-title_get() { [ -n "$book_title" ] || { [ -f "$tmpd/title" ] && read -r book_title < "$tmpd/title"; } || true; }
+title_get() { [ -n "$book_title" ] || { [ -f "$tmpd/title" ] && read -r book_title < "$tmpd/title"; } || true; }   # book_title, from the engine's title file once it's there
 
 bookmark_save() {   # bookmark_save PART: so the same command, or kokoro --continue, picks up here
   local parts=1
@@ -172,7 +172,7 @@ bookmark_done() {  # read to the end: the bookmark and the book's kept audio go
 NOVEL=""                                  # the novel's address, once we know it's one
 NV_URL=(); NV_NUM=()                      # each chapter of this listen: its address and number (with CH_START)
 N_URL=""; N_FIRST=1; N_NUM=""; N_LABEL=""; N_PARTS=1
-novel_load() {
+novel_load() {   # once the engine says it's a web novel: NOVEL, and the novel's own bookmark
   [ -z "$NOVEL" ] && [ -f "$tmpd/novel" ] || return 0
   NOVEL="$(mark_get "$tmpd/novel" url)"
   [ -n "$NOVEL" ] || return 0
@@ -233,7 +233,7 @@ notify() {
       --media-next "$k --next" --on-delete "$k --stop" >/dev/null 2>&1 & )
   return 0
 }
-notify_clear() {
+notify_clear() {   # take the notification away
   [ "$KOKORO_NOTIFY" = 1 ] && command -v termux-notification-remove >/dev/null || return 0
   ( timeout 10 termux-notification-remove kokomux >/dev/null 2>&1 & )
   return 0
@@ -261,7 +261,7 @@ chapter_of() {   # chapter_of PART: CH = the index of the chapter PART is in (-1
 # spent paused doesn't count.
 SLEEP=off; SLEEP_AT=0
 SLEEP_FADE=13000
-sleep_cycle() {
+sleep_cycle() {  # the sleep timer's next setting: off, 15, 30, 60 min, end of chapter
   case "$SLEEP" in
     off) SLEEP=15 ;; 15) SLEEP=30 ;; 30) SLEEP=60 ;;
     60) if [ "${#CH_START[@]}" -gt 1 ]; then SLEEP=chapter; else SLEEP=off; fi ;;
@@ -411,7 +411,7 @@ declare -A MPV_IDX=()              # part -> its playlist index
 MPV_PART=()                        # playlist index -> part
 MPV_SPD=()                         # playlist index -> the speed it was made at
 
-mpv_start() {
+mpv_start() {    # start the one mpv for this listen, and connect to it through socat
   [ -n "$MPV_PID" ] && kill -0 "$MPV_PID" 2>/dev/null && return 0
   MPV_SOCK="$(realpath "$PREFIX/tmp")/kokomux-mpv.$$"   # (a socket's path can't be longer than 107 bytes)
   rm -f "$MPV_SOCK"
@@ -429,7 +429,7 @@ mpv_start() {
   mpv_send '"observe_property",2,"playlist-pos"'
   mpv_send '"observe_property",3,"duration"'
 }
-mpv_send() { printf '{"command":[%s]}\n' "$1" >&"$MPV_OUT"; }
+mpv_send() { printf '{"command":[%s]}\n' "$1" >&"$MPV_OUT"; }   # mpv_send ARGS: a command to mpv, e.g. '"set_property","pause",true'
 mpv_pump() {     # take in what mpv has reported since last time
   local line
   while :; do
@@ -462,7 +462,7 @@ mpv_stop() {     # empty the playlist (a jump starts again from a new part)
   MPV_IDX=(); MPV_PART=(); MPV_SPD=(); MPV_N=0; MPV_POS=-1; MPV_T=0; MPV_MAX=-1
   return 0
 }
-mpv_quit() {
+mpv_quit() {     # stop mpv
   [ -n "$MPV_PID" ] && { kill "$MPV_PID" 2>/dev/null; wait "$MPV_PID" 2>/dev/null; }
   [ -n "$MPV_SOCK" ] && rm -f "$MPV_SOCK"
   MPV_PID=""

@@ -97,7 +97,7 @@ if [ "$LIVE" = 1 ]; then theme_apply; else theme_off; fi
 SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
 frame=0
 
-cols() {
+cols() {         # the terminal's width (60 when it can't be asked)
   local c
   c="$(stty size 2>/dev/null </dev/tty | cut -d' ' -f2)" || true
   [[ "${c:-}" =~ ^[0-9]+$ ]] && [ "$c" -ge 20 ] && echo "$c" || echo 60
@@ -111,13 +111,13 @@ die() {
   [ -n "${2:-}" ] && printf '  %s%s%s\n' "$D" "$2" "$R" >&2
   exit 1
 }
-done_msg() { printf '%s✓%s %s%s\n' "$GRN" "$R" "$1" "${2:+ $D$2$R}" >&2; }
-info() { printf '%s›%s %s\n' "$ACC" "$R" "$1" >&2; }
+done_msg() { printf '%s✓%s %s%s\n' "$GRN" "$R" "$1" "${2:+ $D$2$R}" >&2; }   # done_msg TEXT [DIM]: a ✓ line
+info() { printf '%s›%s %s\n' "$ACC" "$R" "$1" >&2; }   # info TEXT: a › line
 
 # One live status line, never wider than the screen (a wrapped line can't
 # be redrawn in place): status "text" ["dim extra"] ["symbol"]
 TERM_COLS=60; [ "$LIVE" = 1 ] && TERM_COLS="$(cols)"
-status() {
+status() {       # status TEXT [DIM] [SYMBOL]: the live status line, redrawn in place
   [ "$LIVE" = 1 ] || return 0
   local main=$1 extra=${2:-} sym=${3:-${SPIN[frame % 10]}} vis room
   vis="$(printf '%s' "$main" | sed 's/\x1b\[[0-9;]*m//g')"
@@ -127,8 +127,13 @@ status() {
   printf '\r\033[K%s%s%s %s %s%s%s' "$ACC" "$sym" "$R" "$main" "$D" "$extra" "$R" >&2
   frame=$((frame + 1))
 }
-status_clear() { [ "$LIVE" = 1 ] && printf '\r\033[K' >&2; return 0; }
+status_clear() { [ "$LIVE" = 1 ] && printf '\r\033[K' >&2; return 0; }   # rub out the live status line
 
+snippet() {      # snippet FILE: its first 60 characters, on one line (a title for a text)
+  local t
+  t="$(head -c 600 "$1" | tr '\n\t\r' '   ' | tr -s ' ')" || t=""
+  t=${t# }; t=${t:0:60}; printf '%s' "${t% }"
+}
 # shellcheck disable=SC2088  # a literal ~ is the point
 tilde() { case "$1" in "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac; }
 # Voices: one, or several blended ("af_heart:70+af_bella:30").
@@ -145,17 +150,12 @@ voice_label() {  # voice_label SPEC: "af_heart:70+af_bella:30" -> "af_heart + af
   while [[ "$s" =~ ^(.*):[0-9]+(.*)$ ]]; do s=${BASH_REMATCH[1]}${BASH_REMATCH[2]}; done
   printf '%s' "${s//+/ + }"
 }
-conf_set() {     # conf_set NAME VALUE: keep a setting in the settings file
-  mkdir -p "$CONF_DIR"; [ -f "$CONF" ] || : > "$CONF"
-  if grep -q "^$1=" "$CONF"; then sed -i "s|^$1=[^ #]*|$1=$2|" "$CONF"; else echo "$1=$2" >> "$CONF"; fi
-  printf -v "$1" '%s' "$2"
-}
-human_size() {
+human_size() {   # human_size BYTES: "1.2 MB" or "340 KB"
   local b=$1
   if [ "$b" -ge 1048576 ]; then awk "BEGIN { printf \"%.1f MB\", $b / 1048576 }"
   else echo "$(( (b + 1023) / 1024 )) KB"; fi
 }
-human_secs() {
+human_secs() {   # human_secs SECONDS: "2m 05s" or "4.2s"
   awk -v s="$1" 'BEGIN { if (s >= 60) printf "%dm %02ds", s / 60, s % 60; else printf "%.1fs", s }'
 }
 
@@ -170,7 +170,7 @@ opt_rows() {
   done
 }
 
-usage() {
+usage() {        # kokoro --help
   printf '%skokoro%s %sv%s%s\n' "$B" "$R" "$ACC" "$KOKOMUX_VERSION" "$R"
   printf '%sKokoro text-to-speech for Termux%s\n\n' "$D" "$R"
   printf '%sUsage%s kokoro [options] [text]\n' "$B" "$R"
@@ -219,17 +219,17 @@ ROWS
 
 # ------------------------------------------------------------ server
 
-server_token() { [ -f "$TOKEN_FILE" ] && cut -d' ' -f2 "$TOKEN_FILE"; }
-server_port() { [ -f "$TOKEN_FILE" ] && cut -d' ' -f1 "$TOKEN_FILE"; }
+server_token() { [ -f "$TOKEN_FILE" ] && cut -d' ' -f2 "$TOKEN_FILE"; }   # the background server's secret (from its token file)
+server_port() { [ -f "$TOKEN_FILE" ] && cut -d' ' -f1 "$TOKEN_FILE"; }   # the port it listens on (from the same file)
 
-server_up() {
+server_up() {    # is the background server answering?
   local tok port
   tok="$(server_token 2>/dev/null)" || return 1
   port="$(server_port)"
   curl -fsS -m 2 -H "X-Kokoro-Token: $tok" "http://127.0.0.1:$port/health" >/dev/null 2>&1
 }
 
-start_server() {
+start_server() {   # start the server in the container and wait (a spinner) until it answers
   server_up && return 0
   mkdir -p "$SRV_DIR"
   rm -f "$TOKEN_FILE"
@@ -256,7 +256,7 @@ start_server() {
   return 1
 }
 
-stop_server() {
+stop_server() {  # ask the server to stop, and wait until it has
   if ! server_up; then info "The server isn't running."; return 0; fi
   curl -fsS -m 5 -X POST -H "X-Kokoro-Token: $(server_token)" \
     "http://127.0.0.1:$(server_port)/shutdown" >/dev/null || true
@@ -267,7 +267,7 @@ stop_server() {
 
 # ------------------------------------------------------------ playback
 
-player_alive() { local pid; pid="$(cat "$PLAYER_PID" 2>/dev/null)" && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }
+player_alive() { local pid; pid="$(cat "$PLAYER_PID" 2>/dev/null)" && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }   # is a kokoro -p running (by its pid file)?
 
 # control WORD MESSAGE: tell the running player to pause, skip or replay
 control() {
@@ -286,7 +286,7 @@ chapter_url() {  # chapter_url URL N: CHURL = chapter N's address, where a novel
   CHURL="${BASH_REMATCH[1]}$2${BASH_REMATCH[3]}"
 }
 
-stop_playback() {
+stop_playback() {   # stop the running player, if any (returns 1 if there was none)
   local pid
   pid="$(cat "$PLAYER_PID" 2>/dev/null)" || return 1
   rm -f "$PLAYER_PID"
@@ -295,12 +295,15 @@ stop_playback() {
 
 # ------------------------------------------------------------ keys and the frame timer
 # tick waits a moment (no process) and, on a terminal, reads one key or click
-# into KEY. A stop signal during the wait must not exit from inside `read -t`:
+# into KEY, by name (key_name): a printable key is itself ("q", " ", "+"), the
+# others are up down left right enter esc backspace pgup pgdn, and click (a
+# left click or tap, at CLICK_X, CLICK_Y). The mouse wheel is up and down.
+# A stop signal during the wait must not exit from inside `read -t`:
 # if cleanup then outlives the timer, bash's alarm jumps back into a read that's
 # gone and bash crashes (seen with bash 5.2). So during the wait the signal only
 # sets a flag, and tick exits once read has returned.
 
-STOP=""; IN_TICK=0; KEY=""; CMD=""; KBD=""; KEYS_TTY=""; TICK_BG=""
+STOP=""; IN_TICK=0; KEY=""; CMD=""; KBD=""; KEYS_TTY=""; TICK_BG=""; CLICK_X=0; CLICK_Y=0
 exec {TICK}<> <(:)                    # read -t on this is a sleep with no process
 now_ms() { local t=${EPOCHREALTIME//[!0-9]/}; NOW=$(( t / 1000 )); }   # no subshell: called every frame
 keys_on() {      # read keys from the terminal, unechoed (restored on exit)
@@ -310,8 +313,8 @@ keys_on() {      # read keys from the terminal, unechoed (restored on exit)
   KEYS_TTY="$(stty -g 2>/dev/null </dev/tty)" || KEYS_TTY=""
   stty -echo -icanon 2>/dev/null </dev/tty || true
 }
-keys_off() { [ -n "$KEYS_TTY" ] && stty "$KEYS_TTY" 2>/dev/null </dev/tty; KEYS_TTY=""; return 0; }
-tick() {
+keys_off() { [ -n "$KEYS_TTY" ] && stty "$KEYS_TTY" 2>/dev/null </dev/tty; KEYS_TTY=""; return 0; }   # give the terminal back its echo and line editing
+tick() {         # tick SECONDS: flush the frame, wait, and read a key into KEY (by name)
   local c rest=""
   [ -n "${FRAME:-}" ] && flush          # the frame drawn since the last wait, in one write
   [ -n "${TICK_BG:-}" ] && "$TICK_BG"    # the player keeping mpv fed, while a menu is open
@@ -324,19 +327,37 @@ tick() {
       done
       KEY=$'\033'$rest
     fi
+    key_name
   else
     read -r -t "$1" -u "$TICK" _ || true
   fi
   IN_TICK=0
   [ -z "$STOP" ] || exit 130
 }
+key_name() {     # KEY, as the terminal sent it, to its name (see above); "" for what no screen uses
+  case "$KEY" in
+    $'\033[A'|$'\033OA'|$'\033[<64;'*M) KEY=up ;;
+    $'\033[B'|$'\033OB'|$'\033[<65;'*M) KEY=down ;;
+    $'\033[C'|$'\033OC') KEY=right ;;
+    $'\033[D'|$'\033OD') KEY=left ;;
+    $'\033[5~') KEY=pgup ;;
+    $'\033[6~') KEY=pgdn ;;
+    $'\r'|$'\n') KEY=enter ;;
+    $'\033') KEY=esc ;;
+    $'\177'|$'\b') KEY=backspace ;;
+    $'\033[<0;'*M)                            # a left click or tap: "ESC [ < 0 ; x ; y M"
+      if [[ "$KEY" =~ \;([0-9]+)\;([0-9]+)M$ ]]; then CLICK_X=${BASH_REMATCH[1]} CLICK_Y=${BASH_REMATCH[2]} KEY=click
+      else KEY=""; fi ;;
+    $'\033'*) KEY="" ;;                        # a release, another button, a key no screen uses
+  esac
+}
 key_cmd() {      # what KEY asks for (or a clicked button): see the player for each
   CMD=""
   case "$KEY" in
     " "|p|P|k) CMD=toggle ;;
-    n|N|l|$'\033[C'|$'\033OC') CMD=next ;;
-    b|B|h|$'\033[D'|$'\033OD') CMD=again ;;
-    q|Q|$'\033') CMD=quit ;;
+    n|N|l|right) CMD=next ;;
+    b|B|h|left) CMD=again ;;
+    q|Q|esc) CMD=quit ;;
     +|=) CMD=faster ;;
     -|_) CMD=slower ;;
     t|T) CMD="sleep" ;;
@@ -346,7 +367,7 @@ key_cmd() {      # what KEY asks for (or a clicked button): see the player for e
     v|V) CMD=voice ;;
     ']') CMD=next_chapter ;;
     '[') CMD=prev_chapter ;;
-    $'\033[<'*M) [ "${ui:-}" = tui ] && tui_click "$KEY" ;;
+    click) [ "${ui:-}" = tui ] && tui_click ;;
   esac
   KEY=""
 }
@@ -389,9 +410,9 @@ case "${1:-}" in
                  src="$QUEUE_DIR/$id.${ext,,}"; cp "$2" "$src"; title="$(basename "$2")" ;;
       -c|--clipboard) command -v termux-clipboard-get >/dev/null || die "Reading the clipboard needs Termux:API."
                  src="$QUEUE_DIR/$id.txt"; timeout 6 termux-clipboard-get > "$src" || die "Couldn't read the clipboard."
-                 title="$(head -c 60 "$src" | tr '\n\t' '  ')" ;;
+                 title="$(snippet "$src")" ;;
       "") die "What should go in the queue?" "kokoro --add -u URL, -f FILE, -c, or some text" ;;
-      *) src="$QUEUE_DIR/$id.txt"; printf '%s\n' "$*" > "$src"; title="$(head -c 60 "$src" | tr '\n\t' '  ')" ;;
+      *) src="$QUEUE_DIR/$id.txt"; printf '%s\n' "$*" > "$src"; title="$(snippet "$src")" ;;
     esac
     # A copied link on its own is that page.
     if [ "$kind" = file ] && [ "${src##*.}" = txt ] && [ "$(wc -l < "$src")" -le 1 ] &&
@@ -408,7 +429,9 @@ case "${1:-}" in
       list) [ -s "$QUEUE" ] || { info "Your queue is empty."; exit 0; }
             n=0; while IFS=$'\t' read -r _ _ _ title; do n=$((n + 1)); printf '  %s%2d%s  %s\n' "$ACC2" "$n" "$R" "$title"; done < "$QUEUE"
             exit 0 ;;
-      clear) while IFS=$'\t' read -r _ kind src _; do [ "$kind" = file ] && rm -f "$src"; done < "$QUEUE" 2>/dev/null
+      clear) if [ -f "$QUEUE" ]; then
+               while IFS=$'\t' read -r _ kind src _; do [ "$kind" = file ] && rm -f "$src"; done < "$QUEUE"
+             fi
              rm -f "$QUEUE"; done_msg "Queue cleared."; exit 0 ;;
       skip) [ -s "$QUEUE" ] || { info "Your queue is empty."; exit 0; }
             IFS=$'\t' read -r id kind src title < "$QUEUE"
@@ -603,7 +626,7 @@ fi
 
 tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
 gen_pid=""
-cleanup() {
+cleanup() {      # on exit: the screen, the bookmark message, mpv, the engine and the job folder
   set +e   # best effort from here: a process that's already gone mustn't change the exit code
   status_clear
   [ "${in_line:-0}" = 1 ] && [ "${ui:-}" = inline ] && [ "${show_words:-0}" = 1 ] && block_finish
@@ -681,7 +704,7 @@ fi
 # picks up where it was stopped.
 if [ -n "$url" ]; then kind=url source=$url name=$url
 elif [ -n "$infile" ]; then kind=file source="$(realpath "$infile")" name="$(basename "$infile")"
-else kind=text source="" name="$(head -c 60 "$text" | tr '\n' ' ')"; fi
+else kind=text source="" name="$(snippet "$text")"; fi
 book_id=""; start=1; was_parts=0
 if { [ "$play" = 1 ] && [ -z "$out" ]; } || [ "$ext" = m4b ]; then   # (an audiobook reuses what listening made)
   if [ "$kind" = url ]; then book_id="$(printf '%s' "$url" | sha256sum | cut -c1-16)"
@@ -766,7 +789,7 @@ if [ -n "$book_id" ]; then mkdir -p "$CACHE/$book_id"; touch "$CACHE/$book_id"; 
 use_server=0
 if server_up || { [ "$KOKORO_AUTOSERVE" = 1 ] && start_server; }; then use_server=1; fi
 
-run_engine() {
+run_engine() {   # run the job: through the server, or one-off in the container
   if [ "$use_server" = 1 ]; then
     local rc=0
     curl -s --fail-with-body -X POST -H "X-Kokoro-Token: $(server_token)" \
@@ -788,7 +811,7 @@ progress() {
   fi
   echo ""
 }
-waiting_label() {
+waiting_label() {   # what the status line says while the next part is being made
   if [ "$play" = 1 ] && [ "$i" -gt "$start" ]; then echo "Preparing"
   elif [ "$start" -gt 1 ]; then echo "Picking up at part $start"
   elif [ -f "$tmpd/progress" ]; then echo "Making speech"

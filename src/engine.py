@@ -1075,7 +1075,7 @@ def run_job(path):
         # Word timings come from Kokoro itself, with the audio.
         timed = job.get("words") == "1" and engine.has_timings
         if job.get("words") == "1" and not timed:
-            _write_atomic(os.path.join(stream, "words-off"), "this model reports no timings (kokoro --update)\n")
+            _write_atomic(os.path.join(stream, "words-off"), "this model reports no timings\n")
 
     writer = None
     total = 0.0

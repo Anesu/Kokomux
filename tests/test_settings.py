@@ -74,6 +74,16 @@ def test_each_setting_changes_and_is_saved():
         assert got == want, (setting, var, got, want)
 
 
+def test_a_value_sed_would_misread_is_kept_as_it_is():
+    with tempfile.TemporaryDirectory() as home:
+        conf = os.path.join(home, "config")
+        for value in ("plain.wav", "a&b|c.wav"):                # the second replaces the first in place
+            subprocess.run(["bash", "-c", f". {SRC}/theme.sh; . {SRC}/tui.sh; CONF={conf!r}; conf_set KOKORO_OUT {value!r}"],
+                           check=True, env={"PATH": os.environ["PATH"], "HOME": home})
+            with open(conf) as f:
+                assert f.read() == f"KOKORO_OUT={value}\n", value
+
+
 def test_left_goes_the_other_way():
     assert change("speed", -1)["KOKORO_SPEED"] == "0.9"
     assert change("lang", -1)["KOKORO_LANG"] == "cmn"                  # (round to the last)

@@ -5,8 +5,12 @@ Run with:  python3 tests/test_screens.py   (or pytest)
 Each test runs the real `kokoro` command in a pseudo-terminal of a given size,
 with a stand-in phone (a temporary $PREFIX and $HOME, no container), types
 keys, and checks that the screen did what it should and that kokoro neither
-crashed nor left the terminal unusable (taps reported, keys unechoed). The
-screens here need no model, so these run anywhere.
+crashed nor left the terminal unusable (taps reported, keys unechoed).
+
+Home, settings and the voice picker need no model, so those run anywhere. The
+reader needs Kokoro: its tests run when dev/rig.sh has made .dev/ (the model,
+and a proot-distro stand-in) and mpv and socat are installed; sound goes
+nowhere (mpv --ao=null).
 """
 import fcntl
 import os
@@ -21,24 +25,39 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "..", "src")
+RIG = os.path.join(HERE, "..", ".dev")
+HAS_RIG = (os.path.isfile(os.path.join(RIG, "app", "models", "voices-v1.0.bin")) and
+           os.access(os.path.join(RIG, "bin", "proot-distro"), os.X_OK) and
+           bool(shutil.which("mpv")) and bool(shutil.which("socat")))
+STORY = ("The road left the village at first light. It climbed into the hills, where the fields gave way "
+         "to heather.\n\nFor three days she walked without meeting anyone. She slept in the lee of stone walls. "
+         "On the fourth morning a cart came over the ridge.\n\nThe driver offered her a ride as far as the river, "
+         "and after a moment's thought she accepted. They crossed the bridge at dusk.\n")
 UP, DOWN, RIGHT, LEFT, ESC, ENTER = "\033[A", "\033[B", "\033[C", "\033[D", "\033", "\r"
 
 
 class Phone:
     """A stand-in phone: kokoro and its screens in a temporary $PREFIX, no container."""
 
-    def __init__(self):
+    def __init__(self, rig=False):
+        """rig: with Kokoro, from dev/rig.sh's .dev/ (the container's /tmp is this machine's /tmp)."""
         self.dir = tempfile.mkdtemp(prefix="kokomux-test.")
         self.prefix, self.home = os.path.join(self.dir, "prefix"), os.path.join(self.dir, "home")
+        self.rig = rig
         share = os.path.join(self.prefix, "share", "kokomux")
-        for d in (share, os.path.join(self.prefix, "bin"), os.path.join(self.prefix, "tmp"), self.home):
+        for d in (share, os.path.join(self.prefix, "bin"), self.home):
             os.makedirs(d)
+        if rig:
+            os.symlink("/tmp", os.path.join(self.prefix, "tmp"))
+        else:
+            os.makedirs(os.path.join(self.prefix, "tmp"))
         for f in ("theme.sh", "tui.sh", "player.sh"):
             shutil.copy(os.path.join(SRC, f), share)
         with open(os.path.join(SRC, "kokoro"), encoding="utf-8") as f:
             body = f.read().split("\n", 1)[1]
         self.write("prefix/bin/kokoro", "#!/usr/bin/env bash\n" + body, mode=0o755)
-        self.write("prefix/bin/proot-distro", "#!/bin/sh\nexit 1\n", mode=0o755)   # no container here
+        if not rig:
+            self.write("prefix/bin/proot-distro", "#!/bin/sh\nexit 1\n", mode=0o755)   # no container here
 
     def write(self, rel, text, mode=0o644):
         path = os.path.join(self.dir, rel)
@@ -55,11 +74,13 @@ class Phone:
         except OSError:
             return {}
 
-    def run(self, args, keys=(), rows=40, cols=60, wait=0.25):
-        """Run `kokoro ARGS` on a ROWS×COLS terminal, type KEYS (each WAIT seconds apart).
-        Returns (exit status, or None if it's still running; everything it wrote)."""
-        env = dict(PATH=f"{self.prefix}/bin:{os.environ['PATH']}", PREFIX=self.prefix, HOME=self.home,
-                   TERM="xterm-256color", LANG="C.UTF-8", KOKORO_AUTOSERVE="0", KOKORO_NOTIFY="0")
+    def run(self, args, keys=(), rows=40, cols=60, wait=0.25, start=1.2, end=0.6, env=None):
+        """Run `kokoro ARGS` on a ROWS×COLS terminal and type KEYS, START seconds in and
+        then WAIT seconds apart (a key can also be a number: that many seconds' pause).
+        Returns (exit status, or None if it's still running after END; everything it wrote)."""
+        path = f"{self.prefix}/bin:{os.path.join(RIG, 'bin') + ':' if self.rig else ''}{os.environ['PATH']}"
+        env = dict(PATH=path, PREFIX=self.prefix, HOME=self.home, TERM="xterm-256color", LANG="C.UTF-8",
+                   KOKORO_AUTOSERVE="0", KOKORO_NOTIFY="0", KOKORO_MPV_ARGS="--ao=null", **(env or {}))
         pid, fd = pty.fork()
         if pid == 0:
             os.execvpe("kokoro", ["kokoro", *args], env)
@@ -81,18 +102,30 @@ class Phone:
                         os.write(fd, b"\033]11;rgb:1616/1616/1e1e\033\\\033]10;rgb:e0e0/e0e0/e0e0\033\\\033[?62;22c")
             return True
 
-        alive = pump(1.2)
+        alive = pump(start)
         for k in keys:
             if not alive:
                 break
+            if isinstance(k, (int, float)):
+                alive = pump(k)
+                continue
             os.write(fd, k.encode())
             alive = pump(wait)
-        alive = alive and pump(0.6)
+        alive = alive and pump(end)
         if alive:
             os.kill(pid, 9)
         _, status = os.waitpid(pid, 0)
         os.close(fd)
         return (None if alive else os.waitstatus_to_exitcode(status)), out.decode("utf-8", "replace")
+
+    def bookmarks(self):
+        d = os.path.join(self.home, ".local", "share", "kokomux", "bookmarks")
+        out = {}
+        for f in os.listdir(d) if os.path.isdir(d) else []:
+            if f.endswith(".mark"):
+                with open(os.path.join(d, f), encoding="utf-8") as fh:
+                    out[f] = dict(line.split("=", 1) for line in fh.read().splitlines() if "=" in line)
+        return out
 
     def close(self):
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -161,6 +194,29 @@ def test_settings_speed_stops_at_two():
         p.close()
 
 
+def test_settings_mouse_wheel_and_esc():
+    wheel_down = "\033[<65;20;10M"
+    p = Phone()
+    try:
+        status, out = p.run(["--settings"], keys=[wheel_down] * 3 + [RIGHT, ESC])   # down to Speed, faster
+        ended_cleanly(status, out)
+        assert p.config().get("KOKORO_SPEED") == "1.1"
+    finally:
+        p.close()
+
+
+def test_voice_picker_backspace_and_esc():
+    p = Phone()
+    try:
+        # A filter with no match, mended with Backspace, then Esc: back without choosing.
+        status, out = p.run(["--settings"], keys=[ENTER, "z", "x", "\177", ESC, "q"])
+        ended_cleanly(status, out)
+        assert 'No voice matches "zx"' in plain(out)
+        assert "KOKORO_VOICE" not in p.config()
+    finally:
+        p.close()
+
+
 def test_voice_picker_filter_and_choose():
     p = Phone()
     try:
@@ -203,6 +259,128 @@ def test_home_lists_a_bookmark():
         status, out = p.run([], keys=["q"])
         ended_cleanly(status, out)
         assert "A Long Story" in plain(out) and "20%" in plain(out)
+    finally:
+        p.close()
+
+
+# ---------------------------------------------------------------- the reader (needs dev/rig.sh)
+
+def needs_rig(fn):
+    def wrapper():
+        if HAS_RIG:
+            fn()
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+def click(x, y):
+    return f"\033[<0;{x};{y}M"
+
+
+@needs_rig
+def test_reader_plays_to_the_end():
+    p = Phone(rig=True)
+    try:
+        story = p.write("home/story.txt", STORY)
+        status, out = p.run(["-p", "-f", story], start=40, end=0)       # (it quits by itself at the end)
+        ended_cleanly(status, out)
+        assert "Done" in plain(out)
+        assert p.bookmarks() == {}                                   # heard to the end: nothing to come back to
+    finally:
+        p.close()
+
+
+@needs_rig
+def test_reader_keys_menu_and_stop_keeps_the_place():
+    p = Phone(rig=True)
+    try:
+        story = p.write("home/story.txt", STORY)
+        keys = [" ", 1, " ", RIGHT, 2, "+", 1, "t", "m", ESC, "q"]      # pause, play, next, faster, sleep, menu
+        status, out = p.run(["-p", "-f", story], keys=keys, start=8, wait=0.6)
+        ended_cleanly(status, out)
+        marks = list(p.bookmarks().values())
+        assert len(marks) == 1 and int(marks[0]["part"]) >= 2, marks
+        assert marks[0]["speed"] == "1.1"
+        assert "Stopped at part" in plain(out)
+    finally:
+        p.close()
+
+
+@needs_rig
+def test_reader_buttons_by_tap():
+    p = Phone(rig=True)
+    try:
+        story = p.write("home/story.txt", STORY)
+        # 56×40: the transport row is 38; Again, Pause and Next are 11 wide, 3 apart, centred.
+        pause, next_ = click(28, 38), click(42, 38)
+        status, out = p.run(["-p", "-f", story], keys=[pause, 1, pause, next_, 2, "q"], rows=40, cols=56,
+                            start=8, wait=0.6)
+        ended_cleanly(status, out)
+        assert "Paused" in plain(out)
+        assert int(list(p.bookmarks().values())[0]["part"]) >= 2
+    finally:
+        p.close()
+
+
+@needs_rig
+def test_reader_settings_from_the_menu_and_back():
+    p = Phone(rig=True)
+    try:
+        story = p.write("home/story.txt", STORY)
+        keys = ["m", ENTER, DOWN, DOWN, DOWN, RIGHT, "q", 1, "q"]       # Menu → Settings → speed + → back
+        status, out = p.run(["-p", "-f", story], keys=keys, start=8, wait=0.5)
+        ended_cleanly(status, out)
+        assert p.config().get("KOKORO_SPEED") == "1.1"
+    finally:
+        p.close()
+
+
+def make_epub(path, chapters):
+    import zipfile
+    page = '<html xmlns="http://www.w3.org/1999/xhtml"><body><h1>{}</h1><p>{}</p></body></html>'
+    items = "".join(f'<item id="c{i}" href="c{i}.xhtml" media-type="application/xhtml+xml"/>' for i in range(len(chapters)))
+    spine = "".join(f'<itemref idref="c{i}"/>' for i in range(len(chapters)))
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("mimetype", "application/epub+zip")
+        z.writestr("META-INF/container.xml", '<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+                   '<rootfiles><rootfile full-path="b.opf"/></rootfiles></container>')
+        z.writestr("b.opf", '<package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/">'
+                   f'<metadata><dc:title>The Small Book</dc:title></metadata><manifest>{items}</manifest>'
+                   f'<spine>{spine}</spine></package>')
+        for i, (title, text) in enumerate(chapters):
+            z.writestr(f"c{i}.xhtml", page.format(title, text))
+    return path
+
+
+@needs_rig
+def test_reader_chapters_jump_and_continue():
+    p = Phone(rig=True)
+    try:
+        long = " ".join(["The road went on over the hills and down to the sea."] * 3)
+        book = make_epub(os.path.join(p.home, "book.epub"),
+                         [("The Start", long), ("The River", long), ("The Town", long)])
+        # The chapter list (c), down to the third, Enter; then stop.
+        status, out = p.run(["-p", "-f", book], keys=["c", DOWN, DOWN, ENTER, 3, "q"], start=8, wait=0.5)
+        ended_cleanly(status, out)
+        assert "The Town" in plain(out)
+        mark = list(p.bookmarks().values())[0]
+        assert mark["title"] == "The Small Book" and int(mark["part"]) > 2, mark
+        # kokoro --continue picks up there.
+        status, out = p.run(["--continue"], keys=["q"], start=8)
+        ended_cleanly(status, out)
+        assert "The Town" in plain(out)
+    finally:
+        p.close()
+
+
+@needs_rig
+def test_inline_view_plays_to_the_end():
+    p = Phone(rig=True)
+    try:
+        story = p.write("home/story.txt", STORY)
+        status, out = p.run(["-p", "-f", story], start=40, end=0, env={"KOKORO_TUI": "0"})
+        assert status == 0, status
+        assert "Done" in plain(out) and "bridge at dusk" in plain(out)
     finally:
         p.close()
 

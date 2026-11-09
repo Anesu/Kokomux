@@ -325,6 +325,7 @@ The files in `src/` are the source. `./build.sh` bundles them into the single `i
 
 ```
 dev/check.sh                 # build, then shellcheck, pyflakes and every test
+dev/map.sh                   # every function in src/, and what it's for
 dev/rig.sh                   # once: a stand-in phone in .dev/ with the real Kokoro model
 dev/kokoro -p -f story.txt   # run kokoro from src/ on it
 python3 dev/screen.py --out reader.png -- dev/kokoro -p -f story.txt   # a picture of the screen
@@ -350,8 +351,11 @@ python3 dev/screen.py --out reader.png -- dev/kokoro -p -f story.txt   # a pictu
 | `tests/test_player.py` | a new speed heard at once, and the sleep timer's fade |
 | `tests/test_novel.py` | web novels: reading a chapter page, and listening on from chapter to chapter (a made-up novel served locally) |
 | `tests/test_settings.py` | every setting in the menu changes and is saved |
+| `tests/test_screens.py` | the real screens driven with keys and taps in a pseudo-terminal: home, settings, voices, and (with `dev/rig.sh`) the reader |
+| `tests/test_commands.py` | the command-line options: the queue, status, stop, and error messages |
 | `tests/test_theme.py` | the colours: contrast on 15 terminal themes, the golden steps, asking the terminal |
 | `dev/check.sh` | everything to run before a commit |
+| `dev/map.sh` | a map of the code: each file's sections and functions, with what each is for |
 | `dev/rig.sh`, `dev/kokoro` | a stand-in phone (fake `$PREFIX`, container venv, models) to run kokoro for real |
 | `dev/screen.py`, `dev/shot.js` | runs a command in a terminal and saves its screen as HTML and PNG |
 

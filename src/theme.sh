@@ -77,12 +77,12 @@ theme_sgr() {    # theme_sgr 38|48 RGB: the SGR parameters for that colour (REPL
   if [ "$d2" -lt "$d1" ]; then REPLY="$1;5;$(( 232 + k ))"; else REPLY="$1;5;$(( 16 + 36 * ri + 6 * gi + bi ))"; fi
 }
 
-theme_fg() { theme_sgr 38 "$1"; REPLY=$'\033['"$REPLY"m; }
-theme_bg() { theme_sgr 48 "$1"; REPLY=$'\033['"$REPLY"m; }
+theme_fg() { theme_sgr 38 "$1"; REPLY=$'\033['"$REPLY"m; }   # theme_fg RGB: REPLY = the escape for that text colour
+theme_bg() { theme_sgr 48 "$1"; REPLY=$'\033['"$REPLY"m; }   # theme_bg RGB: REPLY = the escape for that background
 
 # --------------------------------------------------------------- the terminal
 
-theme_truecolor() {
+theme_truecolor() {   # does the terminal show 24-bit colour?
   case "${KOKORO_TRUECOLOR:-}" in 1) return 0 ;; 0) return 1 ;; esac
   case "${COLORTERM:-}" in truecolor|24bit) return 0 ;; esac
   [ -n "${TERMUX_VERSION:-}" ] && return 0                  # Termux has 24-bit colour
@@ -142,7 +142,7 @@ theme_term() {   # THEME_TERM_MODE (dark, light or "") and THEME_TERM_BG, from w
 
 # --------------------------------------------------------------- the palette
 
-theme_off() {
+theme_off() {    # no colours (not a terminal, or NO_COLOR)
   R="" B="" D="" PAST="" LINE="" GHOST="" ACC="" ACC2="" GRN="" RED="" YEL=""
   HL="" SURF="" SEL="" PSEL="" BASE="" ACC_SGR="" D_SGR=""
   THEME_ON=0

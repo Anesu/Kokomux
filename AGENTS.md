@@ -84,12 +84,32 @@ share handlers and the widgets. `kokoro --update [BRANCH]` re-runs it.
 | `install.sh` | **built** — never edit by hand |
 | `VERSION` | stamped into both by build.sh (`@@VERSION@@`) |
 | `tests/` | one file per area, each runnable on its own (`python3 tests/test_x.py`) or with pytest |
-| `dev/` | the checks, the stand-in phone and the screen renderer (below) |
+| `dev/` | the checks, the map of the code, the stand-in phone and the screen renderer (below) |
+
+`dev/map.sh` lists every function in src/ with the line that says what it's
+for, section by section (`dev/map.sh src/tui.sh` for one file). Start there to
+find your way; it's made from the code, so it's always current.
+
+## Where to change what
+
+| To change… | Look at |
+|---|---|
+| a screen (home, reader, menu, chapters, settings, voices) | `src/tui.sh`: `tui_home`, `tui_draw` and the view API, `tui_menu`, `tui_chapters`, `tui_settings`, `tui_voices` |
+| what a key or tap does while listening | `key_cmd` (src/kokoro), then `listen_cmd` / `play_line` (src/player.sh) |
+| a key's name (arrows, Enter, clicks) | `key_name` (src/kokoro): screens match names, never escape codes |
+| a setting | the four places in "A new setting" below |
+| a command-line option or admin command (`--queue`, `--status`…) | the `case "${1:-}"` and the options loop in src/kokoro |
+| bookmarks, the sleep timer, chapters, web novels mid-listen | src/player.sh, section "listening" |
+| how text is tidied, split or read from a book or page | src/engine.py: `normalise`, `split_text`, `read_epub`, `read_pdf`, `page_text`, `novel_chapter` |
+| what the engine writes for the player | the docstring at the top of src/engine.py, and `run_job` |
+| colours | src/theme.sh (`theme_apply`) |
+| the installer's steps and screens | src/install.sh (then `./build.sh`) |
 
 ## Checking a change
 
 ```
-dev/check.sh                 # build, bash -n, shellcheck -S warning, pyflakes, every test
+dev/check.sh                 # build, bash -n, shellcheck, the bash-trap check, every function
+                             # documented (dev/map.sh --check), pyflakes, every test
 ```
 
 Run it before every commit. `install.sh` must be rebuilt and committed with
@@ -120,6 +140,19 @@ python3 dev/screen.py --out /tmp/settings.png --bg fafafa --fg 202020 \
 It answers the terminal colour queries like Termux, types keys on a schedule,
 and renders the last screen to HTML and PNG (pyte + Playwright).
 
+To **test** a screen, drive it from `tests/test_screens.py`: `Phone()` is a
+stand-in phone in a temporary folder, and `phone.run(ARGS, keys=[...])` runs
+the real `kokoro` in a pseudo-terminal, types the keys and returns the exit
+status and everything written; `ended_cleanly` checks it quit by itself,
+without a bash error, and gave the terminal back. Home, settings and the voice
+picker need no model; the reader's tests run once `dev/rig.sh` has made
+`.dev/` (and mpv and socat are installed). `tests/test_commands.py` does the
+same for command-line options.
+
+To find where bash stopped, trace it: put
+`exec 9>/tmp/trace; BASH_XTRACEFD=9; set -x` after the shebang of the copy
+being run (e.g. in `Phone`), run it, and read the end of /tmp/trace.
+
 ## Conventions and traps
 
 **Bash (src/kokoro, tui.sh, player.sh)** runs under `set -euo pipefail`.
@@ -129,16 +162,31 @@ and renders the last screen to HTML and PNG (pyte + Playwright).
   flushes before waiting for a key; flush yourself before handing the
   terminal to something else. A stray `printf … >&2` brings back flicker.
 - `x="$(cmd)"` takes the exit status of `cmd`, so under `set -e`
-  `x="$( [ … ] && echo y )"` exits the script when the test is false. Use
-  `if`, or `|| true`.
+  `x="$( [ … ] && echo y )"` exits the script when the test is false (this
+  took the home screen down in v0.17.0; check.sh now refuses `$( [`). Set
+  the variable with `if` instead. With `pipefail` the same goes for a
+  pipeline whose first command can fail (`x="$(sed … missing-file | head)"`):
+  add `|| true`.
 - A function whose last line is `[ cond ] && action` returns 1 when cond is
-  false; end such functions with `return 0`.
+  false, and a function called as a plain command that returns non-zero
+  exits kokoro. End such functions with `return 0` (settings closed on a
+  keypress this way until v0.17.3).
+- `$(( ))` is arithmetic only: text in it (`${rows[y]:0:1} == "#"`) is a
+  syntax error that ends the script. Compare text with `[ ]`.
 - `read` clears its variables at end of file and returns 1: `read -r a b < f || …`.
 - Don't name a variable `done` (a keyword), and quote values that look like
   commands (`kind="file"`) or shellcheck warns (SC2209).
 - The mpv socket path must be ≤ 107 bytes; it's built from `realpath $PREFIX/tmp`.
 - The job folder name must match `^/tmp/kokoro\.[A-Za-z0-9]+$` (the engine
   refuses others); use `mktemp -d "$PREFIX/tmp/kokoro.XXXXXX"`.
+- Keys reach the screens by name, from `tick`: a printable key is itself
+  (`q`, `" "`, `+`); the rest are `up down left right enter esc backspace
+  pgup pgdn` and `click` (at `CLICK_X`, `CLICK_Y`). The mouse wheel is
+  `up`/`down`. Match these in `case "$KEY"`, never raw escape codes.
+- Settings are saved with `conf_set NAME VALUE` (src/tui.sh), which also sets
+  the variable; on the settings screen use `tui_save` (it shows "✓ Saved").
+- Every function has a one-line comment saying what it's for, on its own
+  line or the line above (`dev/map.sh --check`).
 - Playback continues while an overlay (menu, settings, picker) is open:
   `TICK_BG` keeps mpv fed; a choice made there goes through `CMD_PENDING`.
 - tui.sh, player.sh and theme.sh share globals with kokoro (hence the

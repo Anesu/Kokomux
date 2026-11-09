@@ -9,6 +9,6 @@ export PREFIX="$DEV/prefix" HOME="$DEV/home" PATH="$DEV/bin:$DEV/prefix/bin:$PAT
 export KOKORO_AUTOSERVE="${KOKORO_AUTOSERVE:-0}" KOKORO_NOTIFY=0
 export KOKORO_MPV_ARGS="--ao=null --log-file=$DEV/mpv.log"
 # kokoro runs itself again by "$0", so it needs a copy with a shebang that works here.
-{ echo '#!/usr/bin/env bash'; tail -n +2 "$ROOT/src/kokoro"; } > "$PREFIX/bin/kokoro"
+{ echo '#!/usr/bin/env bash'; tail -n +2 "$ROOT/src/kokoro" | sed "s/@@VERSION@@/$(cat "$ROOT/VERSION")/"; } > "$PREFIX/bin/kokoro"
 chmod +x "$PREFIX/bin/kokoro"
 exec "$PREFIX/bin/kokoro" "$@"

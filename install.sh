@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.17.3"
+KOKOMUX_VERSION="0.17.4"
 DISTRO=kokoro
 
 VERBOSE=0
@@ -110,12 +110,12 @@ theme_sgr() {    # theme_sgr 38|48 RGB: the SGR parameters for that colour (REPL
   if [ "$d2" -lt "$d1" ]; then REPLY="$1;5;$(( 232 + k ))"; else REPLY="$1;5;$(( 16 + 36 * ri + 6 * gi + bi ))"; fi
 }
 
-theme_fg() { theme_sgr 38 "$1"; REPLY=$'\033['"$REPLY"m; }
-theme_bg() { theme_sgr 48 "$1"; REPLY=$'\033['"$REPLY"m; }
+theme_fg() { theme_sgr 38 "$1"; REPLY=$'\033['"$REPLY"m; }   # theme_fg RGB: REPLY = the escape for that text colour
+theme_bg() { theme_sgr 48 "$1"; REPLY=$'\033['"$REPLY"m; }   # theme_bg RGB: REPLY = the escape for that background
 
 # --------------------------------------------------------------- the terminal
 
-theme_truecolor() {
+theme_truecolor() {   # does the terminal show 24-bit colour?
   case "${KOKORO_TRUECOLOR:-}" in 1) return 0 ;; 0) return 1 ;; esac
   case "${COLORTERM:-}" in truecolor|24bit) return 0 ;; esac
   [ -n "${TERMUX_VERSION:-}" ] && return 0                  # Termux has 24-bit colour
@@ -175,7 +175,7 @@ theme_term() {   # THEME_TERM_MODE (dark, light or "") and THEME_TERM_BG, from w
 
 # --------------------------------------------------------------- the palette
 
-theme_off() {
+theme_off() {    # no colours (not a terminal, or NO_COLOR)
   R="" B="" D="" PAST="" LINE="" GHOST="" ACC="" ACC2="" GRN="" RED="" YEL=""
   HL="" SURF="" SEL="" PSEL="" BASE="" ACC_SGR="" D_SGR=""
   THEME_ON=0
@@ -1565,7 +1565,7 @@ def run_job(path):
         # Word timings come from Kokoro itself, with the audio.
         timed = job.get("words") == "1" and engine.has_timings
         if job.get("words") == "1" and not timed:
-            _write_atomic(os.path.join(stream, "words-off"), "this model reports no timings (kokoro --update)\n")
+            _write_atomic(os.path.join(stream, "words-off"), "this model reports no timings\n")
 
     writer = None
     total = 0.0
@@ -2119,7 +2119,8 @@ cat > "$WORK/tui.sh" <<'__KOKOMUX_TUI__'
 # Built for any terminal size: a phone held upright, or Samsung DeX with a
 # keyboard and mouse. It uses the alternate screen (scrollback is left as it
 # was), wraps each frame in synchronised output, and redraws on resize. Mouse
-# clicks and taps are read as SGR mouse reports (TUI_BTN holds the buttons).
+# clicks and taps are read as SGR mouse reports; tick names each key (KEY:
+# up, enter, click at CLICK_X CLICK_Y...), and TUI_BTN holds the buttons.
 #
 # Colours come from theme.sh (R B D PAST LINE GHOST ACC ACC2 GRN HL SURF SEL
 # PSEL): when a screen opens it asks the terminal for its colours, so the greys
@@ -2138,7 +2139,7 @@ cat > "$WORK/tui.sh" <<'__KOKOMUX_TUI__'
 # setting_change (here), and tests/test_settings.py.
 #
 # Expects from kokoro: the colours, $tmpd, $KBD (a read descriptor on
-# /dev/tty), tick (sets KEY; runs $TICK_BG while it waits), now_ms,
+# /dev/tty), tick (sets KEY, by name; runs $TICK_BG while it waits), now_ms,
 # and for the home screen BOOKS, QUEUE, CONF, mark_get and the KOKORO_* settings.
 
 TUI=0; TUI_TTY=""; TUI_RESIZED=0
@@ -2153,7 +2154,7 @@ TUI_CHAPTER=""; TUI_HAS_CHAPTERS=0; TUI_BAR=(3 10)   # the progress bar's first 
 SYNC_ON=$'\033[?2026h'; SYNC_OFF=$'\033[?2026l'
 TUI_FOCUS=0; TUI_EASE_AT=0; TUI_EASE_MS=382   # the focus effect; the part just heard eases out
 
-tui_size() {
+tui_size() {     # TW and TH from the terminal, then the layout
   local size
   size="$(stty size 2>/dev/null </dev/tty)" || size=""
   if [[ "$size" =~ ^([0-9]+)\ ([0-9]+)$ ]]; then TH=${BASH_REMATCH[1]} TW=${BASH_REMATCH[2]}; fi
@@ -2170,7 +2171,7 @@ tui_layout() {   # the reading column and the footer's rows, for a TW×TH screen
   TUI_WRAP=(); TUI_OFFS=()
 }
 
-tui_fits() { tui_size; [ "$TW" -ge 40 ] && [ "$TH" -ge 12 ]; }
+tui_fits() { tui_size; [ "$TW" -ge 40 ] && [ "$TH" -ge 12 ]; }   # is the screen big enough for the reader?
 
 # Every frame is drawn into FRAME and written to the terminal in one go (flush),
 # just before kokomux waits for a key (tick) or hands the terminal over. One
@@ -2178,7 +2179,7 @@ tui_fits() { tui_size; [ "$TW" -ge 40 ] && [ "$TH" -ge 12 ]; }
 FRAME=""
 # shellcheck disable=SC2059  # (the format is the caller's, as with printf)
 out() { local s; printf -v s "$@"; FRAME+=$s; }      # out FORMAT ARGS...: like printf, into the frame
-flush() { [ -z "$FRAME" ] || printf '%s' "$FRAME" >&2; FRAME=""; }
+flush() { [ -z "$FRAME" ] || printf '%s' "$FRAME" >&2; FRAME=""; }   # write the frame to the terminal in one go
 
 tui_raw() {      # keys arrive one at a time, unechoed; clicks and taps are reported
   stty -echo -icanon 2>/dev/null </dev/tty || true
@@ -2205,14 +2206,14 @@ tui_theme() {    # ask the terminal its colours (once), then pick the palette
   TUI_FOCUS=0; [ "${KOKORO_FOCUS:-1}" = 1 ] && TUI_FOCUS=1
 }
 
-tui_open() {
+tui_open() {     # open the reader
   [ "$TUI" = 1 ] && return 0
   tui_enter
   tui_size
   tui_draw
 }
 
-tui_close() {
+tui_close() {    # leave the full screen and give the terminal back (safe to call twice)
   [ "$TUI" = 1 ] || return 0
   out '\033[0m\033[?1000l\033[?1006l%s\033[?25h\033[?1049l' "$SYNC_OFF"; flush
   [ -n "$TUI_TTY" ] && stty "$TUI_TTY" 2>/dev/null </dev/tty
@@ -2230,12 +2231,12 @@ tui_refresh() {  # after a resize: measure again and draw everything
   tui_draw
 }
 
-rule() { local line; printf -v line '%*s' "$1" ''; printf '%s' "${line// /─}"; }
+rule() { local line; printf -v line '%*s' "$1" ''; printf '%s' "${line// /─}"; }   # rule N: a line N columns wide
 golden() { REPLY=$(( $1 * 382 / 1000 )); }   # golden N: the smaller golden part of N (N/φ²)
 
 # ---------------------------------------------------------------- drawing
 
-tui_header() {
+tui_header() {   # the reader's top row: kokomux, the title, the voice and speed
   local info=" ${TUI_INFO} " room title
   room=$(( TW - 14 - ${#info} ))
   title=$TUI_TITLE
@@ -2440,7 +2441,7 @@ tui_footer() {   # what's happening, the transport and the quiet controls
   tui_controls
 }
 
-tui_draw() {
+tui_draw() {     # the whole reader, from scratch
   out '%s%s\033[2J' "$SYNC_ON" "$R"  # a full redraw clears what overlays left behind
   tui_header; tui_text; tui_progress; tui_footer
   out '%s' "$SYNC_OFF"
@@ -2457,7 +2458,7 @@ tui_part() {     # tui_part I PARTS: a new part starts playing (dim until its wo
   TUI_PART=$1 TUI_PARTS=${2:-$TUI_PARTS} TUI_A=0 TUI_B=0
   tui_draw
 }
-tui_light() { TUI_A=$1 TUI_B=$2; tui_text; }
+tui_light() { TUI_A=$1 TUI_B=$2; tui_text; }   # tui_light A B: light bytes A..B of the part being read
 tui_anim() { [ "$TUI_EASE_AT" -gt 0 ] && tui_text; return 0; }   # each tick while the part just heard eases out
 tui_state() {    # tui_state TEXT EXTRA SYMBOL PAUSED: only the footer is redrawn
   [ "$1|$2|$3|${4:-0}" = "$TUI_STATE|$TUI_EXTRA|$TUI_SYM|$TUI_PAUSED" ] && return 0
@@ -2466,11 +2467,8 @@ tui_state() {    # tui_state TEXT EXTRA SYMBOL PAUSED: only the footer is redraw
   tui_footer
 }
 
-tui_click() {    # tui_click REPORT: a left click or tap on a button or the progress bar sets CMD
-  local b x y spec row x0 x1 cmd
-  [[ "$1" =~ ^$'\033'\[\<([0-9]+)\;([0-9]+)\;([0-9]+)M$ ]] || return 0
-  b=${BASH_REMATCH[1]} x=${BASH_REMATCH[2]} y=${BASH_REMATCH[3]}
-  [ "$b" = 0 ] || return 0
+tui_click() {    # a click or tap at CLICK_X, CLICK_Y on a button or the progress bar sets CMD
+  local x=$CLICK_X y=$CLICK_Y spec row x0 x1 cmd
   for spec in "${TUI_BTN[@]}"; do
     read -r row x0 x1 cmd <<< "$spec"
     if [ "$y" = "$row" ] && [ "$x" -ge "$x0" ] && [ "$x" -le "$x1" ]; then CMD=$cmd; return 0; fi
@@ -2516,11 +2514,11 @@ tui_chapters() { # tui_chapters CURRENT: pick a chapter over the reading area; C
     KEY=""; tick 0.5; [ -n "$KEY" ] || { continue; }
     dirty=1
     case "$KEY" in
-      $'\033[A'|$'\033OA'|k|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
-      $'\033[B'|$'\033OB'|j|$'\033[<65;'*M) [ "$sel" -lt $(( ${#CH_TITLE[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
-      $'\n'|$'\r') CHOSEN=$sel; break ;;
-      $'\033[<0;'*M) [[ "$KEY" =~ \;([0-9]+)M$ ]] && i=${rowsel[${BASH_REMATCH[1]}]:-} && [ -n "$i" ] && { CHOSEN=$i; break; } ;;
-      $'\033'|q|c) break ;;
+      up|k) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
+      down|j) [ "$sel" -lt $(( ${#CH_TITLE[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
+      enter) CHOSEN=$sel; break ;;
+      click) i=${rowsel[$CLICK_Y]:-}; [ -z "$i" ] || { CHOSEN=$i; break; } ;;
+      esc|q|c) break ;;
     esac
   done
   tui_draw
@@ -2559,13 +2557,13 @@ tui_menu() {     # the reader's menu (m): MENU_CMD = what to do ("" if closed wi
     KEY=""; tick 0.25; [ -n "$KEY" ] || continue
     dirty=1; cmd=""
     case "$KEY" in
-      $'\033[A'|$'\033OA'|k|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
-      $'\033[B'|$'\033OB'|j|$'\033[<65;'*M) [ "$sel" -lt $(( n - 1 )) ] && sel=$(( sel + 1 )) ;;
-      $'\n'|$'\r'|" ") cmd=${items[sel]##*|} ;;
-      $'\033[<0;'*M) [[ "$KEY" =~ \;([0-9]+)M$ ]] && i=${rowsel[${BASH_REMATCH[1]}]:-} && [ -n "$i" ] && cmd=${items[i]##*|} ;;
+      up|k) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
+      down|j) [ "$sel" -lt $(( n - 1 )) ] && sel=$(( sel + 1 )) ;;
+      enter|" ") cmd=${items[sel]##*|} ;;
+      click) i=${rowsel[$CLICK_Y]:-}; [ -z "$i" ] || cmd=${items[i]##*|} ;;
       s) cmd=settings ;; v) cmd=voice ;; t) cmd="sleep" ;; q) cmd=quit ;;
       c) [ "$TUI_HAS_CHAPTERS" = 1 ] && cmd=chapters ;;
-      $'\033'|m) break ;;
+      esc|m) break ;;
     esac
     if [ "$cmd" = sleep ]; then sleep_cycle; continue; fi    # (the menu stays, showing the new time)
     [ -n "$cmd" ] && { MENU_CMD=$cmd; break; }
@@ -2681,14 +2679,14 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
     cmd=""
     case "$KEY" in
       [1-6]) [ "$(( KEY - 1 ))" -lt "${#marks[@]}" ] && cmd="mark:$(( KEY - 1 ))" ;;
-      $'\n'|$'\r') [ "${#marks[@]}" -gt 0 ] && cmd="mark:$sel" ;;
-      $'\033[A'|$'\033OA'|k|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;   # also the mouse wheel
-      $'\033[B'|$'\033OB'|j|$'\033[<65;'*M) [ "$sel" -lt $(( ${#marks[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
+      enter) [ "${#marks[@]}" -gt 0 ] && cmd="mark:$sel" ;;
+      up|k) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
+      down|j) [ "$sel" -lt $(( ${#marks[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
       c) cmd="clip" ;; f) cmd="file" ;; u) cmd="url" ;; t) cmd="text" ;; v) cmd="voice" ;; s|o|,) cmd="settings" ;;
       p) [ "$qn" -gt 0 ] && cmd="queue" ;;
       g) [ "${#marks[@]}" -gt 0 ] && [ "$(mark_get "${marks[sel]}" kind)" = novel ] && cmd="chapter" ;;
-      q|Q|$'\033') break ;;
-      $'\033[<0;'*M) [[ "$KEY" =~ \;([0-9]+)M$ ]] && cmd="${rowact[${BASH_REMATCH[1]}]:-}" ;;
+      q|Q|esc) break ;;
+      click) cmd="${rowact[$CLICK_Y]:-}" ;;
     esac
     case "$cmd" in
       mark:*)  HOME_CHOICE=(--continue "${marks[${cmd#mark:}]}"); break ;;
@@ -2756,10 +2754,15 @@ voice_sample() { # voice_sample VOICE: hear a voice say a line in its own langua
   SAVED_AT=0; SETTINGS_NOTE="Playing a sample of $v…"
 }
 
-tui_save() {     # tui_save NAME VALUE: keep a setting (and use it straight away)
+conf_set() {     # conf_set NAME VALUE: keep a setting in the settings file, and use it now
+  local v=$2
+  v=${v//\\/\\\\}; v=${v//&/\\&}; v=${v//|/\\|}        # (sed would read \ & | in the value)
   mkdir -p "${CONF%/*}"; [ -f "$CONF" ] || : > "$CONF"
-  if grep -q "^$1=" "$CONF"; then sed -i "s|^$1=[^ #]*|$1=$2|" "$CONF"; else echo "$1=$2" >> "$CONF"; fi
+  if grep -q "^$1=" "$CONF"; then sed -i "s|^$1=[^ #]*|$1=$v|" "$CONF"; else printf '%s=%s\n' "$1" "$2" >> "$CONF"; fi
   printf -v "$1" '%s' "$2"
+}
+tui_save() {     # tui_save NAME VALUE: conf_set, and "✓ Saved" on the settings screen
+  conf_set "$1" "$2"
   now_ms; SAVED_AT=$NOW
 }
 
@@ -2970,18 +2973,17 @@ tui_settings() { # the settings menu; works on its own or from the home screen
     dirty=1
     SETTINGS_NOTE=""
     case "$KEY" in
-      $'\033[A'|$'\033OA'|k|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
-      $'\033[B'|$'\033OB'|j|$'\033[<65;'*M) [ "$sel" -lt $(( ${#items[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
-      $'\033[D'|$'\033OD'|h|-) setting_change "${items[sel]}" -1 ;;
-      $'\033[C'|$'\033OC'|l|+|=) setting_change "${items[sel]}" 1 ;;
-      $'\n'|$'\r') setting_change "${items[sel]}" 0 ;;
+      up|k) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
+      down|j) [ "$sel" -lt $(( ${#items[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
+      left|h|-) setting_change "${items[sel]}" -1 ;;
+      right|l|+|=) setting_change "${items[sel]}" 1 ;;
+      enter) setting_change "${items[sel]}" 0 ;;
       " ") case "${items[sel]}" in voice|blend|blendamt) voice_sample "$(voice_mix)" ;; *) setting_change "${items[sel]}" 0 ;; esac ;;
-      $'\033[<0;'*M)
-        [[ "$KEY" =~ \;([0-9]+)M$ ]] || continue
-        r=${rowsel[${BASH_REMATCH[1]}]:-}
+      click)
+        r=${rowsel[$CLICK_Y]:-}
         [ -n "$r" ] || continue
         if [ "$r" = "$sel" ]; then setting_change "${items[sel]}" 0; else sel=$r; fi ;;   # a second click acts
-      q|Q|$'\033') break ;;
+      q|Q|esc) break ;;
     esac
   done
   if [ "$own" = 1 ]; then tui_close; fi
@@ -3048,22 +3050,21 @@ tui_voices() {   # tui_voices [blend]: the voice picker: type to filter, Space t
     dirty=1
     PICK_NOTE=""
     case "$KEY" in
-      $'\033[A'|$'\033OA'|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
-      $'\033[B'|$'\033OB'|$'\033[<65;'*M) [ "$sel" -lt $(( ${#list[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
-      $'\033[5~') sel=$(( sel > view ? sel - view : 0 )) ;;
-      $'\033[6~') sel=$(( sel + view < ${#list[@]} ? sel + view : ${#list[@]} - 1 )) ;;
+      up) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
+      down) [ "$sel" -lt $(( ${#list[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
+      pgup) sel=$(( sel > view ? sel - view : 0 )) ;;
+      pgdn) sel=$(( sel + view < ${#list[@]} ? sel + view : ${#list[@]} - 1 )) ;;
       " ") [ "${#list[@]}" -gt 0 ] || continue
            if [ "$mode" = blend ]; then voice_sample "$(voice_mix "$KOKORO_VOICE" "${list[sel]}:$(blend_amount)")"
            else voice_sample "${list[sel]}"; fi ;;
-      $'\n'|$'\r') [ "${#list[@]}" -gt 0 ] && tui_pick "${list[sel]}" "$mode" && return 0 ;;
-      $'\177'|$'\b') filter=${filter%?}; sel=0; top=0 ;;
+      enter) [ "${#list[@]}" -gt 0 ] && tui_pick "${list[sel]}" "$mode" && return 0 ;;
+      backspace) filter=${filter%?}; sel=0; top=0 ;;
       [a-z_]) filter+=$KEY; sel=0; top=0 ;;
-      $'\033[<0;'*M)
-        [[ "$KEY" =~ \;([0-9]+)M$ ]] || continue
-        i=${rowsel[${BASH_REMATCH[1]}]:-}; [ -n "$i" ] || continue
+      click)
+        i=${rowsel[$CLICK_Y]:-}; [ -n "$i" ] || continue
         if [ "$i" = "$sel" ]; then tui_pick "${list[sel]}" "$mode" && return 0
         else sel=$i; fi ;;
-      $'\033'|q) return 0 ;;
+      esc) return 0 ;;                       # (letters type into the filter)
     esac
   done
 }
@@ -3184,14 +3185,14 @@ view_part() {    # view_part IDX BASE: a part starts playing
   fi
   return 0
 }
-view_light() { if [ "$ui" = tui ]; then tui_light "$@"; elif [ "$show_words" = 1 ]; then block_redraw "$@"; fi; }
+view_light() { if [ "$ui" = tui ]; then tui_light "$@"; elif [ "$show_words" = 1 ]; then block_redraw "$@"; fi; }   # view_light A B: light bytes A..B of the part (-1 -1: nothing lit)
 view_state() {   # view_state TEXT EXTRA [SYMBOL] [PAUSED]: what's happening (a spinner if no symbol)
   local sym=${3:-${SPIN[frame % 10]}}
   frame=$(( frame + 1 ))
   if [ "$ui" = tui ]; then tui_state "$1" "$2" "$sym" "${4:-0}"; else status "$1" "$2" "$sym"; fi
 }
-view_part_end() { if [ "$ui" = tui ]; then tui_light -1 -1; elif [ "$show_words" = 1 ]; then block_finish; fi; }
-view_refresh() { [ "$ui" = tui ] && { tui_refresh; tui_anim; }; return 0; }
+view_part_end() { if [ "$ui" = tui ]; then tui_light -1 -1; elif [ "$show_words" = 1 ]; then block_finish; fi; }   # a part has been heard: nothing lit
+view_refresh() { [ "$ui" = tui ] && { tui_refresh; tui_anim; }; return 0; }   # after a resize, and while the part just heard eases out of focus
 
 words_load() {   # read NNNN.words once it lands
   local f=$1 s e a b
@@ -3208,7 +3209,7 @@ words_load() {   # read NNNN.words once it lands
 # Bookmarks, the notification and the controls that work while a text plays.
 
 book_title=""
-title_get() { [ -n "$book_title" ] || { [ -f "$tmpd/title" ] && read -r book_title < "$tmpd/title"; } || true; }
+title_get() { [ -n "$book_title" ] || { [ -f "$tmpd/title" ] && read -r book_title < "$tmpd/title"; } || true; }   # book_title, from the engine's title file once it's there
 
 bookmark_save() {   # bookmark_save PART: so the same command, or kokoro --continue, picks up here
   local parts=1
@@ -3244,7 +3245,7 @@ bookmark_done() {  # read to the end: the bookmark and the book's kept audio go
 NOVEL=""                                  # the novel's address, once we know it's one
 NV_URL=(); NV_NUM=()                      # each chapter of this listen: its address and number (with CH_START)
 N_URL=""; N_FIRST=1; N_NUM=""; N_LABEL=""; N_PARTS=1
-novel_load() {
+novel_load() {   # once the engine says it's a web novel: NOVEL, and the novel's own bookmark
   [ -z "$NOVEL" ] && [ -f "$tmpd/novel" ] || return 0
   NOVEL="$(mark_get "$tmpd/novel" url)"
   [ -n "$NOVEL" ] || return 0
@@ -3305,7 +3306,7 @@ notify() {
       --media-next "$k --next" --on-delete "$k --stop" >/dev/null 2>&1 & )
   return 0
 }
-notify_clear() {
+notify_clear() {   # take the notification away
   [ "$KOKORO_NOTIFY" = 1 ] && command -v termux-notification-remove >/dev/null || return 0
   ( timeout 10 termux-notification-remove kokomux >/dev/null 2>&1 & )
   return 0
@@ -3333,7 +3334,7 @@ chapter_of() {   # chapter_of PART: CH = the index of the chapter PART is in (-1
 # spent paused doesn't count.
 SLEEP=off; SLEEP_AT=0
 SLEEP_FADE=13000
-sleep_cycle() {
+sleep_cycle() {  # the sleep timer's next setting: off, 15, 30, 60 min, end of chapter
   case "$SLEEP" in
     off) SLEEP=15 ;; 15) SLEEP=30 ;; 30) SLEEP=60 ;;
     60) if [ "${#CH_START[@]}" -gt 1 ]; then SLEEP=chapter; else SLEEP=off; fi ;;
@@ -3483,7 +3484,7 @@ declare -A MPV_IDX=()              # part -> its playlist index
 MPV_PART=()                        # playlist index -> part
 MPV_SPD=()                         # playlist index -> the speed it was made at
 
-mpv_start() {
+mpv_start() {    # start the one mpv for this listen, and connect to it through socat
   [ -n "$MPV_PID" ] && kill -0 "$MPV_PID" 2>/dev/null && return 0
   MPV_SOCK="$(realpath "$PREFIX/tmp")/kokomux-mpv.$$"   # (a socket's path can't be longer than 107 bytes)
   rm -f "$MPV_SOCK"
@@ -3501,7 +3502,7 @@ mpv_start() {
   mpv_send '"observe_property",2,"playlist-pos"'
   mpv_send '"observe_property",3,"duration"'
 }
-mpv_send() { printf '{"command":[%s]}\n' "$1" >&"$MPV_OUT"; }
+mpv_send() { printf '{"command":[%s]}\n' "$1" >&"$MPV_OUT"; }   # mpv_send ARGS: a command to mpv, e.g. '"set_property","pause",true'
 mpv_pump() {     # take in what mpv has reported since last time
   local line
   while :; do
@@ -3534,7 +3535,7 @@ mpv_stop() {     # empty the playlist (a jump starts again from a new part)
   MPV_IDX=(); MPV_PART=(); MPV_SPD=(); MPV_N=0; MPV_POS=-1; MPV_T=0; MPV_MAX=-1
   return 0
 }
-mpv_quit() {
+mpv_quit() {     # stop mpv
   [ -n "$MPV_PID" ] && { kill "$MPV_PID" 2>/dev/null; wait "$MPV_PID" 2>/dev/null; }
   [ -n "$MPV_SOCK" ] && rm -f "$MPV_SOCK"
   MPV_PID=""
@@ -3733,12 +3734,12 @@ theme_sgr() {    # theme_sgr 38|48 RGB: the SGR parameters for that colour (REPL
   if [ "$d2" -lt "$d1" ]; then REPLY="$1;5;$(( 232 + k ))"; else REPLY="$1;5;$(( 16 + 36 * ri + 6 * gi + bi ))"; fi
 }
 
-theme_fg() { theme_sgr 38 "$1"; REPLY=$'\033['"$REPLY"m; }
-theme_bg() { theme_sgr 48 "$1"; REPLY=$'\033['"$REPLY"m; }
+theme_fg() { theme_sgr 38 "$1"; REPLY=$'\033['"$REPLY"m; }   # theme_fg RGB: REPLY = the escape for that text colour
+theme_bg() { theme_sgr 48 "$1"; REPLY=$'\033['"$REPLY"m; }   # theme_bg RGB: REPLY = the escape for that background
 
 # --------------------------------------------------------------- the terminal
 
-theme_truecolor() {
+theme_truecolor() {   # does the terminal show 24-bit colour?
   case "${KOKORO_TRUECOLOR:-}" in 1) return 0 ;; 0) return 1 ;; esac
   case "${COLORTERM:-}" in truecolor|24bit) return 0 ;; esac
   [ -n "${TERMUX_VERSION:-}" ] && return 0                  # Termux has 24-bit colour
@@ -3798,7 +3799,7 @@ theme_term() {   # THEME_TERM_MODE (dark, light or "") and THEME_TERM_BG, from w
 
 # --------------------------------------------------------------- the palette
 
-theme_off() {
+theme_off() {    # no colours (not a terminal, or NO_COLOR)
   R="" B="" D="" PAST="" LINE="" GHOST="" ACC="" ACC2="" GRN="" RED="" YEL=""
   HL="" SURF="" SEL="" PSEL="" BASE="" ACC_SGR="" D_SGR=""
   THEME_ON=0
@@ -3945,7 +3946,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
 # in player.sh, the colours in theme.sh (all three loaded below).
 set -euo pipefail
 
-KOKOMUX_VERSION="0.17.3"
+KOKOMUX_VERSION="0.17.4"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -4029,7 +4030,7 @@ if [ "$LIVE" = 1 ]; then theme_apply; else theme_off; fi
 SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
 frame=0
 
-cols() {
+cols() {         # the terminal's width (60 when it can't be asked)
   local c
   c="$(stty size 2>/dev/null </dev/tty | cut -d' ' -f2)" || true
   [[ "${c:-}" =~ ^[0-9]+$ ]] && [ "$c" -ge 20 ] && echo "$c" || echo 60
@@ -4043,13 +4044,13 @@ die() {
   [ -n "${2:-}" ] && printf '  %s%s%s\n' "$D" "$2" "$R" >&2
   exit 1
 }
-done_msg() { printf '%s✓%s %s%s\n' "$GRN" "$R" "$1" "${2:+ $D$2$R}" >&2; }
-info() { printf '%s›%s %s\n' "$ACC" "$R" "$1" >&2; }
+done_msg() { printf '%s✓%s %s%s\n' "$GRN" "$R" "$1" "${2:+ $D$2$R}" >&2; }   # done_msg TEXT [DIM]: a ✓ line
+info() { printf '%s›%s %s\n' "$ACC" "$R" "$1" >&2; }   # info TEXT: a › line
 
 # One live status line, never wider than the screen (a wrapped line can't
 # be redrawn in place): status "text" ["dim extra"] ["symbol"]
 TERM_COLS=60; [ "$LIVE" = 1 ] && TERM_COLS="$(cols)"
-status() {
+status() {       # status TEXT [DIM] [SYMBOL]: the live status line, redrawn in place
   [ "$LIVE" = 1 ] || return 0
   local main=$1 extra=${2:-} sym=${3:-${SPIN[frame % 10]}} vis room
   vis="$(printf '%s' "$main" | sed 's/\x1b\[[0-9;]*m//g')"
@@ -4059,8 +4060,13 @@ status() {
   printf '\r\033[K%s%s%s %s %s%s%s' "$ACC" "$sym" "$R" "$main" "$D" "$extra" "$R" >&2
   frame=$((frame + 1))
 }
-status_clear() { [ "$LIVE" = 1 ] && printf '\r\033[K' >&2; return 0; }
+status_clear() { [ "$LIVE" = 1 ] && printf '\r\033[K' >&2; return 0; }   # rub out the live status line
 
+snippet() {      # snippet FILE: its first 60 characters, on one line (a title for a text)
+  local t
+  t="$(head -c 600 "$1" | tr '\n\t\r' '   ' | tr -s ' ')" || t=""
+  t=${t# }; t=${t:0:60}; printf '%s' "${t% }"
+}
 # shellcheck disable=SC2088  # a literal ~ is the point
 tilde() { case "$1" in "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac; }
 # Voices: one, or several blended ("af_heart:70+af_bella:30").
@@ -4077,17 +4083,12 @@ voice_label() {  # voice_label SPEC: "af_heart:70+af_bella:30" -> "af_heart + af
   while [[ "$s" =~ ^(.*):[0-9]+(.*)$ ]]; do s=${BASH_REMATCH[1]}${BASH_REMATCH[2]}; done
   printf '%s' "${s//+/ + }"
 }
-conf_set() {     # conf_set NAME VALUE: keep a setting in the settings file
-  mkdir -p "$CONF_DIR"; [ -f "$CONF" ] || : > "$CONF"
-  if grep -q "^$1=" "$CONF"; then sed -i "s|^$1=[^ #]*|$1=$2|" "$CONF"; else echo "$1=$2" >> "$CONF"; fi
-  printf -v "$1" '%s' "$2"
-}
-human_size() {
+human_size() {   # human_size BYTES: "1.2 MB" or "340 KB"
   local b=$1
   if [ "$b" -ge 1048576 ]; then awk "BEGIN { printf \"%.1f MB\", $b / 1048576 }"
   else echo "$(( (b + 1023) / 1024 )) KB"; fi
 }
-human_secs() {
+human_secs() {   # human_secs SECONDS: "2m 05s" or "4.2s"
   awk -v s="$1" 'BEGIN { if (s >= 60) printf "%dm %02ds", s / 60, s % 60; else printf "%.1fs", s }'
 }
 
@@ -4102,7 +4103,7 @@ opt_rows() {
   done
 }
 
-usage() {
+usage() {        # kokoro --help
   printf '%skokoro%s %sv%s%s\n' "$B" "$R" "$ACC" "$KOKOMUX_VERSION" "$R"
   printf '%sKokoro text-to-speech for Termux%s\n\n' "$D" "$R"
   printf '%sUsage%s kokoro [options] [text]\n' "$B" "$R"
@@ -4151,17 +4152,17 @@ ROWS
 
 # ------------------------------------------------------------ server
 
-server_token() { [ -f "$TOKEN_FILE" ] && cut -d' ' -f2 "$TOKEN_FILE"; }
-server_port() { [ -f "$TOKEN_FILE" ] && cut -d' ' -f1 "$TOKEN_FILE"; }
+server_token() { [ -f "$TOKEN_FILE" ] && cut -d' ' -f2 "$TOKEN_FILE"; }   # the background server's secret (from its token file)
+server_port() { [ -f "$TOKEN_FILE" ] && cut -d' ' -f1 "$TOKEN_FILE"; }   # the port it listens on (from the same file)
 
-server_up() {
+server_up() {    # is the background server answering?
   local tok port
   tok="$(server_token 2>/dev/null)" || return 1
   port="$(server_port)"
   curl -fsS -m 2 -H "X-Kokoro-Token: $tok" "http://127.0.0.1:$port/health" >/dev/null 2>&1
 }
 
-start_server() {
+start_server() {   # start the server in the container and wait (a spinner) until it answers
   server_up && return 0
   mkdir -p "$SRV_DIR"
   rm -f "$TOKEN_FILE"
@@ -4188,7 +4189,7 @@ start_server() {
   return 1
 }
 
-stop_server() {
+stop_server() {  # ask the server to stop, and wait until it has
   if ! server_up; then info "The server isn't running."; return 0; fi
   curl -fsS -m 5 -X POST -H "X-Kokoro-Token: $(server_token)" \
     "http://127.0.0.1:$(server_port)/shutdown" >/dev/null || true
@@ -4199,7 +4200,7 @@ stop_server() {
 
 # ------------------------------------------------------------ playback
 
-player_alive() { local pid; pid="$(cat "$PLAYER_PID" 2>/dev/null)" && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }
+player_alive() { local pid; pid="$(cat "$PLAYER_PID" 2>/dev/null)" && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }   # is a kokoro -p running (by its pid file)?
 
 # control WORD MESSAGE: tell the running player to pause, skip or replay
 control() {
@@ -4218,7 +4219,7 @@ chapter_url() {  # chapter_url URL N: CHURL = chapter N's address, where a novel
   CHURL="${BASH_REMATCH[1]}$2${BASH_REMATCH[3]}"
 }
 
-stop_playback() {
+stop_playback() {   # stop the running player, if any (returns 1 if there was none)
   local pid
   pid="$(cat "$PLAYER_PID" 2>/dev/null)" || return 1
   rm -f "$PLAYER_PID"
@@ -4227,12 +4228,15 @@ stop_playback() {
 
 # ------------------------------------------------------------ keys and the frame timer
 # tick waits a moment (no process) and, on a terminal, reads one key or click
-# into KEY. A stop signal during the wait must not exit from inside `read -t`:
+# into KEY, by name (key_name): a printable key is itself ("q", " ", "+"), the
+# others are up down left right enter esc backspace pgup pgdn, and click (a
+# left click or tap, at CLICK_X, CLICK_Y). The mouse wheel is up and down.
+# A stop signal during the wait must not exit from inside `read -t`:
 # if cleanup then outlives the timer, bash's alarm jumps back into a read that's
 # gone and bash crashes (seen with bash 5.2). So during the wait the signal only
 # sets a flag, and tick exits once read has returned.
 
-STOP=""; IN_TICK=0; KEY=""; CMD=""; KBD=""; KEYS_TTY=""; TICK_BG=""
+STOP=""; IN_TICK=0; KEY=""; CMD=""; KBD=""; KEYS_TTY=""; TICK_BG=""; CLICK_X=0; CLICK_Y=0
 exec {TICK}<> <(:)                    # read -t on this is a sleep with no process
 now_ms() { local t=${EPOCHREALTIME//[!0-9]/}; NOW=$(( t / 1000 )); }   # no subshell: called every frame
 keys_on() {      # read keys from the terminal, unechoed (restored on exit)
@@ -4242,8 +4246,8 @@ keys_on() {      # read keys from the terminal, unechoed (restored on exit)
   KEYS_TTY="$(stty -g 2>/dev/null </dev/tty)" || KEYS_TTY=""
   stty -echo -icanon 2>/dev/null </dev/tty || true
 }
-keys_off() { [ -n "$KEYS_TTY" ] && stty "$KEYS_TTY" 2>/dev/null </dev/tty; KEYS_TTY=""; return 0; }
-tick() {
+keys_off() { [ -n "$KEYS_TTY" ] && stty "$KEYS_TTY" 2>/dev/null </dev/tty; KEYS_TTY=""; return 0; }   # give the terminal back its echo and line editing
+tick() {         # tick SECONDS: flush the frame, wait, and read a key into KEY (by name)
   local c rest=""
   [ -n "${FRAME:-}" ] && flush          # the frame drawn since the last wait, in one write
   [ -n "${TICK_BG:-}" ] && "$TICK_BG"    # the player keeping mpv fed, while a menu is open
@@ -4256,19 +4260,37 @@ tick() {
       done
       KEY=$'\033'$rest
     fi
+    key_name
   else
     read -r -t "$1" -u "$TICK" _ || true
   fi
   IN_TICK=0
   [ -z "$STOP" ] || exit 130
 }
+key_name() {     # KEY, as the terminal sent it, to its name (see above); "" for what no screen uses
+  case "$KEY" in
+    $'\033[A'|$'\033OA'|$'\033[<64;'*M) KEY=up ;;
+    $'\033[B'|$'\033OB'|$'\033[<65;'*M) KEY=down ;;
+    $'\033[C'|$'\033OC') KEY=right ;;
+    $'\033[D'|$'\033OD') KEY=left ;;
+    $'\033[5~') KEY=pgup ;;
+    $'\033[6~') KEY=pgdn ;;
+    $'\r'|$'\n') KEY=enter ;;
+    $'\033') KEY=esc ;;
+    $'\177'|$'\b') KEY=backspace ;;
+    $'\033[<0;'*M)                            # a left click or tap: "ESC [ < 0 ; x ; y M"
+      if [[ "$KEY" =~ \;([0-9]+)\;([0-9]+)M$ ]]; then CLICK_X=${BASH_REMATCH[1]} CLICK_Y=${BASH_REMATCH[2]} KEY=click
+      else KEY=""; fi ;;
+    $'\033'*) KEY="" ;;                        # a release, another button, a key no screen uses
+  esac
+}
 key_cmd() {      # what KEY asks for (or a clicked button): see the player for each
   CMD=""
   case "$KEY" in
     " "|p|P|k) CMD=toggle ;;
-    n|N|l|$'\033[C'|$'\033OC') CMD=next ;;
-    b|B|h|$'\033[D'|$'\033OD') CMD=again ;;
-    q|Q|$'\033') CMD=quit ;;
+    n|N|l|right) CMD=next ;;
+    b|B|h|left) CMD=again ;;
+    q|Q|esc) CMD=quit ;;
     +|=) CMD=faster ;;
     -|_) CMD=slower ;;
     t|T) CMD="sleep" ;;
@@ -4278,7 +4300,7 @@ key_cmd() {      # what KEY asks for (or a clicked button): see the player for e
     v|V) CMD=voice ;;
     ']') CMD=next_chapter ;;
     '[') CMD=prev_chapter ;;
-    $'\033[<'*M) [ "${ui:-}" = tui ] && tui_click "$KEY" ;;
+    click) [ "${ui:-}" = tui ] && tui_click ;;
   esac
   KEY=""
 }
@@ -4321,9 +4343,9 @@ case "${1:-}" in
                  src="$QUEUE_DIR/$id.${ext,,}"; cp "$2" "$src"; title="$(basename "$2")" ;;
       -c|--clipboard) command -v termux-clipboard-get >/dev/null || die "Reading the clipboard needs Termux:API."
                  src="$QUEUE_DIR/$id.txt"; timeout 6 termux-clipboard-get > "$src" || die "Couldn't read the clipboard."
-                 title="$(head -c 60 "$src" | tr '\n\t' '  ')" ;;
+                 title="$(snippet "$src")" ;;
       "") die "What should go in the queue?" "kokoro --add -u URL, -f FILE, -c, or some text" ;;
-      *) src="$QUEUE_DIR/$id.txt"; printf '%s\n' "$*" > "$src"; title="$(head -c 60 "$src" | tr '\n\t' '  ')" ;;
+      *) src="$QUEUE_DIR/$id.txt"; printf '%s\n' "$*" > "$src"; title="$(snippet "$src")" ;;
     esac
     # A copied link on its own is that page.
     if [ "$kind" = file ] && [ "${src##*.}" = txt ] && [ "$(wc -l < "$src")" -le 1 ] &&
@@ -4340,7 +4362,9 @@ case "${1:-}" in
       list) [ -s "$QUEUE" ] || { info "Your queue is empty."; exit 0; }
             n=0; while IFS=$'\t' read -r _ _ _ title; do n=$((n + 1)); printf '  %s%2d%s  %s\n' "$ACC2" "$n" "$R" "$title"; done < "$QUEUE"
             exit 0 ;;
-      clear) while IFS=$'\t' read -r _ kind src _; do [ "$kind" = file ] && rm -f "$src"; done < "$QUEUE" 2>/dev/null
+      clear) if [ -f "$QUEUE" ]; then
+               while IFS=$'\t' read -r _ kind src _; do [ "$kind" = file ] && rm -f "$src"; done < "$QUEUE"
+             fi
              rm -f "$QUEUE"; done_msg "Queue cleared."; exit 0 ;;
       skip) [ -s "$QUEUE" ] || { info "Your queue is empty."; exit 0; }
             IFS=$'\t' read -r id kind src title < "$QUEUE"
@@ -4535,7 +4559,7 @@ fi
 
 tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
 gen_pid=""
-cleanup() {
+cleanup() {      # on exit: the screen, the bookmark message, mpv, the engine and the job folder
   set +e   # best effort from here: a process that's already gone mustn't change the exit code
   status_clear
   [ "${in_line:-0}" = 1 ] && [ "${ui:-}" = inline ] && [ "${show_words:-0}" = 1 ] && block_finish
@@ -4613,7 +4637,7 @@ fi
 # picks up where it was stopped.
 if [ -n "$url" ]; then kind=url source=$url name=$url
 elif [ -n "$infile" ]; then kind=file source="$(realpath "$infile")" name="$(basename "$infile")"
-else kind=text source="" name="$(head -c 60 "$text" | tr '\n' ' ')"; fi
+else kind=text source="" name="$(snippet "$text")"; fi
 book_id=""; start=1; was_parts=0
 if { [ "$play" = 1 ] && [ -z "$out" ]; } || [ "$ext" = m4b ]; then   # (an audiobook reuses what listening made)
   if [ "$kind" = url ]; then book_id="$(printf '%s' "$url" | sha256sum | cut -c1-16)"
@@ -4698,7 +4722,7 @@ if [ -n "$book_id" ]; then mkdir -p "$CACHE/$book_id"; touch "$CACHE/$book_id"; 
 use_server=0
 if server_up || { [ "$KOKORO_AUTOSERVE" = 1 ] && start_server; }; then use_server=1; fi
 
-run_engine() {
+run_engine() {   # run the job: through the server, or one-off in the container
   if [ "$use_server" = 1 ]; then
     local rc=0
     curl -s --fail-with-body -X POST -H "X-Kokoro-Token: $(server_token)" \
@@ -4720,7 +4744,7 @@ progress() {
   fi
   echo ""
 }
-waiting_label() {
+waiting_label() {   # what the status line says while the next part is being made
   if [ "$play" = 1 ] && [ "$i" -gt "$start" ]; then echo "Preparing"
   elif [ "$start" -gt 1 ]; then echo "Picking up at part $start"
   elif [ -f "$tmpd/progress" ]; then echo "Making speech"

@@ -24,7 +24,8 @@
 # Built for any terminal size: a phone held upright, or Samsung DeX with a
 # keyboard and mouse. It uses the alternate screen (scrollback is left as it
 # was), wraps each frame in synchronised output, and redraws on resize. Mouse
-# clicks and taps are read as SGR mouse reports (TUI_BTN holds the buttons).
+# clicks and taps are read as SGR mouse reports; tick names each key (KEY:
+# up, enter, click at CLICK_X CLICK_Y...), and TUI_BTN holds the buttons.
 #
 # Colours come from theme.sh (R B D PAST LINE GHOST ACC ACC2 GRN HL SURF SEL
 # PSEL): when a screen opens it asks the terminal for its colours, so the greys
@@ -43,7 +44,7 @@
 # setting_change (here), and tests/test_settings.py.
 #
 # Expects from kokoro: the colours, $tmpd, $KBD (a read descriptor on
-# /dev/tty), tick (sets KEY; runs $TICK_BG while it waits), now_ms,
+# /dev/tty), tick (sets KEY, by name; runs $TICK_BG while it waits), now_ms,
 # and for the home screen BOOKS, QUEUE, CONF, mark_get and the KOKORO_* settings.
 
 TUI=0; TUI_TTY=""; TUI_RESIZED=0
@@ -58,7 +59,7 @@ TUI_CHAPTER=""; TUI_HAS_CHAPTERS=0; TUI_BAR=(3 10)   # the progress bar's first 
 SYNC_ON=$'\033[?2026h'; SYNC_OFF=$'\033[?2026l'
 TUI_FOCUS=0; TUI_EASE_AT=0; TUI_EASE_MS=382   # the focus effect; the part just heard eases out
 
-tui_size() {
+tui_size() {     # TW and TH from the terminal, then the layout
   local size
   size="$(stty size 2>/dev/null </dev/tty)" || size=""
   if [[ "$size" =~ ^([0-9]+)\ ([0-9]+)$ ]]; then TH=${BASH_REMATCH[1]} TW=${BASH_REMATCH[2]}; fi
@@ -75,7 +76,7 @@ tui_layout() {   # the reading column and the footer's rows, for a TW×TH screen
   TUI_WRAP=(); TUI_OFFS=()
 }
 
-tui_fits() { tui_size; [ "$TW" -ge 40 ] && [ "$TH" -ge 12 ]; }
+tui_fits() { tui_size; [ "$TW" -ge 40 ] && [ "$TH" -ge 12 ]; }   # is the screen big enough for the reader?
 
 # Every frame is drawn into FRAME and written to the terminal in one go (flush),
 # just before kokomux waits for a key (tick) or hands the terminal over. One
@@ -83,7 +84,7 @@ tui_fits() { tui_size; [ "$TW" -ge 40 ] && [ "$TH" -ge 12 ]; }
 FRAME=""
 # shellcheck disable=SC2059  # (the format is the caller's, as with printf)
 out() { local s; printf -v s "$@"; FRAME+=$s; }      # out FORMAT ARGS...: like printf, into the frame
-flush() { [ -z "$FRAME" ] || printf '%s' "$FRAME" >&2; FRAME=""; }
+flush() { [ -z "$FRAME" ] || printf '%s' "$FRAME" >&2; FRAME=""; }   # write the frame to the terminal in one go
 
 tui_raw() {      # keys arrive one at a time, unechoed; clicks and taps are reported
   stty -echo -icanon 2>/dev/null </dev/tty || true
@@ -110,14 +111,14 @@ tui_theme() {    # ask the terminal its colours (once), then pick the palette
   TUI_FOCUS=0; [ "${KOKORO_FOCUS:-1}" = 1 ] && TUI_FOCUS=1
 }
 
-tui_open() {
+tui_open() {     # open the reader
   [ "$TUI" = 1 ] && return 0
   tui_enter
   tui_size
   tui_draw
 }
 
-tui_close() {
+tui_close() {    # leave the full screen and give the terminal back (safe to call twice)
   [ "$TUI" = 1 ] || return 0
   out '\033[0m\033[?1000l\033[?1006l%s\033[?25h\033[?1049l' "$SYNC_OFF"; flush
   [ -n "$TUI_TTY" ] && stty "$TUI_TTY" 2>/dev/null </dev/tty
@@ -135,12 +136,12 @@ tui_refresh() {  # after a resize: measure again and draw everything
   tui_draw
 }
 
-rule() { local line; printf -v line '%*s' "$1" ''; printf '%s' "${line// /─}"; }
+rule() { local line; printf -v line '%*s' "$1" ''; printf '%s' "${line// /─}"; }   # rule N: a line N columns wide
 golden() { REPLY=$(( $1 * 382 / 1000 )); }   # golden N: the smaller golden part of N (N/φ²)
 
 # ---------------------------------------------------------------- drawing
 
-tui_header() {
+tui_header() {   # the reader's top row: kokomux, the title, the voice and speed
   local info=" ${TUI_INFO} " room title
   room=$(( TW - 14 - ${#info} ))
   title=$TUI_TITLE
@@ -345,7 +346,7 @@ tui_footer() {   # what's happening, the transport and the quiet controls
   tui_controls
 }
 
-tui_draw() {
+tui_draw() {     # the whole reader, from scratch
   out '%s%s\033[2J' "$SYNC_ON" "$R"  # a full redraw clears what overlays left behind
   tui_header; tui_text; tui_progress; tui_footer
   out '%s' "$SYNC_OFF"
@@ -362,7 +363,7 @@ tui_part() {     # tui_part I PARTS: a new part starts playing (dim until its wo
   TUI_PART=$1 TUI_PARTS=${2:-$TUI_PARTS} TUI_A=0 TUI_B=0
   tui_draw
 }
-tui_light() { TUI_A=$1 TUI_B=$2; tui_text; }
+tui_light() { TUI_A=$1 TUI_B=$2; tui_text; }   # tui_light A B: light bytes A..B of the part being read
 tui_anim() { [ "$TUI_EASE_AT" -gt 0 ] && tui_text; return 0; }   # each tick while the part just heard eases out
 tui_state() {    # tui_state TEXT EXTRA SYMBOL PAUSED: only the footer is redrawn
   [ "$1|$2|$3|${4:-0}" = "$TUI_STATE|$TUI_EXTRA|$TUI_SYM|$TUI_PAUSED" ] && return 0
@@ -371,11 +372,8 @@ tui_state() {    # tui_state TEXT EXTRA SYMBOL PAUSED: only the footer is redraw
   tui_footer
 }
 
-tui_click() {    # tui_click REPORT: a left click or tap on a button or the progress bar sets CMD
-  local b x y spec row x0 x1 cmd
-  [[ "$1" =~ ^$'\033'\[\<([0-9]+)\;([0-9]+)\;([0-9]+)M$ ]] || return 0
-  b=${BASH_REMATCH[1]} x=${BASH_REMATCH[2]} y=${BASH_REMATCH[3]}
-  [ "$b" = 0 ] || return 0
+tui_click() {    # a click or tap at CLICK_X, CLICK_Y on a button or the progress bar sets CMD
+  local x=$CLICK_X y=$CLICK_Y spec row x0 x1 cmd
   for spec in "${TUI_BTN[@]}"; do
     read -r row x0 x1 cmd <<< "$spec"
     if [ "$y" = "$row" ] && [ "$x" -ge "$x0" ] && [ "$x" -le "$x1" ]; then CMD=$cmd; return 0; fi
@@ -421,11 +419,11 @@ tui_chapters() { # tui_chapters CURRENT: pick a chapter over the reading area; C
     KEY=""; tick 0.5; [ -n "$KEY" ] || { continue; }
     dirty=1
     case "$KEY" in
-      $'\033[A'|$'\033OA'|k|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
-      $'\033[B'|$'\033OB'|j|$'\033[<65;'*M) [ "$sel" -lt $(( ${#CH_TITLE[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
-      $'\n'|$'\r') CHOSEN=$sel; break ;;
-      $'\033[<0;'*M) [[ "$KEY" =~ \;([0-9]+)M$ ]] && i=${rowsel[${BASH_REMATCH[1]}]:-} && [ -n "$i" ] && { CHOSEN=$i; break; } ;;
-      $'\033'|q|c) break ;;
+      up|k) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
+      down|j) [ "$sel" -lt $(( ${#CH_TITLE[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
+      enter) CHOSEN=$sel; break ;;
+      click) i=${rowsel[$CLICK_Y]:-}; [ -z "$i" ] || { CHOSEN=$i; break; } ;;
+      esc|q|c) break ;;
     esac
   done
   tui_draw
@@ -464,13 +462,13 @@ tui_menu() {     # the reader's menu (m): MENU_CMD = what to do ("" if closed wi
     KEY=""; tick 0.25; [ -n "$KEY" ] || continue
     dirty=1; cmd=""
     case "$KEY" in
-      $'\033[A'|$'\033OA'|k|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
-      $'\033[B'|$'\033OB'|j|$'\033[<65;'*M) [ "$sel" -lt $(( n - 1 )) ] && sel=$(( sel + 1 )) ;;
-      $'\n'|$'\r'|" ") cmd=${items[sel]##*|} ;;
-      $'\033[<0;'*M) [[ "$KEY" =~ \;([0-9]+)M$ ]] && i=${rowsel[${BASH_REMATCH[1]}]:-} && [ -n "$i" ] && cmd=${items[i]##*|} ;;
+      up|k) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
+      down|j) [ "$sel" -lt $(( n - 1 )) ] && sel=$(( sel + 1 )) ;;
+      enter|" ") cmd=${items[sel]##*|} ;;
+      click) i=${rowsel[$CLICK_Y]:-}; [ -z "$i" ] || cmd=${items[i]##*|} ;;
       s) cmd=settings ;; v) cmd=voice ;; t) cmd="sleep" ;; q) cmd=quit ;;
       c) [ "$TUI_HAS_CHAPTERS" = 1 ] && cmd=chapters ;;
-      $'\033'|m) break ;;
+      esc|m) break ;;
     esac
     if [ "$cmd" = sleep ]; then sleep_cycle; continue; fi    # (the menu stays, showing the new time)
     [ -n "$cmd" ] && { MENU_CMD=$cmd; break; }
@@ -586,14 +584,14 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
     cmd=""
     case "$KEY" in
       [1-6]) [ "$(( KEY - 1 ))" -lt "${#marks[@]}" ] && cmd="mark:$(( KEY - 1 ))" ;;
-      $'\n'|$'\r') [ "${#marks[@]}" -gt 0 ] && cmd="mark:$sel" ;;
-      $'\033[A'|$'\033OA'|k|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;   # also the mouse wheel
-      $'\033[B'|$'\033OB'|j|$'\033[<65;'*M) [ "$sel" -lt $(( ${#marks[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
+      enter) [ "${#marks[@]}" -gt 0 ] && cmd="mark:$sel" ;;
+      up|k) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
+      down|j) [ "$sel" -lt $(( ${#marks[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
       c) cmd="clip" ;; f) cmd="file" ;; u) cmd="url" ;; t) cmd="text" ;; v) cmd="voice" ;; s|o|,) cmd="settings" ;;
       p) [ "$qn" -gt 0 ] && cmd="queue" ;;
       g) [ "${#marks[@]}" -gt 0 ] && [ "$(mark_get "${marks[sel]}" kind)" = novel ] && cmd="chapter" ;;
-      q|Q|$'\033') break ;;
-      $'\033[<0;'*M) [[ "$KEY" =~ \;([0-9]+)M$ ]] && cmd="${rowact[${BASH_REMATCH[1]}]:-}" ;;
+      q|Q|esc) break ;;
+      click) cmd="${rowact[$CLICK_Y]:-}" ;;
     esac
     case "$cmd" in
       mark:*)  HOME_CHOICE=(--continue "${marks[${cmd#mark:}]}"); break ;;
@@ -661,10 +659,15 @@ voice_sample() { # voice_sample VOICE: hear a voice say a line in its own langua
   SAVED_AT=0; SETTINGS_NOTE="Playing a sample of $v…"
 }
 
-tui_save() {     # tui_save NAME VALUE: keep a setting (and use it straight away)
+conf_set() {     # conf_set NAME VALUE: keep a setting in the settings file, and use it now
+  local v=$2
+  v=${v//\\/\\\\}; v=${v//&/\\&}; v=${v//|/\\|}        # (sed would read \ & | in the value)
   mkdir -p "${CONF%/*}"; [ -f "$CONF" ] || : > "$CONF"
-  if grep -q "^$1=" "$CONF"; then sed -i "s|^$1=[^ #]*|$1=$2|" "$CONF"; else echo "$1=$2" >> "$CONF"; fi
+  if grep -q "^$1=" "$CONF"; then sed -i "s|^$1=[^ #]*|$1=$v|" "$CONF"; else printf '%s=%s\n' "$1" "$2" >> "$CONF"; fi
   printf -v "$1" '%s' "$2"
+}
+tui_save() {     # tui_save NAME VALUE: conf_set, and "✓ Saved" on the settings screen
+  conf_set "$1" "$2"
   now_ms; SAVED_AT=$NOW
 }
 
@@ -875,18 +878,17 @@ tui_settings() { # the settings menu; works on its own or from the home screen
     dirty=1
     SETTINGS_NOTE=""
     case "$KEY" in
-      $'\033[A'|$'\033OA'|k|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
-      $'\033[B'|$'\033OB'|j|$'\033[<65;'*M) [ "$sel" -lt $(( ${#items[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
-      $'\033[D'|$'\033OD'|h|-) setting_change "${items[sel]}" -1 ;;
-      $'\033[C'|$'\033OC'|l|+|=) setting_change "${items[sel]}" 1 ;;
-      $'\n'|$'\r') setting_change "${items[sel]}" 0 ;;
+      up|k) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
+      down|j) [ "$sel" -lt $(( ${#items[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
+      left|h|-) setting_change "${items[sel]}" -1 ;;
+      right|l|+|=) setting_change "${items[sel]}" 1 ;;
+      enter) setting_change "${items[sel]}" 0 ;;
       " ") case "${items[sel]}" in voice|blend|blendamt) voice_sample "$(voice_mix)" ;; *) setting_change "${items[sel]}" 0 ;; esac ;;
-      $'\033[<0;'*M)
-        [[ "$KEY" =~ \;([0-9]+)M$ ]] || continue
-        r=${rowsel[${BASH_REMATCH[1]}]:-}
+      click)
+        r=${rowsel[$CLICK_Y]:-}
         [ -n "$r" ] || continue
         if [ "$r" = "$sel" ]; then setting_change "${items[sel]}" 0; else sel=$r; fi ;;   # a second click acts
-      q|Q|$'\033') break ;;
+      q|Q|esc) break ;;
     esac
   done
   if [ "$own" = 1 ]; then tui_close; fi
@@ -953,22 +955,21 @@ tui_voices() {   # tui_voices [blend]: the voice picker: type to filter, Space t
     dirty=1
     PICK_NOTE=""
     case "$KEY" in
-      $'\033[A'|$'\033OA'|$'\033[<64;'*M) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
-      $'\033[B'|$'\033OB'|$'\033[<65;'*M) [ "$sel" -lt $(( ${#list[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
-      $'\033[5~') sel=$(( sel > view ? sel - view : 0 )) ;;
-      $'\033[6~') sel=$(( sel + view < ${#list[@]} ? sel + view : ${#list[@]} - 1 )) ;;
+      up) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
+      down) [ "$sel" -lt $(( ${#list[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
+      pgup) sel=$(( sel > view ? sel - view : 0 )) ;;
+      pgdn) sel=$(( sel + view < ${#list[@]} ? sel + view : ${#list[@]} - 1 )) ;;
       " ") [ "${#list[@]}" -gt 0 ] || continue
            if [ "$mode" = blend ]; then voice_sample "$(voice_mix "$KOKORO_VOICE" "${list[sel]}:$(blend_amount)")"
            else voice_sample "${list[sel]}"; fi ;;
-      $'\n'|$'\r') [ "${#list[@]}" -gt 0 ] && tui_pick "${list[sel]}" "$mode" && return 0 ;;
-      $'\177'|$'\b') filter=${filter%?}; sel=0; top=0 ;;
+      enter) [ "${#list[@]}" -gt 0 ] && tui_pick "${list[sel]}" "$mode" && return 0 ;;
+      backspace) filter=${filter%?}; sel=0; top=0 ;;
       [a-z_]) filter+=$KEY; sel=0; top=0 ;;
-      $'\033[<0;'*M)
-        [[ "$KEY" =~ \;([0-9]+)M$ ]] || continue
-        i=${rowsel[${BASH_REMATCH[1]}]:-}; [ -n "$i" ] || continue
+      click)
+        i=${rowsel[$CLICK_Y]:-}; [ -n "$i" ] || continue
         if [ "$i" = "$sel" ]; then tui_pick "${list[sel]}" "$mode" && return 0
         else sel=$i; fi ;;
-      $'\033'|q) return 0 ;;
+      esc) return 0 ;;                       # (letters type into the filter)
     esac
   done
 }
