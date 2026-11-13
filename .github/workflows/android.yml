@@ -133,4 +133,5 @@ jobs:
           path: |
             ${{ runner.temp }}/first-screen.png
             ${{ runner.temp }}/logcat.txt
+            android/app/build/outputs/androidTest-results/connected/
           if-no-files-found: ignore
