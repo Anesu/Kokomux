@@ -30,7 +30,7 @@ dev/map.sh --check || fail=1                 # every function says what it's for
 PY=python3; [ -x .dev/app/venv/bin/python ] && PY=.dev/app/venv/bin/python
 if "$PY" -m pyflakes --version >/dev/null 2>&1; then
   step pyflakes
-  "$PY" -m pyflakes src/*.py tests/*.py dev/*.py || fail=1
+  "$PY" -m pyflakes src/*.py tests/*.py dev/*.py android/tools/*.py android/app/src/main/python/*.py || fail=1
 fi
 
 for t in tests/test_*.py; do

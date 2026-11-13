@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Five bars, their heights in golden steps (13, 21, 34, 21, 13): a voice. -->
+    <path android:fillColor="#B69CFF" android:pathData="M33,47.5h5v13h-5z" />
+    <path android:fillColor="#A4A9FB" android:pathData="M42,43.5h5v21h-5z" />
+    <path android:fillColor="#92B6F8" android:pathData="M51,37h6v34h-6z" />
+    <path android:fillColor="#87C3F6" android:pathData="M61,43.5h5v21h-5z" />
+    <path android:fillColor="#7CD0F5" android:pathData="M70,47.5h5v13h-5z" />
+</vector>

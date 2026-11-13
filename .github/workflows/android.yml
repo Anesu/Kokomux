@@ -1,0 +1,118 @@
+# The Android app: build the debug APK (to install from the phone), test the
+# engine against kokoro-onnx, and check that the app's Python packages give
+# the sounds engine.py gives in the container.
+name: Android
+
+on:
+  push:
+    paths:
+      - "android/**"
+      - "src/engine.py"
+      - "src/words.py"
+      - ".github/workflows/android.yml"
+  workflow_dispatch:
+
+jobs:
+  apk:
+    name: Debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # Chaquopy builds the app's Python packages with a Python of the same version.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Android SDK, NDK and CMake
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0" "ndk;30.0.16248370" "cmake;3.31.6" > /dev/null
+
+      - name: Kokoro's model and voices, for the engine's tests
+        uses: actions/cache@v6
+        with:
+          path: models
+          key: kokoro-v1.0-fp32-dd4401a9-voices-v1.0
+
+      - name: Download them if they aren't cached
+        run: |
+          mkdir -p models
+          [ -s models/kokoro-v1.0-timestamped.fp32.onnx ] || curl -fsSL -o models/kokoro-v1.0-timestamped.fp32.onnx \
+            https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX-timestamped/resolve/dd4401a9add81ac692d20e240d22ec9dda82cc29/onnx/model.onnx
+          [ -s models/voices-v1.0.bin ] || curl -fsSL -o models/voices-v1.0.bin \
+            https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+
+      - name: Test the engine and build the APK
+        working-directory: android
+        env:
+          KOKOMUX_BUILD_PYTHON: ${{ env.pythonLocation }}/bin/python
+          KOKOMUX_MODELS: ${{ github.workspace }}/models
+        run: ./gradlew --console=plain :engine:test :app:assembleDebug
+
+      - name: The APK's size
+        run: ls -l android/app/build/outputs/apk/debug/app-debug.apk | awk '{printf "app-debug.apk: %.1f MB\n", $5 / 1e6}' | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kokomux-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      # The app's packages (Chaquopy's spaCy 3.8.7, thinc 8.3.4, numpy 1.26.2 on
+      # Python 3.10) against the sounds the container's engine.py made.
+      - name: Pronunciation with the app's Python packages
+        env:
+          PIP_CONSTRAINT: ${{ runner.temp }}/build-constraints.txt
+        run: |
+          echo "setuptools<70" > "$PIP_CONSTRAINT"      # murmurhash 1.0.2 builds only with an older setuptools
+          python -m venv "$RUNNER_TEMP/mirror"
+          "$RUNNER_TEMP/mirror/bin/pip" install --quiet -r android/app/requirements.txt espeakng-loader==0.2.4 pypdf
+          "$RUNNER_TEMP/mirror/bin/python" android/tools/pronunciation.py | tee -a "$GITHUB_STEP_SUMMARY"
+
+  emulator:
+    # The arm64 app on an x86_64 emulator, through Android's arm64 translation:
+    # the pronunciation check with Chaquopy, spaCy and the app's espeak-ng.
+    name: Pronunciation on an emulator
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Android SDK, NDK and CMake
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0" "ndk;30.0.16248370" "cmake;3.31.6" > /dev/null
+
+      - name: Let the emulator use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - uses: reactivecircus/android-emulator-runner@v2
+        env:
+          KOKOMUX_BUILD_PYTHON: ${{ env.pythonLocation }}/bin/python
+        with:
+          api-level: 36
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          working-directory: android
+          script: ./gradlew --console=plain :app:connectedDebugAndroidTest

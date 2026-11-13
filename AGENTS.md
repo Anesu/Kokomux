@@ -85,6 +85,7 @@ share handlers and the widgets. `kokoro --update [BRANCH]` re-runs it.
 | `VERSION` | stamped into both by build.sh (`@@VERSION@@`) |
 | `tests/` | one file per area, each runnable on its own (`python3 tests/test_x.py`) or with pytest |
 | `dev/` | the checks, the map of the code, the stand-in phone and the screen renderer (below) |
+| `android/` | the Android app (Kotlin, Compose, Chaquopy); its own README. It packages `src/engine.py` and `src/words.py` as they are, so a change there reaches the app too (the Android workflow checks it) |
 
 `dev/map.sh` lists every function in src/ with the line that says what it's
 for, section by section (`dev/map.sh src/tui.sh` for one file). Start there to

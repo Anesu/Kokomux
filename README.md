@@ -360,3 +360,5 @@ python3 dev/screen.py --out reader.png -- dev/kokoro -p -f story.txt   # a pictu
 | `dev/screen.py`, `dev/shot.js` | runs a command in a terminal and saves its screen as HTML and PNG |
 
 Each test file runs on its own (`python3 tests/test_text.py`) or with pytest.
+
+**An Android app** is under way in `android/`: Kokoro and misaki running in an app of their own, with engine.py's text side packaged in as it is. See [android/README.md](android/README.md); GitHub Actions builds its debug APK.

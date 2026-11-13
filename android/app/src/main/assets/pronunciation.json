@@ -1,0 +1,358 @@
+{
+"made_with": {
+"misaki": "0.7.4",
+"spacy": "3.8.18"
+},
+"cases": [
+{
+"lang": "en-us",
+"text": "Nobody in the village remembered who had built it, or why it ran inland.",
+"sounds": "nˈObˌɑdi ɪn ðə vˈɪlɪʤ ɹəmˈɛmbəɹd hˌu hæd bˈɪlt ɪt, ɔɹ wˌI ɪt ɹˈæn ˈɪnlˌænd."
+},
+{
+"lang": "en-us",
+"text": "In 1999, the worn-out explorer walked sixty miles to Igdrasil.",
+"sounds": "ˌɪn nˌIntˈin nˈIndi nˈIn, ðə wˈɔɹnˌWt ɪksplˈɔɹəɹ wˈɔkt sˈɪksti mˈIlz tʊ ˈɪɡdɹæsᵊl."
+},
+{
+"lang": "en-us",
+"text": "Doctor Smith paid $42.50 for 3 books on 5th Avenue.",
+"sounds": "dˈɑktəɹ smˈɪθ pˈAd fˈɔɹɾi tˈu dˈɑləɹz ænd fˈɪfti sˈɛnts fɔɹ θɹˈi bˈʊks ˌɔn fˈɪfθ ˈævənˌu."
+},
+{
+"lang": "en-us",
+"text": "The Caravan The caravan moved slowly across the dunes as the sun climbed higher, and every traveller kept one eye on the hori-zon.",
+"sounds": "ðə kˈɛɹəvˌæn ðə kˈɛɹəvˌæn mˈuvd slˈOli əkɹˈɔs ðə dˈunz æz ðə sˈʌn klˈImd hˈIəɹ, ænd ˈɛvəɹi tɹˈævələɹ kˈɛpt wˈʌn ˈI ˌɔn ðə hˈɔɹizˈɑn."
+},
+{
+"lang": "en-us",
+"text": "By noon the camels refused to walk. They pitched the tents in the shade of a ridge and waited for evening.",
+"sounds": "bˌI nˈun ðə kˈæmᵊlz ɹəfjˈuzd tə wˈɔk. ðˌA pˈɪʧt ðə tˈɛnts ɪn ðə ʃˈAd ʌv ɐ ɹˈɪʤ ænd wˈAɾᵻd fɔɹ ˈivnɪŋ."
+},
+{
+"lang": "en-us",
+"text": "I read the book yesterday.",
+"sounds": "ˌI ɹˈɛd ðə bˈʊk jˈɛstəɹdˌA."
+},
+{
+"lang": "en-us",
+"text": "Please record the record.",
+"sounds": "plˈiz ɹəkˈɔɹd ðə ɹˈɛkəɹd."
+},
+{
+"lang": "en-us",
+"text": "Wind the clock.",
+"sounds": "wˈInd ðə klˈɑk."
+},
+{
+"lang": "en-us",
+"text": "It cost $42.50.",
+"sounds": "ˌɪt kˈɔst fˈɔɹɾi tˈu dˈɑləɹz ænd fˈɪfti sˈɛnts."
+},
+{
+"lang": "en-us",
+"text": "I went home.",
+"sounds": "ˌI wˈɛnt hˈOm."
+},
+{
+"lang": "en-us",
+"text": "The part I liked best.",
+"sounds": "ðə pˈɑɹt ˌI lˈIkt bˈɛst."
+},
+{
+"lang": "en-us",
+"text": "Henry VIII was king.",
+"sounds": "hˈɛnɹi vˌiˌIˌIˈI wʌz kˈɪŋ."
+},
+{
+"lang": "en-us",
+"text": "NASA launched it.",
+"sounds": "nˈæsə lˈɔnʧt ɪt."
+},
+{
+"lang": "en-us",
+"text": "She paid $42.50 for 3 books.",
+"sounds": "ʃˌi pˈAd fˈɔɹɾi tˈu dˈɑləɹz ænd fˈɪfti sˈɛnts fɔɹ θɹˈi bˈʊks."
+},
+{
+"lang": "en-us",
+"text": "It's 3:30 now.",
+"sounds": "ˌɪts θɹˈi:θˈɜɹɾi nˈW."
+},
+{
+"lang": "en-us",
+"text": "Isn't it?",
+"sounds": "ˈɪzᵊnt ɪt?"
+},
+{
+"lang": "en-us",
+"text": "Mix it well.",
+"sounds": "mˈɪks ɪt wˈɛl."
+},
+{
+"lang": "en-us",
+"text": "Chapter 4: The Long Road",
+"sounds": "ʧˈæptəɹ fˈɔɹ: ðə lˈɔŋ ɹˈOd"
+},
+{
+"lang": "en-us",
+"text": "Doctor Smith met Missus Jones at 5 PM on Saint James Street.",
+"sounds": "dˈɑktəɹ smˈɪθ mˈɛt mˈɪsəz ʤˈOnz æt fˈIv pˌiˈɛm ˌɔn sˈAnt ʤˈAmz stɹˈit."
+},
+{
+"lang": "en-us",
+"text": "The map was fine. It works.",
+"sounds": "ðə mˈæp wʌz fˈIn. ˌɪt wˈɜɹks."
+},
+{
+"lang": "en-us",
+"text": "Wait, no, yes, fine.",
+"sounds": "wˈAt, nˈO, jˈɛs, fˈIn."
+},
+{
+"lang": "en-us",
+"text": "From 1990 to 1995 it grew by 12 kilometers, for example past the old mill, that is the far one, etcetera.",
+"sounds": "fɹˌʌm nˌIntˈin nˈIndi tə nˌIntˈin nˈIndi fˈIv ɪt ɡɹˈu bI twˈɛlv kəlˈɑməɾəɹz, fɔɹ ɪɡzˈæmpəl pˈæst ði ˈOld mˈɪl, ðæt ɪz ðə fˈɑɹ wˈʌn, ˈɛtsɪɾəɹɹə."
+},
+{
+"lang": "en-us",
+"text": "They lead the way with a lead pipe.",
+"sounds": "ðˌA lˈid ðə wˈA wɪð ɐ lˈid pˈIp."
+},
+{
+"lang": "en-us",
+"text": "The dove dove into the bushes.",
+"sounds": "ðə dˈʌv dˈOv ˈɪntu ðə bˈʊʃᵻz."
+},
+{
+"lang": "en-us",
+"text": "I live near the stage where they play live music.",
+"sounds": "ˌI lˈɪv nˌɪɹ ðə stˈAʤ wˌɛɹ ðA plˈA lˈIv mjˈuzɪk."
+},
+{
+"lang": "en-us",
+"text": "She will present the present tomorrow.",
+"sounds": "ʃˌi wɪl pɹizˈɛnt ðə pɹˈɛzᵊnt təmˈɑɹO."
+},
+{
+"lang": "en-us",
+"text": "We must polish the Polish furniture.",
+"sounds": "wˌi mˈʌst pˈɑlɪʃ ðə pˈOlɪʃ fˈɜɹnəʧəɹ."
+},
+{
+"lang": "en-us",
+"text": "The bandage was wound around the wound.",
+"sounds": "ðə bˈændɪʤ wʌz wˈWnd əɹˈWnd ðə wˈund."
+},
+{
+"lang": "en-us",
+"text": "Schedule the tomato and the aluminium to the laboratory.",
+"sounds": "skˈɛʤˌul ðə təmˈAɾO ænd ði ˌæljʊmˈɪniəm tə ðə lˈæbɹətˌɔɹi."
+},
+{
+"lang": "en-us",
+"text": "“Wait,” she said. “Is that the road?”",
+"sounds": "“wˈAt,” ʃi sˈɛd. “ˌɪz ðæt ðə ɹˈOd?”"
+},
+{
+"lang": "en-us",
+"text": "He didn't answer; the wind had turned.",
+"sounds": "hˌi dˈɪdᵊnt ˈænsəɹ; ðə wˈɪnd hæd tˈɜɹnd."
+},
+{
+"lang": "en-us",
+"text": "On 4 July 1976, 1,250 people paid £3.99 each, 25% more than the 2nd time.",
+"sounds": "ˌɔn fˈɔɹ ʤəlˈI nˌIntˈin sˈɛvənti sˈɪks, wˈʌn θˈWzᵊnd tˈu hˈʌndɹəd fˈɪfti pˈipᵊl pˈAd θɹˈi pˈWndz ænd nˈIndi nˈIn pˈɛns ˈiʧ, twˈɛnti fˈIv pəɹsˈɛnt mˈɔɹ ðən ðə sˈɛkənd tˈIm."
+},
+{
+"lang": "en-us",
+"text": "Tolkien, J. R. R., wrote it in 1937; Hermione and Siobhan read it aloud.",
+"sounds": "tɔlkˈin, ʤˈA ˈɑɹ ˈɑɹ, ɹˈOt ɪt ɪn nˌIntˈin θˈɜɹɾi sˈɛvən; hɜɹmˈIəni ænd ʃɪvˈɔn ɹˈɛd ɪt əlˈWd."
+},
+{
+"lang": "en-us",
+"text": "The road left the village at first light and climbed into the hills, where the fields gave way to heather.",
+"sounds": "ðə ɹˈOd lˈɛft ðə vˈɪlɪʤ æt fˈɜɹst lˈIt ænd klˈImd ˈɪntu ðə hˈɪlz, wˌɛɹ ðə fˈildz ɡˈAv wˈA tə hˈɛðəɹ."
+},
+{
+"lang": "en-us",
+"text": "For three days she walked without meeting anyone, sleeping in the lee of stone walls and waking to the sound of sheep.",
+"sounds": "fˌɔɹ θɹˈi dˈAz ʃi wˈɔkt wəðˈWt mˈiɾɪŋ ˈɛniwˌʌn, slˈipɪŋ ɪn ðə lˈi ʌv stˈOn wˈɔlz ænd wˈAkɪŋ tə ðə sˈWnd ʌv ʃˈip."
+},
+{
+"lang": "en-gb",
+"text": "Nobody in the village remembered who had built it, or why it ran inland.",
+"sounds": "nˈQbədi ɪn ðə vˈɪlɪʤ ɹɪmˈɛmbəd hˌuː had bˈɪlt ɪt, ɔː wˌI ɪt ɹˈan ˈɪnland."
+},
+{
+"lang": "en-gb",
+"text": "In 1999, the worn-out explorer walked sixty miles to Igdrasil.",
+"sounds": "ˌɪn nˌIntˈiːn nˈInti nˈIn, ðə wˈɔːnˌWt ɛksplˈɔːɹə wˈɔːkt sˈɪksti mˈIlz tʊ ˈɪɡdɹasᵊl."
+},
+{
+"lang": "en-gb",
+"text": "Doctor Smith paid $42.50 for 3 books on 5th Avenue.",
+"sounds": "dˈɒktə smˈɪθ pˈAd fˈɔːti tˈuː dˈɒləz and fˈɪfti sˈɛnts fɔː θɹˈiː bˈʊks ˌɒn fˈɪfθ ˈavɪnjuː."
+},
+{
+"lang": "en-gb",
+"text": "The Caravan The caravan moved slowly across the dunes as the sun climbed higher, and every traveller kept one eye on the hori-zon.",
+"sounds": "ðə kˈaɹəvan ðə kˈaɹəvan mˈuːvd slˈQli əkɹˈɒs ðə djˈuːnz az ðə sˈʌn klˈImd hˈIə, and ˈɛvəɹi tɹˈavələ kˈɛpt wˈʌn ˈI ˌɒn ðə hˈɔːɹizˈɒn."
+},
+{
+"lang": "en-gb",
+"text": "By noon the camels refused to walk. They pitched the tents in the shade of a ridge and waited for evening.",
+"sounds": "bˌI nˈuːn ðə kˈamᵊlz ɹɪfjˈuːzd tə wˈɔːk. ðˌA pˈɪʧt ðə tˈɛnts ɪn ðə ʃˈAd ɒv ɐ ɹˈɪʤ and wˈAtɪd fɔː ˈiːvnɪŋ."
+},
+{
+"lang": "en-gb",
+"text": "I read the book yesterday.",
+"sounds": "ˌI ɹˈɛd ðə bˈʊk jˈɛstədA."
+},
+{
+"lang": "en-gb",
+"text": "Please record the record.",
+"sounds": "plˈiːz ɹɪkˈɔːd ðə ɹˈɛkɔːd."
+},
+{
+"lang": "en-gb",
+"text": "Wind the clock.",
+"sounds": "wˈInd ðə klˈɒk."
+},
+{
+"lang": "en-gb",
+"text": "It cost $42.50.",
+"sounds": "ˌɪt kˈɒst fˈɔːti tˈuː dˈɒləz and fˈɪfti sˈɛnts."
+},
+{
+"lang": "en-gb",
+"text": "I went home.",
+"sounds": "ˌI wˈɛnt hˈQm."
+},
+{
+"lang": "en-gb",
+"text": "The part I liked best.",
+"sounds": "ðə pˈɑːt ˌI lˈIkt bˈɛst."
+},
+{
+"lang": "en-gb",
+"text": "Henry VIII was king.",
+"sounds": "hˈɛnɹi vˌiːˌIˌIˈI wɒz kˈɪŋ."
+},
+{
+"lang": "en-gb",
+"text": "NASA launched it.",
+"sounds": "nˈasə lˈɔːnʧt ɪt."
+},
+{
+"lang": "en-gb",
+"text": "She paid $42.50 for 3 books.",
+"sounds": "ʃˌiː pˈAd fˈɔːti tˈuː dˈɒləz and fˈɪfti sˈɛnts fɔː θɹˈiː bˈʊks."
+},
+{
+"lang": "en-gb",
+"text": "It's 3:30 now.",
+"sounds": "ˌɪts θɹˈiː:θˈɜːti nˈW."
+},
+{
+"lang": "en-gb",
+"text": "Isn't it?",
+"sounds": "ˈɪzᵊnt ɪt?"
+},
+{
+"lang": "en-gb",
+"text": "Mix it well.",
+"sounds": "mˈɪks ɪt wˈɛl."
+},
+{
+"lang": "en-gb",
+"text": "Chapter 4: The Long Road",
+"sounds": "ʧˈaptə fˈɔː: ðə lˈɒŋ ɹˈQd"
+},
+{
+"lang": "en-gb",
+"text": "Doctor Smith met Missus Jones at 5 PM on Saint James Street.",
+"sounds": "dˈɒktə smˈɪθ mˈɛt mˈɪsɪz ʤˈQnz at fˈIv pˌiːˈɛm ˌɒn sˈAnt ʤˈAmz stɹˈiːt."
+},
+{
+"lang": "en-gb",
+"text": "The map was fine. It works.",
+"sounds": "ðə mˈap wɒz fˈIn. ˌɪt wˈɜːks."
+},
+{
+"lang": "en-gb",
+"text": "Wait, no, yes, fine.",
+"sounds": "wˈAt, nˈQ, jˈɛs, fˈIn."
+},
+{
+"lang": "en-gb",
+"text": "From 1990 to 1995 it grew by 12 kilometres, for example past the old mill, that is the far one, etcetera.",
+"sounds": "fɹˌɒm nˌIntˈiːn nˈInti tə nˌIntˈiːn nˈInti fˈIv ɪt ɡɹˈuː bI twˈɛlv kˈɪləmˌiːtəz, fɔː ɪɡzˈɑːmpᵊl pˈɑːst ði ˈQld mˈɪl, ðat ɪz ðə fˈɑː wˈʌn, ˈɛtsɪtəɹə."
+},
+{
+"lang": "en-gb",
+"text": "They lead the way with a lead pipe.",
+"sounds": "ðˌA lˈiːd ðə wˈA wɪð ɐ lˈiːd pˈIp."
+},
+{
+"lang": "en-gb",
+"text": "The dove dove into the bushes.",
+"sounds": "ðə dˈʌv dˈQv ˈɪntuː ðə bˈʊʃɪz."
+},
+{
+"lang": "en-gb",
+"text": "I live near the stage where they play live music.",
+"sounds": "ˌI lˈɪv nˌɪə ðə stˈAʤ wˌɛː ðA plˈA lˈIv mjˈuːzɪk."
+},
+{
+"lang": "en-gb",
+"text": "She will present the present tomorrow.",
+"sounds": "ʃˌiː wɪl pɹɪzˈɛnt ðə pɹˈɛzᵊnt tʊmˈɒɹQ."
+},
+{
+"lang": "en-gb",
+"text": "We must polish the Polish furniture.",
+"sounds": "wˌiː mˈʌst pˈɒlɪʃ ðə pˈQlɪʃ fˈɜːnɪʧə."
+},
+{
+"lang": "en-gb",
+"text": "The bandage was wound around the wound.",
+"sounds": "ðə bˈandɪʤ wɒz wˈWnd əɹˈWnd ðə wˈuːnd."
+},
+{
+"lang": "en-gb",
+"text": "Schedule the tomato and the aluminium to the laboratory.",
+"sounds": "ʃˈɛdjuːl ðə təmˈɑːtQ and ði ˌaljʊmˈɪnɪəm tə ðə ləbˈɒɹətəɹi."
+},
+{
+"lang": "en-gb",
+"text": "“Wait,” she said. “Is that the road?”",
+"sounds": "“wˈAt,” ʃiː sˈɛd. “ˌɪz ðat ðə ɹˈQd?”"
+},
+{
+"lang": "en-gb",
+"text": "He didn't answer; the wind had turned.",
+"sounds": "hˌiː dˈɪdnt ˈɑːnsə; ðə wˈɪnd had tˈɜːnd."
+},
+{
+"lang": "en-gb",
+"text": "On 4 July 1976, 1,250 people paid £3.99 each, 25% more than the 2nd time.",
+"sounds": "ˌɒn fˈɔː ʤʊlˈI nˌIntˈiːn sˈɛvnti sˈɪks, wˈʌn θˈWznd tˈuː hˈʌndɹəd fˈɪfti pˈiːpᵊl pˈAd θɹˈiː pˈWndz and nˈInti nˈIn pˈɛns ˈiːʧ, twˈɛnti fˈIv pəsˈɛnt mˈɔː ðən ðə sˈɛkᵊnd tˈIm."
+},
+{
+"lang": "en-gb",
+"text": "Tolkien, J. R. R., wrote it in 1937; Hermione and Siobhan read it aloud.",
+"sounds": "tɔlkˈiːn, ʤˈA ˈɑː ˈɑː, ɹˈQt ɪt ɪn nˌIntˈiːn θˈɜːti sˈɛvᵊn; hɜːmˈIəni and ʃɪvˈɔːn ɹˈɛd ɪt əlˈWd."
+},
+{
+"lang": "en-gb",
+"text": "The road left the village at first light and climbed into the hills, where the fields gave way to heather.",
+"sounds": "ðə ɹˈQd lˈɛft ðə vˈɪlɪʤ at fˈɜːst lˈIt and klˈImd ˈɪntuː ðə hˈɪlz, wˌɛː ðə fˈiːldz ɡˈAv wˈA tə hˈɛðə."
+},
+{
+"lang": "en-gb",
+"text": "For three days she walked without meeting anyone, sleeping in the lee of stone walls and waking to the sound of sheep.",
+"sounds": "fˌɔː θɹˈiː dˈAz ʃiː wˈɔːkt wɪðˈWt mˈiːtɪŋ ˈɛnɪwʌn, slˈiːpɪŋ ɪn ðə lˈiː ɒv stˈQn wˈɔːlz and wˈAkɪŋ tə ðə sˈWnd ɒv ʃˈiːp."
+}
+]
+}
