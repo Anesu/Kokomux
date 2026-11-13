@@ -8,7 +8,9 @@ plain wording. The Termux version in `src/` stays as it is.
 picker and Play. It shows how long each part took (misaki and Kokoro
 separately), how much speech it made, and the real-time factor, so it can be
 compared with `kokoro --benchmark` in Termux. The text box starts with the
-benchmark's own text.
+benchmark's own text, and the chips under it are the benchmark's ways of
+running Kokoro (its own choice of threads, 2 to 8, block 4): pick the one
+it kept in Termux.
 
 ## How it works
 

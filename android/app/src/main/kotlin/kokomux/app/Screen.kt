@@ -3,6 +3,8 @@ package kokomux.app
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -18,6 +20,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuAnchorType
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -71,8 +74,9 @@ fun SpikeScreen(spike: Spike) {
                     Text(if (spike.playing) "■  Stop" else "▶  Play")
                 }
             }
+            Tuning(spike)
             if (spike.error.isNotEmpty()) Text(spike.error, color = MaterialTheme.colorScheme.error)
-            if (spike.made.isNotEmpty()) Timings(spike.made)
+            if (spike.made.isNotEmpty()) Timings(spike.made, spike.madeWith)
             Pronunciation(spike)
             if (spike.loaded.isNotEmpty()) Dim(spike.loaded)
         }
@@ -124,6 +128,27 @@ private fun VoicePicker(spike: Spike, modifier: Modifier) {
     }
 }
 
+/** How onnxruntime runs Kokoro: the choices kokoro --benchmark tries, to match what it kept in Termux. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun Tuning(spike: Spike) {
+    val ready = spike.stage == Stage.Ready && !spike.playing
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(Space.s), verticalArrangement = Arrangement.Center) {
+        for (n in listOf(0, 2, 4, 6, 8)) {
+            FilterChip(
+                selected = spike.threads == n, enabled = ready,
+                onClick = { spike.tune(n, spike.block) },
+                label = { Text(if (n == 0) "its own choice" else "$n threads") },
+            )
+        }
+        FilterChip(
+            selected = spike.block > 0, enabled = ready,
+            onClick = { spike.tune(spike.threads, if (spike.block > 0) 0 else 4) },
+            label = { Text("block 4") },
+        )
+    }
+}
+
 /** "af_heart" -> "American, female". */
 private fun describe(voice: String): String {
     val accent = if (voice.startsWith("b")) "British" else "American"
@@ -133,7 +158,7 @@ private fun describe(voice: String): String {
 
 /** Each part's times, then the whole: how many times faster than real time it was made. */
 @Composable
-private fun Timings(made: List<Made>) {
+private fun Timings(made: List<Made>, with: String) {
     Column(verticalArrangement = Arrangement.spacedBy(Space.s)) {
         Row { listOf("Part", "misaki", "Kokoro", "Speech", "Speed").forEach { Cell(it, dim = true) } }
         HorizontalDivider(color = MaterialTheme.colorScheme.outline)
@@ -152,7 +177,7 @@ private fun Timings(made: List<Made>) {
         val kokoro = made.sumOf { it.kokoro }
         Text(
             "${fmt(audio)} s of speech made in ${fmt(took)} s: %.1f× real time (real-time factor %.3f). ".format(audio / took, took / audio) +
-                "Kokoro alone: %.1f× (%.3f).".format(audio / kokoro, kokoro / audio),
+                "Kokoro alone, $with: %.1f× (%.3f).".format(audio / kokoro, kokoro / audio),
             style = MaterialTheme.typography.bodyMedium,
         )
         Dim("First part ready ${fmt(made.first().took)} s after Play.")

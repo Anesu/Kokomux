@@ -70,12 +70,12 @@ jobs:
       # The app's packages (Chaquopy's spaCy 3.8.7, thinc 8.3.4, numpy 1.26.2 on
       # Python 3.10) against the sounds the container's engine.py made.
       - name: Pronunciation with the app's Python packages
-        env:
-          PIP_CONSTRAINT: ${{ runner.temp }}/build-constraints.txt
         run: |
-          echo "setuptools<70" > "$PIP_CONSTRAINT"      # murmurhash 1.0.2 builds only with an older setuptools
-          python -m venv "$RUNNER_TEMP/mirror"
-          "$RUNNER_TEMP/mirror/bin/pip" install --quiet -r android/app/requirements.txt espeakng-loader==0.2.4 pypdf
+          python -m pip install --quiet uv
+          echo "setuptools<70" > "$RUNNER_TEMP/build-constraints.txt"   # murmurhash 1.0.2 builds only with an older setuptools
+          uv venv --quiet -p "$pythonLocation/bin/python" "$RUNNER_TEMP/mirror"
+          VIRTUAL_ENV="$RUNNER_TEMP/mirror" uv pip install --quiet --build-constraints "$RUNNER_TEMP/build-constraints.txt" \
+            -r android/app/requirements.txt espeakng-loader==0.2.4 pypdf
           "$RUNNER_TEMP/mirror/bin/python" android/tools/pronunciation.py | tee -a "$GITHUB_STEP_SUMMARY"
 
   emulator:
@@ -117,4 +117,20 @@ jobs:
           target: google_apis
           disable-animations: true
           working-directory: android
-          script: ./gradlew --console=plain :app:connectedDebugAndroidTest
+          # The app's first screen as it opens (no model yet) and its log, then the test.
+          script: |
+            ./gradlew --console=plain :app:installDebug
+            adb shell am start -W -n kokomux.app/.MainActivity
+            sleep 20
+            adb exec-out screencap -p > "$RUNNER_TEMP/first-screen.png"
+            adb logcat -d > "$RUNNER_TEMP/logcat.txt"
+            ./gradlew --console=plain :app:connectedDebugAndroidTest
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: emulator-screen
+          path: |
+            ${{ runner.temp }}/first-screen.png
+            ${{ runner.temp }}/logcat.txt
+          if-no-files-found: ignore

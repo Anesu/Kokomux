@@ -21,12 +21,15 @@ class Speech(val samples: FloatArray, val timings: List<Timing>) {
  * The same code runs on the phone (onnxruntime-android) and in the JVM tests
  * (onnxruntime), which share the ai.onnxruntime API.
  */
-class Kokoro(model: File, voices: File, threads: Int = 0) : AutoCloseable {
+class Kokoro(model: File, voices: File, threads: Int = 0, block: Int = 0) : AutoCloseable {
     private val env = OrtEnvironment.getEnvironment()
+    // As engine.py's load_kokoro: threads 0 is onnxruntime's own choice; block > 0 spreads
+    // the work across cores of different speeds (kokoro --benchmark tries both).
     private val session: OrtSession = OrtSession.SessionOptions().use { so ->
         so.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
         so.setInterOpNumThreads(1)
         if (threads > 0) so.setIntraOpNumThreads(threads)
+        if (block > 0) so.addConfigEntry("session.dynamic_block_base", block.toString())
         env.createSession(model.path, so)
     }
     val voices: Voices = Voices.read(voices)

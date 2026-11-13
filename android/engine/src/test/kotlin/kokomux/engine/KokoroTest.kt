@@ -53,10 +53,12 @@ class KokoroTest {
     fun speechMatchesKokoroOnnx() {
         for (i in 0 until golden.length()) {
             val case = golden.getJSONObject(i)
+            val t0 = System.nanoTime()
             val speech = kokoro.speak(case.getString("phonemes"), case.getString("voice"), case.getDouble("speed").toFloat())
+            val took = (System.nanoTime() - t0) / 1e9
             val want = case.getInt("samples")
             val label = "${case.getString("voice")}: ${case.getString("text").take(40)}"
-            println("$label: ${speech.samples.size} samples, kokoro-onnx made $want")
+            println("$label: ${speech.samples.size} samples, kokoro-onnx made $want; %.1f× real time".format(speech.seconds / took))
             // Silence is trimmed in 512-sample steps and pauses spliced in 10 ms frames,
             // so a frame right on a threshold may fall the other way: allow one step.
             assertTrue("$label: ${speech.samples.size} samples, want $want", abs(speech.samples.size - want) <= 512)

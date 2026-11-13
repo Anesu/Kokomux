@@ -53,6 +53,11 @@ class Spike(app: Application) : AndroidViewModel(app) {
     var voice by mutableStateOf("af_heart")
     var voices by mutableStateOf(listOf("af_heart"))
         private set
+    /** How onnxruntime runs Kokoro, as kokoro --benchmark tries it: threads (0: its own choice) and block. */
+    var threads by mutableStateOf(0)
+        private set
+    var block by mutableStateOf(0)
+        private set
     var playing by mutableStateOf(false)
         private set
     var loaded by mutableStateOf("")
@@ -64,6 +69,9 @@ class Spike(app: Application) : AndroidViewModel(app) {
     var error by mutableStateOf("")
         private set
     val made = mutableStateListOf<Made>()
+    /** How Kokoro ran for the parts in [made]. */
+    var madeWith by mutableStateOf("")
+        private set
 
     private val models = Models(File(app.filesDir, "models"))
     private val words = Text(app)
@@ -108,14 +116,9 @@ class Spike(app: Application) : AndroidViewModel(app) {
     private fun load() {
         viewModelScope.launch(worker) {
             try {
-                stage = Stage.Loading("Kokoro")
-                val t0 = System.nanoTime()
-                val k = Kokoro(models.model, models.voices)
-                val kokoroSecs = seconds(t0)
+                val kokoroSecs = loadKokoro()
                 stage = Stage.Loading("misaki")
                 val misakiSecs = words.warm("en-us") + words.warm("en-gb")
-                kokoro = k
-                voices = k.voices.names.filter { it.take(3) in setOf("af_", "am_", "bf_", "bm_") }
                 loaded = "Kokoro loaded in ${fmt(kokoroSecs)} s, misaki and spaCy in ${fmt(misakiSecs)} s"
                 stage = Stage.Ready
             } catch (e: Throwable) {
@@ -124,12 +127,45 @@ class Spike(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** (Re)load Kokoro with the chosen threads and block; the seconds it took. */
+    private fun loadKokoro(): Double {
+        stage = Stage.Loading("Kokoro")
+        kokoro?.close()
+        kokoro = null
+        val t0 = System.nanoTime()
+        val k = Kokoro(models.model, models.voices, threads, block)
+        kokoro = k
+        voices = k.voices.names.filter { it.take(3) in setOf("af_", "am_", "bf_", "bm_") }
+        return seconds(t0)
+    }
+
+    /** Run Kokoro another way: [threads] (0: onnxruntime's own choice) and [block] (0: off). */
+    fun tune(threads: Int, block: Int) {
+        if (stage != Stage.Ready || (threads == this.threads && block == this.block)) return
+        stop()
+        this.threads = threads
+        this.block = block
+        viewModelScope.launch(worker) {
+            try {
+                val secs = loadKokoro()
+                loaded = "Kokoro loaded in ${fmt(secs)} s (${tuning()})"
+                stage = Stage.Ready
+            } catch (e: Throwable) {
+                stage = Stage.Failed(e.message ?: e.toString())
+            }
+        }
+    }
+
+    /** "its own choice", "6 threads, block 4": kokoro --benchmark's words. */
+    fun tuning() = (if (threads == 0) "its own choice" else "$threads threads") + (if (block > 0) ", block $block" else "")
+
     /** Play the text, or stop. */
     fun playOrStop() {
         if (playing) return stop()
         val k = kokoro ?: return
         stop()
         made.clear()
+        madeWith = tuning()
         error = ""
         playing = true
         making = true
