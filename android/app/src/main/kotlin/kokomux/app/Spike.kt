@@ -17,6 +17,7 @@ import kokomux.engine.withPause
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Dispatchers
@@ -79,7 +80,9 @@ class Spike(app: Application) : AndroidViewModel(app) {
     // Python and onnxruntime are driven from one thread, one part at a time.
     private val worker = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
     private var job: Job? = null
-    private var making = false
+    // Which Play this is, so a stopped one's ending doesn't touch the next one.
+    @Volatile private var runs = 0
+    @Volatile private var making = false
     private val parts = File(app.cacheDir, "parts")
     private val player = ExoPlayer.Builder(app).build().apply {
         addListener(object : Player.Listener {
@@ -169,6 +172,7 @@ class Spike(app: Application) : AndroidViewModel(app) {
         error = ""
         playing = true
         making = true
+        val run = ++runs
         val text = text
         val voice = voice
         val lang = if (voice.startsWith("b")) "en-gb" else "en-us"
@@ -191,8 +195,11 @@ class Spike(app: Application) : AndroidViewModel(app) {
             } catch (e: Throwable) {
                 if (e !is kotlinx.coroutines.CancellationException) error = e.message ?: e.toString()
             } finally {
-                making = false
-                withContext(Dispatchers.Main) { if (player.playbackState != Player.STATE_READY) playing = false }
+                if (run == runs) {
+                    making = false
+                    // Already played to the end of what was made (or nothing was): Play again.
+                    if (isActive) withContext(Dispatchers.Main) { if (player.playbackState != Player.STATE_READY) playing = false }
+                }
             }
         }
     }
