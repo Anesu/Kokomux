@@ -57,7 +57,9 @@ jobs:
         run: ./gradlew --console=plain :engine:test :app:assembleDebug
 
       - name: The APK's size
-        run: ls -l android/app/build/outputs/apk/debug/app-debug.apk | awk '{printf "app-debug.apk: %.1f MB\n", $5 / 1e6}' | tee -a "$GITHUB_STEP_SUMMARY"
+        run: |
+          ls -l android/app/build/outputs/apk/debug/app-debug.apk |
+            awk '{printf "app-debug.apk: %.1f MB\n", $5 / 1e6}' | tee -a "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v7
         with:
