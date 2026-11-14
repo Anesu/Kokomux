@@ -8,7 +8,8 @@ plain wording. The Termux version in `src/` stays as it is.
 
 - **Home**: the voice new things are read in (tap it to choose another) and
   settings; what's playing; **File**, **Web page**, **Clipboard** and
-  **Type**; the bookshelf, each book with its cover and how far through.
+  **Type**; the bookshelf, each book with its cover and how far through (⋮
+  removes one, with 5 seconds to undo it).
 - **The reader**: the whole book in a reading column, the part being read on
   the golden line with the spoken word lit, the text fading with its distance
   from it (the focus effect); tap any part to hear it. Below: the bar (tap it,
@@ -17,7 +18,8 @@ plain wording. The Termux version in `src/` stays as it is.
   the part and the time left, ⏮ ▶ ⏭ (⏮ goes back to the part before in its
   first three seconds), then the speed, the sleep timer, the chapters and the
   voice, each showing its value. ⌄ folds the reader away, still playing; ⋮ has
-  settings and stop.
+  settings and stop. With a keyboard (DeX), Termux's keys: Space, ← →, [ ],
+  − +, t, c, s, v and q.
 - **A new speed is heard at once**: the part playing carries on at it, pitch
   kept, while the rest is made again at that speed. **A new voice** starts
   again at the part you're on.

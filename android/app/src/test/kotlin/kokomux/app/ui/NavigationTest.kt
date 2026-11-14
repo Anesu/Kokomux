@@ -1,16 +1,20 @@
 package kokomux.app.ui
 
 import androidx.activity.ComponentActivity
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.test.click
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isSelectable
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
-import androidx.compose.ui.test.performClick
-import androidx.compose.ui.test.click
+import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.percentOffset
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performKeyInput
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.pressKey
 import androidx.compose.ui.test.swipe
 import org.junit.Assert.assertEquals
 import org.junit.Rule
@@ -41,6 +45,10 @@ class NavigationTest {
         override fun hear(voice: String) { log += "hear $voice" }
         override fun readTyped(text: String) { log += "typed $text" }
         override fun readClipboard() { log += "clipboard" }
+        override fun remove(id: String) { log += "remove $id" }
+        override fun playPause() { log += "playPause" }
+        override fun next() { log += "next" }
+        override fun again() { log += "again" }
     }
 
     private fun show(state: UiState, asked: Asked) =
@@ -181,5 +189,37 @@ class NavigationTest {
         show(Fake.state.copy(playing = null), asked)
         compose.onNodeWithText("Clipboard").performClick()
         assertEquals(listOf("clipboard"), asked.log)
+    }
+
+    @Test
+    fun aBookTakenOffTheShelfCanComeBack() {
+        val asked = Asked()
+        show(Fake.state.copy(playing = null), asked)
+        compose.onNodeWithContentDescription("More for A Short History of Nearly Everything").performClick()
+        compose.onNodeWithText("Remove").performClick()
+        compose.onNodeWithText("A Short History of Nearly Everything").assertDoesNotExist()
+        compose.onNodeWithText("Undo").performClick()
+        compose.onNodeWithText("A Short History of Nearly Everything").assertExists()
+        assertEquals(emptyList<String>(), asked.log)
+
+        compose.onNodeWithContentDescription("More for A Short History of Nearly Everything").performClick()
+        compose.onNodeWithText("Remove").performClick()
+        compose.waitForIdle()
+        compose.mainClock.advanceTimeBy(5_500)                                   // the undo bar goes, and the book with it
+        compose.onNodeWithText("Undo").assertDoesNotExist()
+        assertEquals(listOf("remove 3"), asked.log)
+    }
+
+    @Test
+    fun termuxKeysWorkInTheReader() {
+        val asked = Asked()
+        show(Fake.state.copy(playing = Fake.playing(playing = false)), asked)
+        compose.onRoot().performKeyInput {
+            pressKey(Key.Spacebar); pressKey(Key.DirectionRight); pressKey(Key.DirectionLeft)
+            pressKey(Key.RightBracket); pressKey(Key.Equals)
+        }
+        assertEquals(listOf("playPause", "next", "again", "jump 7", "speed 1.2"), asked.log)
+        compose.onRoot().performKeyInput { pressKey(Key.C) }
+        compose.onNodeWithText("Chapter Two: The Harbour").assertExists()
     }
 }

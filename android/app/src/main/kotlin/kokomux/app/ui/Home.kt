@@ -10,14 +10,19 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -27,11 +32,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
 
 /**
  * The home screen (tui.sh's tui_home): the voice new things are read in, and
  * settings; what's playing; four ways to start something new; the bookshelf
- * of books in progress. On the optical centre when there's room.
+ * of books in progress (one taken off it can be brought back for 5 s). On
+ * the optical centre when there's room.
  */
 @Composable
 fun HomeScreen(
@@ -40,35 +48,66 @@ fun HomeScreen(
     onVoices: () -> Unit, onSettings: () -> Unit,
 ) {
     val t = LocalTokens.current
-    GoldenColumn(Modifier.fillMaxSize().background(t.bg).safeDrawingPadding()) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.s)) {
-            Logo(Space.xl)
-            Text("kokomux", style = Type.title, color = t.accent, modifier = Modifier.weight(1f), maxLines = 1)
-            Pill(Glyphs.hear, Voices.name(state.prefs.voice), "Voice ${Voices.name(state.prefs.voice)}", onClick = onVoices)
-            GlyphButton(Glyphs.settings, "Settings", onClick = onSettings)
-        }
-        Spacer(Modifier.height(Space.l))
-        if (state.error.isNotEmpty()) {
-            ErrorLine(state.error, actions::dismissError)
-            Spacer(Modifier.height(Space.m))
-        }
-        if (state.opening) NowCard(null, actions, onReader)
-        else state.playing?.let { NowCard(it, actions, onReader) }
-        if (state.opening || state.playing != null) Spacer(Modifier.height(Space.l))
+    // A book taken off the shelf goes for good when its undo bar does (after 5 s, or on leaving home).
+    var removal by remember { mutableStateOf<Removal?>(null) }
+    removal?.let { r ->
+        LaunchedEffect(r) { delay(5000); removal = null }
+        DisposableEffect(r) { onDispose { if (!r.undone) actions.remove(r.book.id) } }
+    }
+    Box(Modifier.fillMaxSize().background(t.bg)) {
+        GoldenColumn(Modifier.fillMaxSize().safeDrawingPadding()) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.s)) {
+                Logo(Space.xl)
+                Text("kokomux", style = Type.title, color = t.accent, modifier = Modifier.weight(1f), maxLines = 1)
+                Pill(Glyphs.hear, Voices.name(state.prefs.voice), "Voice ${Voices.name(state.prefs.voice)}", onClick = onVoices)
+                GlyphButton(Glyphs.settings, "Settings", onClick = onSettings)
+            }
+            Spacer(Modifier.height(Space.l))
+            if (state.error.isNotEmpty()) {
+                ErrorLine(state.error, actions::dismissError)
+                Spacer(Modifier.height(Space.m))
+            }
+            if (state.opening) NowCard(null, actions, onReader)
+            else state.playing?.let { NowCard(it, actions, onReader) }
+            if (state.opening || state.playing != null) Spacer(Modifier.height(Space.l))
 
-        val ready = state.setup == Setup.Ready
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(Space.s)) {
-            Tile(Glyphs.file, "File", Modifier.weight(1f), enabled = ready, onClick = onOpenFile)
-            Tile(Glyphs.globe, "Web page", Modifier.weight(1f), enabled = ready, onClick = onPage)
-            Tile(Glyphs.paste, "Clipboard", Modifier.weight(1f), enabled = ready) { actions.readClipboard(); onReader() }
-            Tile(Glyphs.type, "Type", Modifier.weight(1f), enabled = ready, onClick = onType)
-        }
+            val ready = state.setup == Setup.Ready
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(Space.s)) {
+                Tile(Glyphs.file, "File", Modifier.weight(1f), enabled = ready, onClick = onOpenFile)
+                Tile(Glyphs.globe, "Web page", Modifier.weight(1f), enabled = ready, onClick = onPage)
+                Tile(Glyphs.paste, "Clipboard", Modifier.weight(1f), enabled = ready) { actions.readClipboard(); onReader() }
+                Tile(Glyphs.type, "Type", Modifier.weight(1f), enabled = ready, onClick = onType)
+            }
 
-        val shelf = state.shelf.filter { it.id != state.playing?.id }
-        if (shelf.isNotEmpty()) {
-            Spacer(Modifier.height(Space.s))
-            SectionTitle("Bookshelf")
-            for (b in shelf) ShelfRow(b, onClick = { actions.resume(b.id); onReader() }, onRemove = { actions.remove(b.id) })
+            val shelf = state.shelf.filter { it.id != state.playing?.id && it.id != removal?.book?.id }
+            if (shelf.isNotEmpty()) {
+                Spacer(Modifier.height(Space.s))
+                SectionTitle("Bookshelf")
+                for (b in shelf) ShelfRow(b, onClick = { actions.resume(b.id); onReader() }, onRemove = { removal = Removal(b) })
+            }
+        }
+        removal?.let { r ->
+            Undo(r.book.title, Modifier.align(Alignment.BottomCenter).safeDrawingPadding()) { r.undone = true; removal = null }
+        }
+    }
+}
+
+/** A book being taken off the shelf, until its undo bar goes. */
+private class Removal(val book: ShelfBook) { var undone = false }
+
+/** "Removed: the title", and Undo, floating at the bottom of the screen. */
+@Composable
+private fun Undo(title: String, modifier: Modifier, onUndo: () -> Unit) {
+    val t = LocalTokens.current
+    Row(
+        modifier.widthIn(max = Space.column).fillMaxWidth().padding(Space.l).clip(Corner.l).background(t.fg)
+            .padding(start = Space.m),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("Removed: $title", style = Type.small, color = t.bg, maxLines = 1, overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f))
+        TextButton(onClick = onUndo, modifier = Modifier.heightIn(min = 48.dp)) {
+            Text("Undo", style = Type.label, color = Tokens.mix(t.accent, t.bg, 0.382f))
         }
     }
 }

@@ -20,8 +20,8 @@ android {
         applicationId = "kokomux.app"
         minSdk = 36                       // Android 16, what the S26 Ultra shipped with
         targetSdk = 36
-        versionCode = 5
-        versionName = "0.4.1"
+        versionCode = 6
+        versionName = "0.4.2"
         ndk { abiFilters += "arm64-v8a" }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

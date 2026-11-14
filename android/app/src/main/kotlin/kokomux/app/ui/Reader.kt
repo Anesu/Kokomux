@@ -4,6 +4,7 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -39,7 +40,15 @@ import androidx.compose.runtime.withFrameMillis
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEvent
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.Role
@@ -68,7 +77,13 @@ fun ReaderScreen(
     p: Playing, prefs: Prefs, position: () -> Long, actions: Actions, to: ReaderTo,
 ) {
     val t = LocalTokens.current
-    Column(Modifier.fillMaxSize().background(t.bg).safeDrawingPadding(), horizontalAlignment = Alignment.CenterHorizontally) {
+    val keys = remember { FocusRequester() }
+    LaunchedEffect(Unit) { keys.requestFocus() }
+    Column(
+        Modifier.fillMaxSize().background(t.bg).safeDrawingPadding()
+            .focusRequester(keys).focusable().onPreviewKeyEvent { it.type == KeyEventType.KeyDown && readerKey(it, p, actions, to) },
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
         Header(p, actions, to)
         Box(Modifier.weight(1f).widthIn(max = Space.column).fillMaxWidth()) {
             ReadingColumn(p, prefs, position, actions)
@@ -80,6 +95,32 @@ fun ReaderScreen(
         }
         Footer(p, actions, to)
     }
+}
+
+/**
+ * Termux's keys, for DeX or a keyboard: Space plays or pauses, ← hears the
+ * part again, → the next one, [ and ] the chapter before or after, − and +
+ * the speed, t the sleep timer, c the chapters, s settings, v the voice, q
+ * stops.
+ */
+private fun readerKey(e: KeyEvent, p: Playing, actions: Actions, to: ReaderTo): Boolean {
+    val here = p.chapters.indexOf(p.chapter)
+    when (e.key) {
+        Key.Spacebar -> actions.playPause()
+        Key.DirectionLeft -> actions.again()
+        Key.DirectionRight -> actions.next()
+        Key.LeftBracket -> p.chapters.getOrNull(here - 1)?.let { actions.jump(it.first) }
+        Key.RightBracket -> p.chapters.getOrNull(here + 1)?.let { actions.jump(it.first) }
+        Key.Minus, Key.NumPadSubtract -> actions.speed(((p.speed * 10 + 0.5f).toInt() - 1).coerceAtLeast(5) / 10f)
+        Key.Plus, Key.Equals, Key.NumPadAdd -> actions.speed(((p.speed * 10 + 0.5f).toInt() + 1).coerceAtMost(20) / 10f)
+        Key.T -> to.sleep()
+        Key.C -> to.chapters()
+        Key.S -> to.settings()
+        Key.V -> to.voices()
+        Key.Q -> { actions.stop(); to.home() }
+        else -> return false
+    }
+    return true
 }
 
 /** Where the reader's controls lead: home, and the sheets and screens they open. */
