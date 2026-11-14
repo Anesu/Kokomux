@@ -102,10 +102,13 @@ fun KokomuxApp(state: UiState, position: () -> Long, link: () -> String, actions
         ) {
             val p = state.playing
             when (open) {
-                Sheet.CHAPTERS -> if (p != null) ChaptersSheet(p) { actions.jump(it); sheet = null }
+                Sheet.CHAPTERS -> if (p != null) {
+                    LaunchedEffect(p.id) { if (p.novel) actions.loadToc() }
+                    ChaptersSheet(p, state.toc, state.tocLoading, { actions.jump(it); sheet = null }) { actions.chapter(it); sheet = null }
+                }
                 Sheet.SLEEP -> if (p != null) SleepSheet(p) { actions.sleep(it); sheet = null }
                 Sheet.SPEED -> SpeedSheet(p?.speed ?: state.prefs.speed, actions::speed)
-                Sheet.PAGE -> PageSheet(link()) { actions.openPage(it); go(Screen.READER) }
+                Sheet.PAGE -> WebSheet(link(), state, actions) { actions.openPage(it); go(Screen.READER) }
                 Sheet.TYPE -> TypeSheet { actions.readTyped(it); go(Screen.READER) }
             }
         }

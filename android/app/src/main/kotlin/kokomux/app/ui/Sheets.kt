@@ -31,6 +31,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -77,30 +78,51 @@ fun Choice(title: String, caption: String = "", chosen: Boolean = false, onClick
     }
 }
 
-/** The book's chapters (tui_chapters), numbered: those heard quieter, the one playing marked; pick one to go there. */
+/** A chapter in a list: its number, its name, whether it's been heard, and whether it's the one playing. */
+data class ChapterItem(val number: Int, val title: String, val heard: Boolean, val now: Boolean)
+
+/** Chapters, numbered: those heard quieter, the one playing marked; pick one to go there. Opens at the one playing. */
 @Composable
-fun ChaptersSheet(p: Playing, onPick: (Int) -> Unit) {
+fun ChapterList(items: List<ChapterItem>, onPick: (Int) -> Unit) {
     val t = LocalTokens.current
+    val here = items.indexOfFirst { it.now }
+    val list = rememberLazyListState(initialFirstVisibleItemIndex = (here - 2).coerceAtLeast(0))
+    LazyColumn(Modifier.heightIn(max = 480.dp), state = list, contentPadding = PaddingValues(bottom = Space.s)) {
+        itemsIndexed(items) { i, c ->
+            Row(
+                Modifier.fillMaxWidth().heightIn(min = Space.touch).clip(Corner.m)
+                    .background(if (c.now) t.sel else t.bg.copy(alpha = 0f))
+                    .clickable(role = Role.Button) { onPick(i) }.padding(end = Space.m),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(Modifier.width(3.dp).height(Space.l).clip(CircleShape).background(if (c.now) t.accent else t.bg.copy(alpha = 0f)))
+                Text("${c.number}", style = Type.small, color = if (c.now) t.accent else quiet(),
+                    textAlign = TextAlign.End, maxLines = 1, modifier = Modifier.width(Space.xl + Space.s).padding(end = Space.m))
+                Text(c.title, style = Type.label, color = if (c.heard) quiet() else t.fg, maxLines = 2,
+                    overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(vertical = Space.s))
+            }
+        }
+    }
+}
+
+/**
+ * The book's chapters (tui_chapters). A web novel's are all its chapters, from its own page
+ * ([toc], fetched as the sheet opens); one not in this listen starts the novel again there.
+ */
+@Composable
+fun ChaptersSheet(p: Playing, toc: List<TocEntry>, loading: Boolean, onPick: (Int) -> Unit, onChapter: (String) -> Unit) {
+    if (p.novel && toc.isNotEmpty()) {
+        val here = toc.indexOfFirst { it.now }
+        SheetFrame("Chapters", if (here >= 0) "${toc[here].number} of ${toc.last().number}" else "") {
+            ChapterList(toc.map { ChapterItem(it.number, it.label, it.heard, it.now) }) { onChapter(toc[it].url) }
+        }
+        return
+    }
     val current = p.chapter
     val here = p.chapters.indexOf(current)
-    val list = rememberLazyListState(initialFirstVisibleItemIndex = (here - 2).coerceAtLeast(0))
-    SheetFrame("Chapters", if (here >= 0) "${here + 1} of ${p.chapters.size}" else "") {
-        LazyColumn(Modifier.heightIn(max = 480.dp), state = list, contentPadding = PaddingValues(bottom = Space.s)) {
-            itemsIndexed(p.chapters) { i, c ->
-                val chosen = c == current
-                Row(
-                    Modifier.fillMaxWidth().heightIn(min = Space.touch).clip(Corner.m)
-                        .background(if (chosen) t.sel else t.bg.copy(alpha = 0f))
-                        .clickable(role = Role.Button) { onPick(c.first) }.padding(end = Space.m),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Box(Modifier.width(3.dp).height(Space.l).clip(CircleShape).background(if (chosen) t.accent else t.bg.copy(alpha = 0f)))
-                    Text("${i + 1}", style = Type.small, color = if (chosen) t.accent else quiet(),
-                        textAlign = TextAlign.End, modifier = Modifier.width(Space.xl).padding(end = Space.m))
-                    Text(c.title, style = Type.label, color = if (i < here) quiet() else t.fg, maxLines = 2,
-                        overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(vertical = Space.s))
-                }
-            }
+    SheetFrame("Chapters", if (loading) "…" else if (here >= 0) "${here + 1} of ${p.chapters.size}" else "") {
+        ChapterList(p.chapters.mapIndexed { i, c -> ChapterItem(if (p.novel) c.number else i + 1, c.title, i < here, c == current) }) {
+            onPick(p.chapters[it].first)
         }
     }
 }
@@ -147,23 +169,43 @@ fun SpeedSheet(speed: Float, onPick: (Float) -> Unit) {
     }
 }
 
-/** A web page to read: its address (a copied link is filled in). */
+/**
+ * A web page to read, or a web novel to find: an address reads that page (a copied link is
+ * filled in); words find novels by name, then the one picked shows its chapters to start from.
+ */
 @Composable
-fun PageSheet(suggested: String, onRead: (String) -> Unit) {
+fun WebSheet(suggested: String, state: UiState, actions: Actions, onRead: (String) -> Unit) {
     val t = LocalTokens.current
-    var address by rememberSaveable { mutableStateOf(suggested) }
-    val ok = address.trim().matches(Regex("^https?://\\S+$"))
-    SheetFrame("Web page") {
+    var entry by rememberSaveable { mutableStateOf(suggested) }
+    var novel by remember { mutableStateOf<Found?>(null) }
+    val address = entry.trim().matches(Regex("^https?://\\S+$"))
+    val n = novel
+    if (n != null) {
+        SheetFrame(n.title, n.latest) {
+            if (state.tocLoading) Logo(Space.l, live = true)
+            ChapterList(state.toc.map { ChapterItem(it.number, it.label, it.heard, it.now) }) { onRead(state.toc[it].url) }
+        }
+        return
+    }
+    SheetFrame("Web page or novel") {
         OutlinedTextField(
-            value = address, onValueChange = { address = it }, singleLine = true, modifier = Modifier.fillMaxWidth(),
-            placeholder = { Text("https://…", style = Type.body, color = quiet()) }, textStyle = Type.body, shape = Corner.l,
+            value = entry, onValueChange = { entry = it }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+            placeholder = { Text("Address, or a novel's name", style = Type.body, color = quiet()) }, textStyle = Type.body,
+            shape = Corner.l,
             leadingIcon = { Icon(Glyphs.globe, null, Modifier.size(Space.l - 3.dp), tint = t.dim) },
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Go),
-            keyboardActions = KeyboardActions(onGo = { if (ok) onRead(address.trim()) }),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = if (address) ImeAction.Go else ImeAction.Search),
+            keyboardActions = KeyboardActions(onGo = { if (address) onRead(entry.trim()) },
+                onSearch = { if (entry.isNotBlank()) actions.search(entry) }),
             colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = t.accent, unfocusedBorderColor = t.line),
         )
         Spacer(Modifier.height(Space.m))
-        MainButton("Read", enabled = ok) { onRead(address.trim()) }
+        if (address || entry.isBlank()) MainButton("Read", enabled = address) { onRead(entry.trim()) }
+        else if (state.searching) ProgressFill(0, 1, "Finding “${entry.trim()}”…")
+        else MainButton("Find") { actions.search(entry) }
+        if (!address && state.found.isNotEmpty()) {
+            Spacer(Modifier.height(Space.s))
+            for (f in state.found) Choice(f.title, f.latest) { novel = f; actions.novelToc(f) }
+        }
     }
 }
 

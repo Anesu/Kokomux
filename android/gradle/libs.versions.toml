@@ -5,6 +5,8 @@ chaquopy = "17.2.0"
 onnxruntime = "1.32.0"
 media3 = "1.11.1"
 litert = "2.3.2"
+work = "2.12.0"
+glance = "1.2.0"
 qnn = "2.47.0"
 compose-bom = "2026.09.00"
 activity = "1.13.0"
@@ -18,6 +20,8 @@ androidx-junit = "1.3.0"
 [libraries]
 onnxruntime-android = { module = "com.microsoft.onnxruntime:onnxruntime-android", version.ref = "onnxruntime" }
 onnxruntime-jvm = { module = "com.microsoft.onnxruntime:onnxruntime", version.ref = "onnxruntime" }
+work-runtime = { module = "androidx.work:work-runtime-ktx", version.ref = "work" }
+glance-appwidget = { module = "androidx.glance:glance-appwidget", version.ref = "glance" }
 litert = { module = "com.google.ai.edge.litert:litert", version.ref = "litert" }
 litert-npu-qualcomm = { module = "com.google.ai.edge.litert:litert-npu-runtime-qualcomm", version.ref = "litert" }
 qnn-runtime = { module = "com.qualcomm.qti:qnn-runtime", version.ref = "qnn" }

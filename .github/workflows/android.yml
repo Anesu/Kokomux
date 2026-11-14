@@ -114,6 +114,7 @@ jobs:
             --find-links "$RUNNER_TEMP/wheels" -r android/app/requirements.txt espeakng-loader==0.2.4
           "$RUNNER_TEMP/mirror/bin/python" android/tools/pronunciation.py | tee -a "$GITHUB_STEP_SUMMARY"
           "$RUNNER_TEMP/mirror/bin/python" -I android/tools/test_text_side.py | tee -a "$GITHUB_STEP_SUMMARY"
+          "$RUNNER_TEMP/mirror/bin/python" -I android/tools/test_novels.py | tee -a "$GITHUB_STEP_SUMMARY"
 
   emulator:
     # The arm64 app on an x86_64 emulator, through Android's arm64 translation:

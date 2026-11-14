@@ -6,14 +6,34 @@ import java.security.MessageDigest
 /** A part of a book: its text, and the pause after it in seconds (engine.py's PAUSE). */
 data class Part(val text: String, val pause: Double)
 
-/** Where a chapter starts: its first part (counting from 1) and its title. */
-data class Chapter(val first: Int, val title: String)
+/** Where a chapter starts: its first part (counting from 1) and its title; a web novel's also its address and number. */
+data class Chapter(val first: Int, val title: String, val url: String = "", val number: Int = 0)
 
-/** A book, file or page, read and split into parts as engine.py's run_job splits it. */
-data class Book(val title: String, val parts: List<Part>, val chapters: List<Chapter>) {
+/**
+ * A book, file or page, read and split into parts as engine.py's run_job splits it. A web
+ * novel's chapters arrive as it's heard, each added on the end ([plus]).
+ */
+data class Book(val title: String, val parts: List<Part>, val chapters: List<Chapter>, val novel: Novel? = null) {
     /** The chapter part [i] is in. */
     fun chapterOf(i: Int): Chapter? = chapters.lastOrNull { it.first <= i }
+
+    /** The parts of chapter [c] (counting from 1, as the book does). */
+    fun partsOf(c: Chapter): IntRange = c.first until (chapters.firstOrNull { it.first > c.first }?.first ?: (parts.size + 1))
+
+    /** A novel's next chapter, added on the end. */
+    fun plus(chapter: NovelChapter, parts: List<Part>) = copy(
+        parts = this.parts + parts,
+        chapters = chapters + Chapter(this.parts.size + 1, chapter.label, chapter.url, chapter.number),
+        novel = novel?.copy(next = chapter.next),
+    )
 }
+
+/** A web novel being heard: its own address (its bookmark's) and title, and the next chapter's address (null: none yet). */
+data class Novel(val url: String, val title: String, val next: String?)
+
+/** A chapter of a web novel (engine.py's novel_chapter): which novel, which chapter, and those either side. */
+data class NovelChapter(val novel: String, val novelUrl: String, val url: String, val label: String, val number: Int,
+                        val next: String?, val prev: String?)
 
 /** A part's sounds as engine.synthesize gets them, and each word's own sounds (misaki's, as JSON; null: espeak's). */
 data class Speakable(val sounds: String, val perWord: String)

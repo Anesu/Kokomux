@@ -134,6 +134,34 @@ class MakerTest {
     }
 
     @Test
+    fun aNovelGrowsAChapterAtATimeAndItsBookmarkIsTermuxs() {
+        val first = Book("The Long Road", listOf(Part("Chapter 6.", 0.0), Part("One.", 0.0), Part("Two.", 0.0)),
+            listOf(Chapter(1, "Chapter 6", "https://n.example/novel/road/chapter-6", 6)),
+            Novel("https://n.example/novel/road", "The Long Road", "https://n.example/novel/road/chapter-7"))
+        val seven = NovelChapter("The Long Road", "https://n.example/novel/road", "https://n.example/novel/road/chapter-7",
+            "Chapter 7: The River", 7, "https://n.example/novel/road/chapter-8", null)
+        val b = first.plus(seven, listOf(Part("Chapter 7: The River.", 0.0), Part("Three.", 0.0)))
+        assertEquals(5, b.parts.size)
+        assertEquals(Chapter(4, "Chapter 7: The River", seven.url, 7), b.chapterOf(5))
+        assertEquals(4..5, b.partsOf(b.chapters[1]))
+        assertEquals(1..3, b.partsOf(b.chapters[0]))
+        assertEquals("https://n.example/novel/road/chapter-8", b.novel!!.next)
+
+        val dir = temp()
+        val marks = Bookmarks(dir)
+        val m = Bookmarks.Mark(Books.id(b.novel!!.url), 2, 2, "The Long Road", "novel", seven.url, "af_heart", 1f, "en-us",
+            chapter = seven.label, number = 7, novel = b.novel!!.url, done = true)
+        marks.save(m)
+        // The keys novel_mark in src/player.sh writes, done=1 only when it's done.
+        assertEquals(listOf("part=2", "parts=2", "title=The Long Road", "kind=novel", "source=${seven.url}", "voice=af_heart",
+            "speed=1.0", "lang=en-us", "chapter=Chapter 7: The River", "number=7", "novel=${b.novel!!.url}", "done=1"),
+            File(dir, "${m.id}.mark").readLines())
+        assertEquals(m.copy(lastHeard = marks.get(m.id)!!.lastHeard), marks.get(m.id))
+        marks.save(m.copy(done = false))
+        assertFalse(File(dir, "${m.id}.mark").readText().contains("done"))
+    }
+
+    @Test
     fun bookIdsAndLanguagesAreTermuxs() {
         // printf '%s' https://example.com/a | sha256sum | cut -c1-16
         assertEquals(URL_ID, Books.id("https://example.com/a"))

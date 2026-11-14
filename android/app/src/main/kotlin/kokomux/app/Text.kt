@@ -6,6 +6,8 @@ import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
 import kokomux.engine.Book
 import kokomux.engine.Chapter
+import kokomux.engine.Novel
+import kokomux.engine.NovelChapter
 import kokomux.engine.Part
 import kokomux.engine.ReadError
 import kokomux.engine.Speakable
@@ -37,12 +39,45 @@ class Text(private val context: Context) : TextSide {
         if (got.has("error")) throw ReadError(got.getString("error"))
         val parts = got.getJSONArray("parts")
         val chapters = got.getJSONArray("chapters")
+        val novel = got.optJSONObject("novel")?.let(::novelChapter)
         return Book(
             got.getString("title"),
             (0 until parts.length()).map { parts.getJSONArray(it).let { p -> Part(p.getString(0), p.getDouble(1)) } },
-            (0 until chapters.length()).map { chapters.getJSONArray(it).let { c -> Chapter(c.getInt(0), c.getString(1)) } },
+            (0 until chapters.length()).map { chapters.getJSONArray(it).let { c ->
+                Chapter(c.getInt(0), c.getString(1), novel?.url.orEmpty(), novel?.number ?: 0) } },
+            novel?.let { Novel(it.novelUrl, it.novel, it.next) },
         )
     }
+
+    /** A novel's chapter as read (its details and its text, the label first); null if it isn't out (yet). */
+    fun chapter(url: String): Pair<NovelChapter, String>? {
+        val got = JSONObject(module.callAttr("chapter", url).toString())
+        if (got.has("error")) throw ReadError(got.getString("error"))
+        if (got.has("none")) return null
+        return novelChapter(got.getJSONObject("novel")) to got.getString("text")
+    }
+
+    /** A novel's chapters, from its own page: (number, label, address), in order. */
+    fun toc(novelUrl: String, anyChapter: String): List<Triple<Int, String, String>> {
+        val got = module.callAttr("toc", novelUrl, anyChapter).toString()
+        if (got.startsWith("{")) throw ReadError(JSONObject(got).getString("error"))
+        val a = JSONArray(got)
+        return (0 until a.length()).map { a.getJSONArray(it).let { c -> Triple(c.getInt(0), c.getString(1), c.getString(2)) } }
+    }
+
+    /** Novels found by name: (title, address, latest chapter). */
+    fun search(query: String): List<Triple<String, String, String>> {
+        val got = module.callAttr("search", query).toString()
+        if (got.startsWith("{")) throw ReadError(JSONObject(got).getString("error"))
+        val a = JSONArray(got)
+        return (0 until a.length()).map { a.getJSONArray(it).let { r -> Triple(r.getString(0), r.getString(1), r.getString(2)) } }
+    }
+
+    private fun novelChapter(o: JSONObject) = NovelChapter(
+        o.getString("novel"), o.getString("novel_url"), o.getString("url"), o.getString("label"), o.getInt("number"),
+        o.optString("next").takeIf { !o.isNull("next") && it.isNotEmpty() },
+        o.optString("prev").takeIf { !o.isNull("prev") && it.isNotEmpty() },
+    )
 
     override fun speakable(text: String, lang: String): Speakable {
         val got = JSONObject(module.callAttr("speakable", text, lang).toString())

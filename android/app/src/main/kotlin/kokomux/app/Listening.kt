@@ -42,6 +42,8 @@ object Listening {
     /** The part playing (counting from 1), 0 before it starts. */
     var at by mutableStateOf(0)
     var error by mutableStateOf("")
+    /** Something to say that isn't wrong ("Up to date: Chapter 8 is the latest"), shown for a moment. */
+    var note by mutableStateOf("")
     val made = mutableStateListOf<Maker.Made>()
     /** How Kokoro ran for [made] (kokoro --benchmark's words). */
     var madeWith by mutableStateOf("")

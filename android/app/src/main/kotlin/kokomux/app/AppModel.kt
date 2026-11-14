@@ -25,6 +25,8 @@ import kokomux.app.ui.Actions
 import kokomux.app.ui.Checked
 import kokomux.app.ui.Clip
 import kokomux.app.ui.EngineFiles
+import kokomux.app.ui.Found
+import kokomux.app.ui.TocEntry
 import kokomux.app.ui.Making
 import kokomux.app.ui.Playing
 import kokomux.app.ui.Prefs
@@ -70,6 +72,10 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
     private var clipSamples: FloatArray? = null
     private var recorder: Clips.Recorder? = null
     private var cloning by mutableStateOf(false)
+    private var toc by mutableStateOf(emptyList<TocEntry>())
+    private var tocLoading by mutableStateOf(false)
+    private var found by mutableStateOf(emptyList<Found>())
+    private var searching by mutableStateOf(false)
     /** The part playing's word timings: (part, words). */
     private var words by mutableStateOf(0 to emptyList<WordSpan>())
     private val version = app.packageManager.getPackageInfo(app.packageName, 0).versionName.orEmpty()
@@ -114,7 +120,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
                     at = Listening.at, playing = playing, madeTo = made.maxOfOrNull { it.index } ?: 0, making = Listening.making,
                     voice = n.request.voice, speed = n.request.speed, sleep = Listening.sleep,
                     words = if (words.first == Listening.at) words.second else emptyList(),
-                    left = left(n.book, Listening.at, n.request.speed),
+                    left = left(n.book, Listening.at, n.request.speed), novel = n.book.novel != null,
                 )
             },
             voices = voices,
@@ -123,9 +129,11 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
                 Voices.engineTitle(now?.request?.voice ?: prefs.voice),
                 if (VoiceId.engine(now?.request?.voice ?: prefs.voice) == VoiceId.KOKORO) Listening.madeWith else ""),
             checked = checked, checking = checking, loaded = loaded, kept = kept,
-            error = error.ifEmpty { Listening.error }, hearing = hearing, version = version,
+            error = error.ifEmpty { Listening.error }, note = Listening.note, hearing = hearing, version = version,
             engines = Voices.engines.mapNotNull { engineFiles[it.first] }, preparing = Listening.preparing,
             recording = recording, clip = clip, cloning = cloning,
+            toc = toc.map { e -> e.copy(now = now?.book?.chapterOf(Listening.at.coerceAtLeast(1))?.url == e.url) },
+            tocLoading = tocLoading, found = found, searching = searching,
         )
     }
 
@@ -471,6 +479,65 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
         }
     }
 
+    // ------------------------------------------------------------ web novels
+
+    override fun loadToc() {
+        val b = Listening.now?.book ?: return
+        val c = b.chapters.lastOrNull()?.takeIf { b.novel != null } ?: return
+        tocLoading = true
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val got = engine.novels.chapter(c.url)?.first ?: return@launch
+                val playing = b.chapterOf(Listening.at.coerceAtLeast(1))?.number ?: c.number
+                toc = engine.novels.toc(got).map { (n, label, url) -> TocEntry(n, label, url, n < playing, false) }
+            } catch (e: Exception) {
+                error = e.message ?: e.toString()
+            } finally {
+                tocLoading = false
+            }
+        }
+    }
+
+    override fun chapter(url: String) {
+        val b = Listening.now?.book ?: return
+        val inListen = b.chapters.firstOrNull { it.url == url }
+        if (inListen != null) jump(inListen.first)
+        else command(ListenService.CHAPTER, Bundle().apply { putString("url", url) })
+    }
+
+    override fun search(query: String) {
+        if (query.isBlank()) return
+        searching = true
+        found = emptyList()
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                found = engine.exclusive { engine.text.search(query) }.map { (title, url, latest) -> Found(title, url, latest) }
+                if (found.isEmpty()) error = "No novel called that"
+            } catch (e: Exception) {
+                error = e.message ?: e.toString()
+            } finally {
+                searching = false
+            }
+        }
+    }
+
+    override fun novelToc(found: Found) {
+        tocLoading = true
+        toc = emptyList()
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val heard = engine.bookmarks.get(Books.id(found.url))?.number ?: 0
+                val list = engine.exclusive { engine.text.toc(found.url, "") }
+                toc = list.map { (n, label, url) -> TocEntry(n, label, url, n < heard, n == heard) }
+                if (toc.isEmpty()) error = "Couldn't find that novel's chapters"
+            } catch (e: Exception) {
+                error = e.message ?: e.toString()
+            } finally {
+                tocLoading = false
+            }
+        }
+    }
+
     // ------------------------------------------------------------ settings and checks
 
     override fun prefs(prefs: Prefs) {
@@ -518,12 +585,16 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
     override fun dismissError() {
         error = ""
         Listening.error = ""
+        Listening.note = ""
     }
 
     /** The bookshelf, from the bookmarks, and the kept audio's size. */
     fun refreshShelf() {
         viewModelScope.launch(Dispatchers.IO) {
-            shelf = engine.bookmarks.all().map { ShelfBook(it.id, it.title, it.part, it.parts, it.voice) }
+            shelf = engine.bookmarks.all().map {
+                val latest = if (it.kind == "novel") engine.novels.known(it.novel)?.latest ?: it.number else 0
+                ShelfBook(it.id, it.title, it.part, it.parts, it.voice, it.chapter, it.number, maxOf(latest, it.number), it.done)
+            }
             kept = engine.cache.walkTopDown().filter { it.isFile }.sumOf { it.length() }
         }
     }

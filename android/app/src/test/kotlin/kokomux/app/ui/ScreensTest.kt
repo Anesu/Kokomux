@@ -104,7 +104,13 @@ class ScreensTest {
         NewVoiceScreen(Fake.state.copy(clip = Clip(7.2)), Fake.actions) {}
     }
 
-    @Test fun sheetChapters() = shot("sheet-chapters", ThemeMode.DARK, sheet { ChaptersSheet(Fake.playing()) {} })
+    @Test fun sheetChapters() = shot("sheet-chapters", ThemeMode.DARK, sheet { ChaptersSheet(Fake.playing(), emptyList(), false, {}) {} })
+    @Test fun sheetNovelChapters() = shot("sheet-novel-chapters", ThemeMode.LIGHT, sheet {
+        ChaptersSheet(Fake.playing().copy(novel = true), Fake.toc, false, {}) {}
+    })
+    @Test fun sheetFindNovel() = shot("sheet-find-novel", ThemeMode.DARK, sheet {
+        WebSheet("goddess summon", Fake.state.copy(found = Fake.found), Fake.actions) {}
+    })
     @Test fun sheetSleep() = shot("sheet-sleep", ThemeMode.DARK, sheet { SleepSheet(Fake.playing(sleep = Sleep.EndOfChapter)) {} })
     // A narrow screen (a larger display size, or the CI emulator's 320 dp) and large text: nothing cut off.
     @Test @Config(qualifiers = NARROW) fun homeNarrow() = shot("narrow-home", ThemeMode.DARK, home)
@@ -117,7 +123,7 @@ class ScreensTest {
     @Test @Config(fontScale = 1.3f) fun speedLargeText() = shot("large-text-speed", ThemeMode.LIGHT, sheet { SpeedSheet(1.2f) {} })
 
     @Test fun sheetSpeed() = shot("sheet-speed", ThemeMode.LIGHT, sheet { SpeedSheet(1.2f) {} })
-    @Test fun sheetPage() = shot("sheet-page", ThemeMode.DARK, sheet { PageSheet("https://example.com/the-long-road") {} })
+    @Test fun sheetPage() = shot("sheet-page", ThemeMode.DARK, sheet { WebSheet("https://example.com/the-long-road", Fake.state, Fake.actions) {} })
     @Test fun sheetType() = shot("sheet-type", ThemeMode.LIGHT, sheet { TypeSheet {} })
 }
 

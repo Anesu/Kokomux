@@ -12,10 +12,27 @@ sealed interface Setup {
     data class Failed(val message: String) : Setup
 }
 
-/** A book in progress, from its bookmark. */
-data class ShelfBook(val id: String, val title: String, val part: Int, val parts: Int, val voice: String) {
-    val progress get() = if (parts > 1) (part - 1).toFloat() / (parts - 1) else 0f
+/**
+ * A book in progress, from its bookmark. A web novel's: the chapter it's at ([chapter], [number]),
+ * the latest chapter out that's known, and whether it's been heard up to it ([done]).
+ */
+data class ShelfBook(val id: String, val title: String, val part: Int, val parts: Int, val voice: String,
+                     val chapter: String = "", val number: Int = 0, val latest: Int = 0, val done: Boolean = false) {
+    val novel get() = number > 0
+    val progress get() = when {
+        novel -> if (latest > 0) ((number - 1) + part.toFloat() / parts.coerceAtLeast(1)) / latest else 0f
+        parts > 1 -> (part - 1).toFloat() / (parts - 1)
+        else -> 0f
+    }
+    /** Chapters out after the one it's at. */
+    val fresh get() = if (novel) (latest - number).coerceAtLeast(0) else 0
 }
+
+/** A chapter in a novel's list: its number, label and address, whether it's been heard, and whether it's the one playing. */
+data class TocEntry(val number: Int, val label: String, val url: String, val heard: Boolean, val now: Boolean)
+
+/** A novel found by name: its title, its own address, and the latest chapter the site mentions. */
+data class Found(val title: String, val url: String, val latest: String)
 
 /** A word the voice is saying: when (ms into the part) and where (characters in the part's text). */
 data class WordSpan(val start: Long, val end: Long, val from: Int, val to: Int)
@@ -45,6 +62,8 @@ data class Playing(
     val words: List<WordSpan> = emptyList(),
     /** Seconds of listening left at this speed, from how long the parts made so far took to say (0: not known yet). */
     val left: Double = 0.0,
+    /** It's a web novel: chapters arrive as it's heard. */
+    val novel: Boolean = false,
 ) {
     val chapter: Chapter? get() = chapters.lastOrNull { it.first <= at.coerceAtLeast(1) }
 }
@@ -101,6 +120,8 @@ data class UiState(
     val kept: Long = 0,
     /** Something went wrong, in words to show. */
     val error: String = "",
+    /** Something to say for a moment that isn't wrong. */
+    val note: String = "",
     /** The voice whose sample is playing. */
     val hearing: String = "",
     /** The app's version. */
@@ -115,6 +136,12 @@ data class UiState(
     val clip: Clip? = null,
     /** A new voice is being made from the clip. */
     val cloning: Boolean = false,
+    /** The novel playing's list of chapters (empty until asked for), and whether it's being fetched. */
+    val toc: List<TocEntry> = emptyList(),
+    val tocLoading: Boolean = false,
+    /** Novels found by name, and whether a search is going. */
+    val found: List<Found> = emptyList(),
+    val searching: Boolean = false,
 )
 
 /** What the screens can ask for. */
@@ -150,6 +177,13 @@ interface Actions {
     /** A voice made from the clip, its [words] (blank if not known), [name] and language; it becomes the voice. */
     fun makeVoice(words: String, name: String, lang: String)
     fun forgetVoice(voice: String)
+    /** The novel playing's list of chapters, fetched for the chapters sheet. */
+    fun loadToc()
+    /** Go to a chapter of the novel playing (one not in this listen starts it again there). */
+    fun chapter(url: String)
+    /** Novels whose name has these words in it; a found novel's chapters, to pick where to start. */
+    fun search(query: String)
+    fun novelToc(found: Found)
     fun prefs(prefs: Prefs)
     fun check()
     fun clearKept()

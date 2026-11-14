@@ -6,14 +6,21 @@ import kotlin.math.roundToLong
 /**
  * Where each book was left, kept as the Termux version keeps them: one
  * <book id>.mark file of key=value lines (part, parts, title, kind, source,
- * voice, speed, lang). A bookmark goes once a book has been heard to the end.
+ * voice, speed, lang; a web novel's also chapter, number, novel and done). A
+ * bookmark goes once a book has been heard to the end; a novel's stays, done,
+ * for the chapters still to come.
  */
 class Bookmarks(private val dir: File) {
-    /** A book's bookmark. [kind] is "file", "url" or "text"; [source] the file in the app's storage or the address. */
+    /**
+     * A book's bookmark. [kind] is "file", "url", "text" or "novel"; [source] the file in the app's
+     * storage or the address (a novel's: the chapter's, [part] of its [parts]); a novel's [chapter]
+     * label and [number], the [novel]'s address, and whether it's [done] (heard to the latest chapter).
+     */
     data class Mark(
         val id: String, val part: Int, val parts: Int, val title: String, val kind: String,
         val source: String, val voice: String, val speed: Float, val lang: String,
-        val lastHeard: Long = 0,
+        val lastHeard: Long = 0, val chapter: String = "", val number: Int = 0, val novel: String = "",
+        val done: Boolean = false,
     ) {
         /** How far through, from 0 to 1. */
         val progress get() = if (parts > 1) (part - 1).toFloat() / (parts - 1) else 0f
@@ -27,7 +34,9 @@ class Bookmarks(private val dir: File) {
         tmp.writeText(
             listOf("part" to mark.part, "parts" to mark.parts, "title" to mark.title.replace("\n", " "),
                 "kind" to mark.kind, "source" to mark.source, "voice" to mark.voice, "speed" to mark.speed,
-                "lang" to mark.lang).joinToString("") { (k, v) -> "$k=$v\n" },
+                "lang" to mark.lang).joinToString("") { (k, v) -> "$k=$v\n" } +
+                if (mark.kind != "novel") "" else listOf("chapter" to mark.chapter.replace("\n", " "), "number" to mark.number,
+                    "novel" to mark.novel).joinToString("") { (k, v) -> "$k=$v\n" } + if (mark.done) "done=1\n" else "",
         )
         if (!tmp.renameTo(file)) error("Couldn't save the bookmark")
     }
@@ -56,6 +65,8 @@ class Bookmarks(private val dir: File) {
             title = kv["title"].orEmpty(), kind = kv["kind"].orEmpty(), source = kv["source"].orEmpty(),
             voice = kv["voice"] ?: "af_heart", speed = kv["speed"]?.toFloatOrNull() ?: 1f,
             lang = kv["lang"] ?: "en-us", lastHeard = file.lastModified(),
+            chapter = kv["chapter"].orEmpty(), number = kv["number"]?.toIntOrNull() ?: 0, novel = kv["novel"].orEmpty(),
+            done = kv["done"] == "1",
         )
     }
 

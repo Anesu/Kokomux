@@ -106,7 +106,13 @@ fun HomeScreen(
             }
         }
         removal?.let { r ->
-            Undo(r.book.title, Modifier.align(Alignment.BottomCenter).safeDrawingPadding()) { r.undone = true; removal = null }
+            Bar("Removed: ${r.book.title}", "Undo", Modifier.align(Alignment.BottomCenter).safeDrawingPadding()) {
+                r.undone = true; removal = null
+            }
+        }
+        if (removal == null && state.note.isNotEmpty()) {
+            LaunchedEffect(state.note) { delay(5000); actions.dismissError() }
+            Bar(state.note, "OK", Modifier.align(Alignment.BottomCenter).safeDrawingPadding(), actions::dismissError)
         }
     }
 }
@@ -114,19 +120,19 @@ fun HomeScreen(
 /** A book being taken off the shelf, until its undo bar goes. */
 private class Removal(val book: ShelfBook) { var undone = false }
 
-/** "Removed: the title", and Undo, floating at the bottom of the screen. */
+/** A word for a moment ("Removed: the title"), and what to do about it (Undo), floating at the bottom of the screen. */
 @Composable
-private fun Undo(title: String, modifier: Modifier, onUndo: () -> Unit) {
+private fun Bar(text: String, action: String, modifier: Modifier, onAction: () -> Unit) {
     val t = LocalTokens.current
     Row(
         modifier.widthIn(max = Space.column).fillMaxWidth().padding(Space.l).clip(Corner.l).background(t.fg)
             .padding(start = Space.m),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text("Removed: $title", style = Type.small, color = t.bg, maxLines = 1, overflow = TextOverflow.Ellipsis,
+        Text(text, style = Type.small, color = t.bg, maxLines = 2, overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f))
-        TextButton(onClick = onUndo, modifier = Modifier.heightIn(min = 48.dp)) {
-            Text("Undo", style = Type.label, color = Tokens.mix(t.accent, t.bg, 0.382f))
+        TextButton(onClick = onAction, modifier = Modifier.heightIn(min = 48.dp)) {
+            Text(action, style = Type.label, color = Tokens.mix(t.accent, t.bg, 0.382f))
         }
     }
 }
@@ -156,7 +162,10 @@ private fun NowCard(p: Playing?, actions: Actions, onReader: () -> Unit) {
     } }
 }
 
-/** A book on the shelf: its cover, title and how far through; tap to carry on, ⋮ to remove it. */
+/**
+ * A book on the shelf: its cover, title and how far through (a web novel: its chapter, and how
+ * many more are out); tap to carry on, ⋮ to remove it.
+ */
 @Composable
 private fun ShelfRow(b: ShelfBook, onClick: () -> Unit, onRemove: () -> Unit) {
     val t = LocalTokens.current
@@ -170,7 +179,11 @@ private fun ShelfRow(b: ShelfBook, onClick: () -> Unit, onRemove: () -> Unit) {
             Text(b.title, style = Type.label, color = t.fg, maxLines = 2, overflow = TextOverflow.Ellipsis)
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.s)) {
                 Track(b.progress, Modifier.weight(1f))
-                Dim("${(b.progress * 100).toInt()}%", maxLines = 1)
+                if (!b.novel) Dim("${(b.progress * 100).toInt()}%", maxLines = 1)
+            }
+            if (b.novel) Row(horizontalArrangement = Arrangement.spacedBy(Space.s)) {
+                Dim(if (b.done && b.fresh == 0) "Up to date · ${b.number}" else "Chapter ${b.number} of ${b.latest}", maxLines = 1)
+                if (b.fresh > 0) Text("${b.fresh} new", style = Type.small, color = t.accent2, maxLines = 1)
             }
         }
         Box {

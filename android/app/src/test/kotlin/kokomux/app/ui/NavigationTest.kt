@@ -49,6 +49,10 @@ class NavigationTest {
         override fun playPause() { log += "playPause" }
         override fun next() { log += "next" }
         override fun again() { log += "again" }
+        override fun search(query: String) { log += "search $query" }
+        override fun chapter(url: String) { log += "chapter $url" }
+        override fun loadToc() { log += "toc" }
+        override fun novelToc(found: Found) { log += "novel ${found.title}" }
     }
 
     private fun show(state: UiState, asked: Asked) =
@@ -95,9 +99,33 @@ class NavigationTest {
         val asked = Asked()
         show(Fake.state.copy(playing = null), asked)
         compose.onNodeWithText("Web page").performClick()
-        compose.onNodeWithText("https://…").performTextInput("https://example.com/a")
+        compose.onNodeWithText("Address, or a novel's name").performTextInput("https://example.com/a")
         compose.onNodeWithText("Read").performClick()
         assertEquals(listOf("page https://example.com/a"), asked.log)
+    }
+
+    @Test
+    fun aNovelIsFoundByNameAndStartedAtAChapter() {
+        val asked = Asked()
+        show(Fake.state.copy(playing = null, shelf = emptyList(), found = Fake.found, toc = Fake.toc), asked)
+        compose.onNodeWithText("Web page").performClick()
+        compose.onNodeWithText("Address, or a novel's name").performTextInput("goddess summon")
+        compose.onNodeWithText("Find").performClick()                    // words find novels; an address would read
+        compose.onNodeWithText("Starting with an SSS-Rank Goddess Summon").performClick()
+        compose.onNodeWithText("Chapter 8: The Summoning").performClick()
+        assertEquals(listOf("search goddess summon", "novel Starting with an SSS-Rank Goddess Summon",
+            "page https://freewebnovel.com/novel/starting-with-an-sss-rank-goddess-summon/chapter-8"), asked.log)
+    }
+
+    @Test
+    fun aNovelsChaptersAreAllOfItsChapters() {
+        val asked = Asked()
+        show(Fake.state.copy(playing = Fake.playing(playing = false).copy(novel = true), toc = Fake.toc), asked)
+        compose.onNodeWithContentDescription("Chapters").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithText("7 of 21").assertExists()
+        compose.onNodeWithText("Chapter 9: S-Rank").performClick()
+        assertEquals(listOf("toc", "chapter https://freewebnovel.com/novel/starting-with-an-sss-rank-goddess-summon/chapter-9"), asked.log)
     }
 
     @Test

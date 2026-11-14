@@ -24,6 +24,12 @@ import kotlin.concurrent.withLock
 /** The app: one [Engine] for the screen and the listening service. */
 class KokomuxApp : Application() {
     val engine by lazy { Engine(this) }
+
+    override fun onCreate() {
+        super.onCreate()
+        Browser.init(this)
+        NewChapters.schedule(this)
+    }
 }
 
 /** The app's [Engine]. */
@@ -50,6 +56,8 @@ class Engine(private val context: Context) {
     val bookmarks = Bookmarks(books)
     /** Made parts, kept per book and settings, as Termux's $PREFIX/tmp/kokomux-cache. */
     val cache = File(context.filesDir, "kokomux-cache")
+    /** Web novels' chapters, kept as they're fetched. */
+    val novels = Novels(books, text) { work -> exclusive(work) }
     /** Voices cloned with Qwen: <hash>.qwen (the voice) and <hash>.voice (its id). */
     val clones = File(context.filesDir, "voices")
 

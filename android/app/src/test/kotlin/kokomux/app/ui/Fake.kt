@@ -36,7 +36,7 @@ object Fake {
 
     val shelf = listOf(
         ShelfBook("0123456789abcdef", "The Long Road", 4, 12, "bf_emma"),
-        ShelfBook("2", "Starting with an SSS-Rank Goddess Summon", 233, 377, "af_heart"),
+        ShelfBook("2", "Starting with an SSS-Rank Goddess Summon", 12, 34, "af_heart", "Chapter 8: The Summoning", 8, 11),
         ShelfBook("3", "A Short History of Nearly Everything", 89, 1597, "bm_george"),
     )
 
@@ -53,6 +53,15 @@ object Fake {
             EngineFiles("ming", "Ming 3.0", 2_839_549_649, done = 1_123_000_000),
             EngineFiles("qwen", "Qwen3-TTS", 1_689_175_579, 1_689_175_579),
         ),
+    )
+
+    /** A web novel being heard, at chapter 7, and its list of chapters. */
+    val toc = (1..21).map { n -> TocEntry(n, if (n % 5 == 0) "Chapter $n" else "Chapter $n: ${listOf("The Summoning", "S-Rank", "The Goddess", "First Blood")[n % 4]}",
+        "https://freewebnovel.com/novel/starting-with-an-sss-rank-goddess-summon/chapter-$n", n < 7, n == 7) }
+
+    val found = listOf(
+        Found("Starting with an SSS-Rank Goddess Summon", "https://freewebnovel.com/novel/starting-with-an-sss-rank-goddess-summon", "Chapter 412"),
+        Found("The Goddess Summoner's Guild", "https://freewebnovel.com/novel/the-goddess-summoners-guild", "Chapter 88"),
     )
 
     /** Actions that do nothing. */
@@ -83,6 +92,10 @@ object Fake {
         override fun dropClip() {}
         override fun makeVoice(words: String, name: String, lang: String) {}
         override fun forgetVoice(voice: String) {}
+        override fun loadToc() {}
+        override fun chapter(url: String) {}
+        override fun search(query: String) {}
+        override fun novelToc(found: Found) {}
         override fun prefs(prefs: Prefs) {}
         override fun check() {}
         override fun clearKept() {}

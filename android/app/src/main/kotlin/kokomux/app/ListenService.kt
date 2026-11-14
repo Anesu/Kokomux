@@ -43,6 +43,10 @@ import kokomux.engine.VoiceId
  *  - the sleep timer fades the voice out over its last 13 seconds, counting
  *    only time spent playing, and keeps your place
  *  - carrying on after a minute away goes back 5 seconds first (10 after an hour)
+ *  - a web novel goes on from chapter to chapter: as the chapter is made, the
+ *    next is fetched (or taken from those kept ahead) and added on the end;
+ *    its bookmark is the novel's, the chapter and the part in it, and stays,
+ *    done, once the latest chapter has been heard
  *
  * The screen connects a MediaController and sends the commands below.
  */
@@ -99,6 +103,7 @@ class ListenService : MediaSessionService() {
                                              command: SessionCommand, args: Bundle): ListenableFuture<SessionResult> {
                     when (command.customAction) {
                         OPEN -> open(Request.from(args))
+                        CHAPTER -> request?.let { open(it.copy(source = args.getString("url")!!)) }
                         STOP -> close()
                         JUMP -> jump(args.getInt("part"))
                         SPEED -> speed(args.getFloat("speed"))
@@ -126,9 +131,12 @@ class ListenService : MediaSessionService() {
         Listening.made.clear()
         Listening.unpaced()
         read(request, run) { b, lang ->
-            val mark = engine.bookmarks.get(request.id)
-            val start = Bookmarks.startAt(mark?.part ?: 1, mark?.parts ?: 0, b.parts.size)
-            begin(request, b, lang, start)
+            // A novel's chapter is the novel's: its bookmark, if it's in this chapter (or heard to the end of it).
+            val r = b.novel?.let { n -> request.copy(id = Books.id(n.url), kind = "novel", source = b.chapters.first().url) } ?: request
+            val mark = engine.bookmarks.get(r.id)?.takeIf { b.novel == null || it.source == r.source }
+            val start = if (mark?.done == true && mark.part >= mark.parts) b.parts.size + 1
+            else Bookmarks.startAt(mark?.part ?: 1, mark?.parts ?: 0, b.parts.size)
+            begin(r, b, lang, start)
         }
     }
 
@@ -158,6 +166,8 @@ class ListenService : MediaSessionService() {
         Listening.opening = false
         startMaking(start, keepPlaying = false)
         player.playWhenReady = true
+        // The next few chapters, fetched so they can be heard offline.
+        b.novel?.let { b.chapters.lastOrNull() }?.let { c -> Thread({ runCatching { engine.novels.ahead(engine.novels.chapter(c.url)!!.first) } }, "kokomux-ahead").start() }
     }
 
     /**
@@ -165,14 +175,16 @@ class ListenService : MediaSessionService() {
      * playlist. [keepPlaying]: the part playing stays (a new speed); otherwise
      * the playlist starts again at [from].
      */
-    private fun startMaking(from: Int, keepPlaying: Boolean) {
+    private fun startMaking(from: Int, keepPlaying: Boolean, append: Boolean = false) {
         val r = request ?: return
         val b = book ?: return
         stop.set(true)
         val run = ++runs
         val stop = AtomicBoolean(false).also { this.stop = it }
         allMade = false
-        if (keepPlaying && player.mediaItemCount > 0) {
+        if (append) {
+            // (a novel's next chapter: what's on the playlist stays)
+        } else if (keepPlaying && player.mediaItemCount > 0) {
             val keep = player.currentMediaItemIndex + 1
             if (player.mediaItemCount > keep) player.removeMediaItems(keep, player.mediaItemCount)
         } else {
@@ -182,6 +194,7 @@ class ListenService : MediaSessionService() {
         }
         if (from > b.parts.size) {
             allMade = true
+            if (b.novel != null) extend(run)
             return
         }
         Listening.making = true
@@ -201,12 +214,60 @@ class ListenService : MediaSessionService() {
                     if (run != runs) return@post
                     allMade = true
                     Listening.making = false
-                    if (player.playbackState == Player.STATE_ENDED) finished()
+                    if (b.novel != null) extend(run)
+                    else if (player.playbackState == Player.STATE_ENDED) finished()
                 }
             } catch (e: Throwable) {
                 main.post { if (run == runs) failed(e.message ?: e.toString()) }
             }
         }, "kokomux-making").start()
+    }
+
+    /**
+     * A novel's next chapter, added on the end and made on from there: kept ahead already, or
+     * fetched now. When there's none out yet, the novel is heard up to date.
+     */
+    private fun extend(run: Int) {
+        val b = book ?: return
+        val next = b.novel?.next ?: return upToDate()
+        val lang = lang
+        allMade = false
+        Listening.making = true
+        Thread({
+            try {
+                val got = engine.novels.chapter(next)
+                val parts = got?.let { engine.exclusive { engine.text.parts(it.second, lang) } }
+                main.post {
+                    if (run != runs || book !== b) return@post
+                    if (got == null || parts.isNullOrEmpty()) {
+                        book = b.copy(novel = b.novel?.copy(next = null))
+                        upToDate()
+                        return@post
+                    }
+                    val longer = b.plus(got.first, parts)
+                    book = longer
+                    Listening.now = Listening.now?.let { Listening.Now(it.request, longer, it.first, it.lang) }
+                    startMaking(b.parts.size + 1, keepPlaying = true, append = true)
+                }
+                if (got != null) engine.novels.ahead(got.first)
+            } catch (e: Throwable) {
+                // Offline with nothing kept ahead: what's made plays out, and the next chapter is tried again then.
+                main.post {
+                    if (run != runs) return@post
+                    allMade = true
+                    Listening.making = false
+                    Listening.error = "Couldn't get the next chapter (${e.message})"
+                    if (player.playbackState == Player.STATE_ENDED) finished()
+                }
+            }
+        }, "kokomux-next-chapter").start()
+    }
+
+    /** Heard to the latest chapter: if it's all played, the novel stays on the shelf, done, for what comes next. */
+    private fun upToDate() {
+        allMade = true
+        Listening.making = false
+        if (player.playbackState == Player.STATE_ENDED || player.mediaItemCount == 0) finished()
     }
 
     /** The speed [r]'s parts are made at: Kokoro's own, 1× for the others (the player speeds them up). */
@@ -243,10 +304,21 @@ class ListenService : MediaSessionService() {
         player.playbackParameters = PlaybackParameters(r.speed / madeAt)
         at = part
         Listening.at = part
-        if (now.book.parts.size > 1) engine.bookmarks.save(
-            Bookmarks.Mark(r.id, part, now.book.parts.size, now.book.title, r.kind, r.source, r.voice, r.speed, now.lang),
-        )
+        mark(now.book, r, part, now.lang)
         if (Listening.sleep == Sleep.EndOfChapter) chapterEnd()
+    }
+
+    /** The bookmark at [part]: a book's, or a novel's (its chapter, and the part in it). */
+    private fun mark(b: Book, r: Request, part: Int, lang: String, done: Boolean = false) {
+        val n = b.novel
+        val c = b.chapterOf(part)
+        if (n != null && c != null) {
+            val parts = b.partsOf(c)
+            engine.bookmarks.save(Bookmarks.Mark(r.id, part - c.first + 1, parts.count(), n.title, "novel", c.url, r.voice,
+                r.speed, lang, chapter = c.title, number = c.number, novel = n.url, done = done))
+        } else if (b.parts.size > 1) {
+            engine.bookmarks.save(Bookmarks.Mark(r.id, part, b.parts.size, b.title, r.kind, r.source, r.voice, r.speed, lang))
+        }
     }
 
     /** Go to [part]: at once if it's on the playlist, otherwise making starts there. */
@@ -282,6 +354,7 @@ class ListenService : MediaSessionService() {
         if (voice == r.voice) return
         val next = r.copy(voice = voice)
         val from = at.coerceAtLeast(1)
+        val chapter = book?.takeIf { it.novel != null }?.chapterOf(from)
         Listening.unpaced()
         if (Books.langOf(voice) == lang) {
             Listening.preparing = ""
@@ -295,7 +368,14 @@ class ListenService : MediaSessionService() {
             stop.set(true)
             player.stop()
             Listening.opening = true
-            read(next, run) { b, lang -> begin(next, b, lang, Bookmarks.startAt(from, book?.parts?.size ?: 0, b.parts.size)) }
+            // (a novel starts again at the chapter it's in)
+            val again = if (chapter != null) next.copy(source = chapter.url) else next
+            val inChapter = if (chapter != null) from - chapter.first + 1 else from
+            read(again, run) { b, lang ->
+                val r = b.novel?.let { n -> again.copy(id = Books.id(n.url), kind = "novel") } ?: again
+                begin(r, b, lang, if (chapter != null) inChapter.coerceIn(1, b.parts.size)
+                else Bookmarks.startAt(from, book?.parts?.size ?: 0, b.parts.size))
+            }
         }
     }
 
@@ -374,14 +454,23 @@ class ListenService : MediaSessionService() {
 
     // ------------------------------------------------------------ the end
 
-    /** Heard to the end: the bookmark, the kept parts and the book's own copy go, as in Termux. */
+    /**
+     * Heard to the end: the bookmark, the kept parts and the book's own copy go, as in Termux. A
+     * novel's bookmark stays, done, at the end of the latest chapter, for the chapters still to come.
+     */
     private fun finished() {
         val now = Listening.now ?: return
         val id = now.request.id
         stop.set(true)
-        engine.bookmarks.remove(id)
+        val b = book
+        if (b?.novel != null) {
+            mark(b, now.request, b.parts.size, now.lang, done = true)
+            b.chapters.lastOrNull()?.let { Listening.note = "Up to date: ${it.title} is the latest" }
+        } else {
+            engine.bookmarks.remove(id)
+            if (now.request.kind != "url") File(now.request.source).delete()
+        }
         File(engine.cache, id).deleteRecursively()
-        if (now.request.kind != "url") File(now.request.source).delete()
         Listening.now = null
         Listening.at = 0
         Listening.sleep = null
@@ -435,7 +524,9 @@ class ListenService : MediaSessionService() {
         const val SPEED = "kokomux.SPEED"
         const val VOICE = "kokomux.VOICE"
         const val SLEEP = "kokomux.SLEEP"
-        private val COMMANDS = listOf(OPEN, STOP, JUMP, SPEED, VOICE, SLEEP)
+        /** A novel's chapter that isn't in this listen: the novel starts again there. */
+        const val CHAPTER = "kokomux.CHAPTER"
+        private val COMMANDS = listOf(OPEN, STOP, JUMP, SPEED, VOICE, SLEEP, CHAPTER)
         /** KOKORO_CACHE_GB's default: 50 GB of kept parts at most. */
         const val CACHE_LIMIT = 50L * 1000 * 1000 * 1000
         /** The sleep timer's fade, as Termux's. */
