@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="1.2.0"
+KOKOMUX_VERSION="1.3.0"
 DISTRO=kokoro
 
 VERBOSE=0
@@ -506,7 +506,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_FILE__'
 # in theme.sh (all four loaded below).
 set -euo pipefail
 
-KOKOMUX_VERSION="1.2.0"
+KOKOMUX_VERSION="1.3.0"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -1465,6 +1465,7 @@ TUI_PART=0; TUI_PARTS=0; TUI_A=0; TUI_B=0
 TUI_STATE=""; TUI_EXTRA=""; TUI_SYM=""; TUI_PAUSED=0; TUI_TITLE=""; TUI_INFO=""; TUI_SPEED=1.0
 TUI_BTN=()                            # clickable buttons: "row x0 x1 command"
 TUI_CHAPTER=""; TUI_HAS_CHAPTERS=0; TUI_BAR=(3 10)   # the progress bar's first column and width
+TUI_LEFT=""                           # the time left, as the player says it ("12m left in chapter · 6h 10m in all")
 SYNC_ON=$'\033[?2026h'; SYNC_OFF=$'\033[?2026l'
 TUI_FOCUS=0; TUI_EASE_AT=0; TUI_EASE_MS=382   # the focus effect; the part just heard eases out
 
@@ -1693,11 +1694,16 @@ tui_progress() { # the bar across the screen (tap it to jump there)
   out '%s%s%s' "$LINE" "${bar// /─}" "$R"
 }
 
-tui_info() {     # what's happening on the left, the chapter and part on the right
+tui_info() {     # what's happening on the left; the chapter, and the time left (or the part), on the right
   local state where="" ch=$TUI_CHAPTER room
   state="$TUI_STATE${TUI_EXTRA:+ · $TUI_EXTRA}"
   [ "$TUI_PARTS" -gt 1 ] && where="$TUI_PART of $TUI_PARTS"
+  [ -n "$TUI_LEFT" ] && where=$TUI_LEFT
   room=$(( TW - 4 - ${#state} - 4 - ${#TUI_SYM} - ${#where} - 3 ))
+  if [ -n "$TUI_LEFT" ] && { [ "$room" -lt 0 ] || { [ -n "$ch" ] && [ "$room" -le 12 ]; }; }; then
+    where="${where/ left in chapter/ in chapter}"; where="${where/ in all/ all}"    # narrower: "12m in chapter · 6h 10m all"
+    room=$(( TW - 4 - ${#state} - 4 - ${#TUI_SYM} - ${#where} - 3 ))
+  fi
   if [ -n "$ch" ] && [ "$room" -gt 6 ]; then
     [ "${#ch}" -gt "$room" ] && ch="${ch:0:$(( room - 1 ))}…"
     where="$ch · $where"
@@ -1917,8 +1923,8 @@ tui_prompt() {   # tui_prompt LABEL [DEFAULT]: ask on the bottom line (with Tab 
   ANSWER=$ans
 }
 
-home_book() {    # home_book Y MARK NUM SELECTED: one book on the shelf: its number, title, progress bar, how far, and ✕ (remove)
-  local y=$1 m=$2 title part parts pct bw=12 bar rest row="" mk=" "
+home_book() {    # home_book Y MARK NUM SELECTED: one book on the shelf: its number, title, progress bar, time left (or how far), and ✕ (remove)
+  local y=$1 m=$2 title part parts pct bw=12 bar rest row="" mk=" " left
   title="$(mark_get "$m" title)"; part="$(mark_get "$m" part)"; parts="$(mark_get "$m" parts)"
   [ "${parts:-0}" -gt 0 ] 2>/dev/null || parts=1
   [ "${part:-0}" -gt 0 ] 2>/dev/null || part=1
@@ -1929,12 +1935,14 @@ home_book() {    # home_book Y MARK NUM SELECTED: one book on the shelf: its num
   fi
   printf -v bar '%*s' $(( pct * bw / 100 )) ''; bar="$ACC${bar// /━}$R"
   printf -v rest '%*s' $(( bw - pct * bw / 100 )) ''; bar+="$LINE${rest// /─}$R"
-  fit "$title" $(( CW - 26 )); title=$REPLY
+  left="$(mark_get "$m" left)"
+  if [[ "$left" =~ ^[0-9]+$ ]] && [ "$pct" -lt 100 ]; then dur_label "$left"; left=$REPLY; else left="$pct%"; fi
+  fit "$title" $(( CW - 28 )); title=$REPLY
   local x=$GHOST
   if [ "$4" = 1 ]; then row=$SEL; mk="$ACC▎"; x=$D; fi
   bar="${bar//$R/$R$row}"            # keep the selected row's background across the bar
-  out '\033[%d;%dH%s%s%s%s%2d%s  %s %s %s%3d%%%s %s✕%s' "$y" "$LM" "$row" "$mk" "$R$row" \
-    "$ACC2" "$3" "$R$row" "$title" "$bar$row" "$D" "$pct" "$R$row" "$x" "$R"
+  out '\033[%d;%dH%s%s%s%s%2d%s  %s %s %s%6s%s %s✕%s' "$y" "$LM" "$row" "$mk" "$R$row" \
+    "$ACC2" "$3" "$R$row" "$title" "$bar$row" "$D" "$left" "$R$row" "$x" "$R"
   HOME_X=$(( LM + CW - 2 ))          # the ✕'s column, for a tap
 }
 
@@ -2620,8 +2628,11 @@ bookmark_save() {   # bookmark_save PART: so the same command, or kokoro --conti
   [ "$PARTS" -gt 1 ] || return 0                          # nothing to come back to
   [ -d "$BOOKS" ] || mkdir -p "$BOOKS"
   [ "$kind" = text ] && [ ! -f "$BOOKS/$book_id.txt" ] && cp "$text" "$BOOKS/$book_id.txt"
-  printf 'part=%s\nparts=%s\ntitle=%s\nkind=%s\nsource=%s\nvoice=%s\nspeed=%s\nlang=%s\n' \
-    "$1" "$PARTS" "${book_title:-$name}" "$kind" "$source" "$voice" "$speed" "$lang" > "$BOOKS/$book_id.mark"
+  {
+    printf 'part=%s\nparts=%s\ntitle=%s\nkind=%s\nsource=%s\nvoice=%s\nspeed=%s\nlang=%s\n' \
+      "$1" "$PARTS" "${book_title:-$name}" "$kind" "$source" "$voice" "$speed" "$lang"
+    [ -z "$LEFT_SECS" ] || echo "left=$LEFT_SECS"            # (seconds, for the bookshelf)
+  } > "$BOOKS/$book_id.mark"
 }
 bookmark_done() {  # read to the end: the bookmark and the book's kept audio go
   if [ -n "$NOVEL" ]; then                                # a novel stays on the shelf, up to date
@@ -2728,6 +2739,58 @@ chapter_of() {   # chapter_of PART: CH = the index of the chapter PART is in (-1
   return 0
 }
 
+# Time left: from the engine's plan (the characters up to the end of each
+# part) and how fast this voice reads (rate: characters a second, at the speed
+# it was measured at, scaled to the speed now). Until the first part is made,
+# Kokoro's usual pace. Worked out once a part, when it starts.
+LEFT_CH=""; LEFT_BOOK=""; LEFT_SECS=""
+dur_label() {    # dur_label SECONDS: REPLY = "14h", "6h 10m", "12m" or "<1m" (6 columns at most)
+  local m=$(( ($1 + 30) / 60 ))                  # (to the nearest minute)
+  if [ "$m" -ge 600 ]; then REPLY="$(( (m + 30) / 60 ))h"
+  elif [ "$m" -ge 60 ]; then REPLY="$(( m / 60 ))h $(( m % 60 ))m"
+  elif [ "$m" -ge 1 ]; then REPLY="${m}m"
+  else REPLY="<1m"; fi
+}
+speed_milli() {  # speed_milli SPEED: REPLY = SPEED in thousandths ("1.25" -> 1250)
+  local s=$1 f=0
+  [[ "$s" == *.* ]] && f=${s#*.}
+  f="${f}000"; REPLY=$(( 10#${s%%.*} * 1000 + 10#${f:0:3} ))
+}
+time_left() {    # time_left PART: LEFT_CH and LEFT_BOOK ("12m", "" if not known) from the start of PART; LEFT_SECS for the bookmark
+  local cum=() rate=14000 at=1000 now before last end cps rs k
+  LEFT_CH=""; LEFT_BOOK=""; LEFT_SECS=""
+  [ -s "$tmpd/plan" ] || return 0
+  mapfile -t cum < <(cut -f1 "$tmpd/plan")
+  [ "${#cum[@]}" -ge "$1" ] || return 0
+  speed_milli "$speed"; now=$REPLY
+  if [ -f "$tmpd/rate" ] && read -r cps rs < "$tmpd/rate" && [[ "$cps" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+    speed_milli "$cps"; rate=$REPLY; speed_milli "${rs:-1}"; at=$REPLY
+  fi
+  [ "$rate" -gt 0 ] && [ "$at" -gt 0 ] || return 0
+  rate=$(( rate * now / at ))                     # (characters a second ×1000, at the speed now)
+  [ "$rate" -gt 0 ] || return 0
+  before=0; [ "$1" -gt 1 ] && before=${cum[$1 - 2]}
+  last=${cum[${#cum[@]} - 1]}
+  if [ -z "$NOVEL" ] || [ -f "$tmpd/stream/end" ]; then     # (a novel's next chapters aren't known yet)
+    LEFT_SECS=$(( (last - before) * 1000 / rate ))
+    dur_label "$LEFT_SECS"; LEFT_BOOK=$REPLY
+  fi
+  chapter_of "$1"
+  if [ "$CH" -ge 0 ]; then
+    k=$(( CH + 1 )); end=$last
+    [ "$k" -lt "${#CH_START[@]}" ] && end=${cum[${CH_START[k]} - 2]:-$last}
+    dur_label $(( (end - before) * 1000 / rate )); LEFT_CH=$REPLY
+  fi
+  return 0
+}
+left_label() {   # LEFT_LABEL: the time left as the player shows it ("12m left in chapter · 6h 10m in all")
+  LEFT_LABEL=""
+  if [ -n "$LEFT_CH" ] && [ "${#CH_START[@]}" -gt 1 ]; then
+    LEFT_LABEL="$LEFT_CH left in chapter${LEFT_BOOK:+ · $LEFT_BOOK in all}"
+  elif [ -n "$LEFT_BOOK" ]; then LEFT_LABEL="$LEFT_BOOK left"; fi
+  return 0
+}
+
 # The sleep timer: off, a number of minutes, or the end of the chapter. The voice
 # fades out over its last SLEEP_FADE ms and then it stops, keeping the bookmark
 # at the part being read (so it picks up at the start of that sentence). Time
@@ -2747,7 +2810,7 @@ sleep_label() {  # SLEEP_LABEL: what the timer shows ("" when off)
   SLEEP_LABEL=""
   case "$SLEEP" in
     off) ;;
-    chapter) SLEEP_LABEL="☾ end of chapter" ;;
+    chapter) SLEEP_LABEL="☾ end of chapter${LEFT_CH:+, $LEFT_CH}" ;;
     *) now_ms; SLEEP_LABEL="☾ $(( (SLEEP_AT - NOW + 59999) / 60000 ))m" ;;
   esac
 }
@@ -2788,7 +2851,7 @@ job_fork() {     # a fresh job folder ($tmpd) with what the engine found in the 
   engine_stop
   FORKED_FROM=$tmpd
   tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
-  for f in in.txt title chapters serial novel progress plan; do [ -f "$FORKED_FROM/$f" ] && cp "$FORKED_FROM/$f" "$tmpd/"; done
+  for f in in.txt title chapters serial novel progress plan rate; do [ -f "$FORKED_FROM/$f" ] && cp "$FORKED_FROM/$f" "$tmpd/"; done
   return 0
 }
 jump_to() {      # jump_to PART
@@ -2994,7 +3057,7 @@ play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause
   local paused_at=0 away back
   w_state=pending; MPV_EST=0
   { [ -f "$tmpd/stream/words-off" ] || [ "$show_words" = 0 ]; } && w_state=off
-  title_get; part_of "$i"
+  title_get; part_of "$i"; chapters_load; time_left "$i"; left_label; TUI_LEFT=$LEFT_LABEL
   bookmark_save "$i"; notify "${PART% · }"
   mpv_start
   [ -n "${MPV_IDX[$i]+x}" ] || mpv_queue "$i" "$wav"
@@ -3077,9 +3140,9 @@ play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause
     sleep_vol "$i"
     if [ "$VOL" != "$MPV_VOL" ]; then mpv_send "\"set_property\",\"volume\",$VOL"; MPV_VOL=$VOL; fi
     if [ "$VOL" = 0 ] && [ "$SLEEP" != chapter ]; then SLEPT=1; exit "$QUIT_RC"; fi   # time's up (the bookmark is this part)
-    part_of "$i"; sleep_label
-    if [ "$ui" = tui ]; then label=$SLEEP_LABEL
-    else label="${PART}${SLEEP_LABEL:+$SLEEP_LABEL · }␣ pause · → next · q stop"; fi
+    part_of "$i"; sleep_label; left_label
+    if [ "$ui" = tui ]; then label=$SLEEP_LABEL; TUI_LEFT=$LEFT_LABEL
+    else label="${PART}${LEFT_LABEL:+$LEFT_LABEL · }${SLEEP_LABEL:+$SLEEP_LABEL · }␣ pause · → next · q stop"; fi
     if [ "$label|playing" != "$last" ]; then view_state "Playing" "$label" "▶"; last="$label|playing"; fi
     tick 0.03
   done
@@ -3225,6 +3288,7 @@ cmd_status() {   # kokoro --status: the server, the settings and the last bookma
   if [ -n "$last" ]; then
     where="part $(mark_get "$last" part) of $(mark_get "$last" parts)"
     [ "$(mark_get "$last" kind)" = novel ] && where="$(mark_get "$last" chapter)"
+    if [[ "$(mark_get "$last" left)" =~ ^[0-9]+$ ]]; then dur_label "$(mark_get "$last" left)"; where+=", $REPLY left"; fi
     printf '    Bookmark  %s %s(%s · kokoro --continue)%s\n' "$(mark_get "$last" title)" "$D" "$where" "$R"
   fi
   printf '    Settings  %s%s%s\n' "$D" "$(tilde "$CONF")" "$R"
@@ -3515,7 +3579,7 @@ key=value lines:
 
 What it writes into the folder: `title`, `progress` ("part total"), `chapters`
 ("first-part<TAB>title" per line), `plan` (every part, one line each:
-"characters-up-to-its-end<TAB>its text"), `rate` (characters spoken a second,
+"characters-up-to-its-end<TAB>its text"), `rate` ("characters-a-second speed",
 from the parts made so far), `result` ("seconds-of-audio seconds-taken
 parts"), `out.<ext>` and `chapters_ms` when saving, and with stream=1
 `stream/NNNN.txt` (the part's text), `stream/NNNN.words` (its word timings),
@@ -4048,8 +4112,8 @@ def run_job(path):
             total += length / rate
             made[i] = length / rate
             heard_chars += len(chunk) + 1
-            # How fast this voice reads, in characters a second: the player tells the time left by it.
-            _write_atomic(os.path.join(jobdir, "rate"), f"{heard_chars / total:.3f}\n")
+            # How fast this voice reads, in characters a second, and at what speed: the player tells the time left by it.
+            _write_atomic(os.path.join(jobdir, "rate"), f"{heard_chars / total:.3f} {speed:g}\n")
             if out:
                 # Written as it's made, so a whole book never has to fit in memory.
                 if writer is None:

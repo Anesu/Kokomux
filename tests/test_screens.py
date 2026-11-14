@@ -276,6 +276,19 @@ def shelf(p, n):
     return marks
 
 
+def test_home_shows_the_time_left_in_a_book():
+    p = Phone()
+    try:
+        p.write("home/.local/share/kokomux/bookmarks/0123456789abcdef.mark",
+                "part=3\nparts=10\ntitle=A Long Story\nkind=file\nsource=/nowhere\n"
+                "voice=af_heart\nspeed=1.0\nlang=en-us\nleft=22200\n")
+        status, out = p.run([], keys=["q"])
+        ended_cleanly(status, out)
+        assert "A Long Story" in plain(out) and "6h 10m" in plain(out) and "20%" not in plain(out)
+    finally:
+        p.close()
+
+
 def test_home_shelf_scrolls_to_every_book():
     p = Phone()
     try:

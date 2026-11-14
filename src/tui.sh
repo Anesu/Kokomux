@@ -57,6 +57,7 @@ TUI_PART=0; TUI_PARTS=0; TUI_A=0; TUI_B=0
 TUI_STATE=""; TUI_EXTRA=""; TUI_SYM=""; TUI_PAUSED=0; TUI_TITLE=""; TUI_INFO=""; TUI_SPEED=1.0
 TUI_BTN=()                            # clickable buttons: "row x0 x1 command"
 TUI_CHAPTER=""; TUI_HAS_CHAPTERS=0; TUI_BAR=(3 10)   # the progress bar's first column and width
+TUI_LEFT=""                           # the time left, as the player says it ("12m left in chapter · 6h 10m in all")
 SYNC_ON=$'\033[?2026h'; SYNC_OFF=$'\033[?2026l'
 TUI_FOCUS=0; TUI_EASE_AT=0; TUI_EASE_MS=382   # the focus effect; the part just heard eases out
 
@@ -285,11 +286,16 @@ tui_progress() { # the bar across the screen (tap it to jump there)
   out '%s%s%s' "$LINE" "${bar// /─}" "$R"
 }
 
-tui_info() {     # what's happening on the left, the chapter and part on the right
+tui_info() {     # what's happening on the left; the chapter, and the time left (or the part), on the right
   local state where="" ch=$TUI_CHAPTER room
   state="$TUI_STATE${TUI_EXTRA:+ · $TUI_EXTRA}"
   [ "$TUI_PARTS" -gt 1 ] && where="$TUI_PART of $TUI_PARTS"
+  [ -n "$TUI_LEFT" ] && where=$TUI_LEFT
   room=$(( TW - 4 - ${#state} - 4 - ${#TUI_SYM} - ${#where} - 3 ))
+  if [ -n "$TUI_LEFT" ] && { [ "$room" -lt 0 ] || { [ -n "$ch" ] && [ "$room" -le 12 ]; }; }; then
+    where="${where/ left in chapter/ in chapter}"; where="${where/ in all/ all}"    # narrower: "12m in chapter · 6h 10m all"
+    room=$(( TW - 4 - ${#state} - 4 - ${#TUI_SYM} - ${#where} - 3 ))
+  fi
   if [ -n "$ch" ] && [ "$room" -gt 6 ]; then
     [ "${#ch}" -gt "$room" ] && ch="${ch:0:$(( room - 1 ))}…"
     where="$ch · $where"
@@ -509,8 +515,8 @@ tui_prompt() {   # tui_prompt LABEL [DEFAULT]: ask on the bottom line (with Tab 
   ANSWER=$ans
 }
 
-home_book() {    # home_book Y MARK NUM SELECTED: one book on the shelf: its number, title, progress bar, how far, and ✕ (remove)
-  local y=$1 m=$2 title part parts pct bw=12 bar rest row="" mk=" "
+home_book() {    # home_book Y MARK NUM SELECTED: one book on the shelf: its number, title, progress bar, time left (or how far), and ✕ (remove)
+  local y=$1 m=$2 title part parts pct bw=12 bar rest row="" mk=" " left
   title="$(mark_get "$m" title)"; part="$(mark_get "$m" part)"; parts="$(mark_get "$m" parts)"
   [ "${parts:-0}" -gt 0 ] 2>/dev/null || parts=1
   [ "${part:-0}" -gt 0 ] 2>/dev/null || part=1
@@ -521,12 +527,14 @@ home_book() {    # home_book Y MARK NUM SELECTED: one book on the shelf: its num
   fi
   printf -v bar '%*s' $(( pct * bw / 100 )) ''; bar="$ACC${bar// /━}$R"
   printf -v rest '%*s' $(( bw - pct * bw / 100 )) ''; bar+="$LINE${rest// /─}$R"
-  fit "$title" $(( CW - 26 )); title=$REPLY
+  left="$(mark_get "$m" left)"
+  if [[ "$left" =~ ^[0-9]+$ ]] && [ "$pct" -lt 100 ]; then dur_label "$left"; left=$REPLY; else left="$pct%"; fi
+  fit "$title" $(( CW - 28 )); title=$REPLY
   local x=$GHOST
   if [ "$4" = 1 ]; then row=$SEL; mk="$ACC▎"; x=$D; fi
   bar="${bar//$R/$R$row}"            # keep the selected row's background across the bar
-  out '\033[%d;%dH%s%s%s%s%2d%s  %s %s %s%3d%%%s %s✕%s' "$y" "$LM" "$row" "$mk" "$R$row" \
-    "$ACC2" "$3" "$R$row" "$title" "$bar$row" "$D" "$pct" "$R$row" "$x" "$R"
+  out '\033[%d;%dH%s%s%s%s%2d%s  %s %s %s%6s%s %s✕%s' "$y" "$LM" "$row" "$mk" "$R$row" \
+    "$ACC2" "$3" "$R$row" "$title" "$bar$row" "$D" "$left" "$R$row" "$x" "$R"
   HOME_X=$(( LM + CW - 2 ))          # the ✕'s column, for a tap
 }
 

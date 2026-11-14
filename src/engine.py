@@ -25,7 +25,7 @@ key=value lines:
 
 What it writes into the folder: `title`, `progress` ("part total"), `chapters`
 ("first-part<TAB>title" per line), `plan` (every part, one line each:
-"characters-up-to-its-end<TAB>its text"), `rate` (characters spoken a second,
+"characters-up-to-its-end<TAB>its text"), `rate` ("characters-a-second speed",
 from the parts made so far), `result` ("seconds-of-audio seconds-taken
 parts"), `out.<ext>` and `chapters_ms` when saving, and with stream=1
 `stream/NNNN.txt` (the part's text), `stream/NNNN.words` (its word timings),
@@ -558,8 +558,8 @@ def run_job(path):
             total += length / rate
             made[i] = length / rate
             heard_chars += len(chunk) + 1
-            # How fast this voice reads, in characters a second: the player tells the time left by it.
-            _write_atomic(os.path.join(jobdir, "rate"), f"{heard_chars / total:.3f}\n")
+            # How fast this voice reads, in characters a second, and at what speed: the player tells the time left by it.
+            _write_atomic(os.path.join(jobdir, "rate"), f"{heard_chars / total:.3f} {speed:g}\n")
             if out:
                 # Written as it's made, so a whole book never has to fit in memory.
                 if writer is None:

@@ -135,6 +135,7 @@ cmd_status() {   # kokoro --status: the server, the settings and the last bookma
   if [ -n "$last" ]; then
     where="part $(mark_get "$last" part) of $(mark_get "$last" parts)"
     [ "$(mark_get "$last" kind)" = novel ] && where="$(mark_get "$last" chapter)"
+    if [[ "$(mark_get "$last" left)" =~ ^[0-9]+$ ]]; then dur_label "$(mark_get "$last" left)"; where+=", $REPLY left"; fi
     printf '    Bookmark  %s %s(%s · kokoro --continue)%s\n' "$(mark_get "$last" title)" "$D" "$where" "$R"
   fi
   printf '    Settings  %s%s%s\n' "$D" "$(tilde "$CONF")" "$R"

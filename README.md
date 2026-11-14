@@ -112,17 +112,17 @@ On a terminal, `kokoro -p` opens a full-screen reader. Across the top are the ti
 | q or Esc | Menu → **Stop** | stop, keeping your place |
 | | the progress bar | click or tap it to jump to that point |
 
-Above the bar, a line says what's happening (playing, paused, how much of the book is made) and where you are (chapter, part). Playback carries on while the menu or settings are open; a new voice or language starts again at the part you're on.
+Above the bar, a line says what's happening (playing, paused, how much of the book is made), the chapter you're in, and **how long is left**: in the chapter and in the whole book (*12m left in chapter · 6h 10m in all*). It's worked out from how fast the voice you chose actually reads, at your speed, so it changes at once when you change the speed. A web novel shows the time left in the chapter, since the next chapters aren't out yet. Playback carries on while the menu or settings are open; a new voice or language starts again at the part you're on.
 
 **A new speed is heard at once.** The part you're on carries on at the new speed, with its pitch kept, while the rest is made again at that speed behind it. From the next part on you hear Kokoro speaking at the new speed itself, which sounds more natural than a sped-up recording.
 
 **Back a little after a long pause.** Carry on after a minute or more away and it goes back 5 seconds first, or 10 after an hour, so you pick up the thread.
 
-The sleep timer fades the voice out over its last 13 seconds, then stops, keeping your place at the start of the sentence it faded on. With **end of chapter**, it fades over the end of the chapter's last part. Time spent paused doesn't count towards it. The reader shows the chapter you're in beside the progress bar.
+The sleep timer fades the voice out over its last 13 seconds, then stops, keeping your place at the start of the sentence it faded on. With **end of chapter**, it shows how long that is (*☾ end of chapter, 12m*) and fades over the end of the chapter's last part. Time spent paused doesn't count towards it. The reader shows the chapter you're in beside the progress bar.
 
 With a keyboard and mouse (DeX, a tablet, or a Bluetooth keyboard), the keys and clicks both work. On a phone, tap the buttons. When you stop, kokoro says where you stopped and how to carry on.
 
-Run `kokoro` on its own to open the **home screen**. Its **bookshelf** lists every book, web novel and long text you're partway through, the most recent first, with progress bars; it scrolls when there are more than fit. Choose one with ↑↓ and Enter, its number, or a tap. **x** (or a tap on a book's faint **✕**) takes it off the shelf, with its saved audio, after asking. Books you've heard to the end go on the **Finished** list (**h**), with the date; Enter on one hears it again from the start. It also has one-key actions:
+Run `kokoro` on its own to open the **home screen**. Its **bookshelf** lists every book, web novel and long text you're partway through, the most recent first, with progress bars and the time left in each; it scrolls when there are more than fit. Choose one with ↑↓ and Enter, its number, or a tap. **x** (or a tap on a book's faint **✕**) takes it off the shelf, with its saved audio, after asking. Books you've heard to the end go on the **Finished** list (**h**), with the date; Enter on one hears it again from the start. It also has one-key actions:
 
 | Key | Does |
 |---|---|

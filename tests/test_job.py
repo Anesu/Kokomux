@@ -366,7 +366,9 @@ def test_the_plan_lists_every_part_and_the_rate_follows_the_voice():
         assert int(plan[-1][0]) == sum(len(t) + 1 for t, _ in parts)        # characters up to each part's end
         assert all(int(a[0]) < int(b[0]) for a, b in zip(plan, plan[1:]))
         with open(os.path.join(jobdir, "rate")) as f:
-            rate = float(f.read())
+            rate, speed = f.read().split()
+        rate = float(rate)
+        assert speed == "1"
         # FakeKokoro speaks 100 characters a second, and each part has a pause after it
         assert 60 < rate < 100, rate
     finally:

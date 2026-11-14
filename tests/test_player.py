@@ -176,6 +176,43 @@ def test_a_new_part_starts_with_no_time_and_a_playlist_clear_keeps_it():
     assert cleared == ["0", "4.2", "5000"], cleared         # the same part, renumbered: its time stands
 
 
+
+def time_left(prefix, part, speed="1.0", rate="20.000 1", novel="", end=True):
+    """The time left from PART of a 100-part book (each part 120 characters, chapters at 1, 41 and 81)."""
+    return fields(bash(f"""
+tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"; mkdir "$tmpd/stream"
+for n in $(seq 1 100); do printf '%d\\tsome text\\n' $(( n * 120 )); done > "$tmpd/plan"
+printf '1\\tOne\\n41\\tTwo\\n81\\tThree\\n' > "$tmpd/chapters"
+{'echo "' + rate + '" > "$tmpd/rate"' if rate else ''}
+{'touch "$tmpd/stream/end"' if end else ''}
+NOVEL="{novel}"; speed={speed}
+chapters_load; time_left {part}; left_label
+echo "ch=$LEFT_CH"; echo "book=$LEFT_BOOK"; echo "secs=$LEFT_SECS"; echo "label=$LEFT_LABEL"
+""", prefix))
+
+
+def test_time_left_in_the_chapter_and_the_book():
+    with tempfile.TemporaryDirectory() as d:
+        f = time_left(d, 1)                      # 12000 characters at 20 a second: 600 s
+        assert (f["secs"], f["book"], f["ch"]) == ("600", "10m", "4m")      # chapter one: 40 parts, 240 s
+        assert f["label"] == "4m left in chapter · 10m in all"
+        f = time_left(d, 81, speed="2.0")        # twice as fast as it was measured: 20 parts in 60 s
+        assert (f["secs"], f["ch"]) == ("60", "1m")
+        f = time_left(d, 100, rate="")           # nothing made yet: Kokoro's usual pace (14 a second)
+        assert f["secs"] == "8" and f["book"] == "<1m"
+
+
+def test_a_novel_tells_only_the_chapter_until_its_end_is_known():
+    with tempfile.TemporaryDirectory() as d:
+        f = time_left(d, 50, novel="https://example.org/novel/x", end=False)
+        assert f["book"] == "" and f["secs"] == "" and f["ch"] == "3m"   # 31 parts, 186 s
+        assert f["label"] == "3m left in chapter"
+
+
+def test_durations_read_well():
+    out = bash("for s in 0 29 30 89 90 3569 3599 22200 36000 200000; do dur_label $s; printf '%s|' \"$REPLY\"; done", tempfile.mkdtemp())
+    assert out == "<1m|<1m|1m|1m|2m|59m|1h 0m|6h 10m|10h|56h|"
+
 if __name__ == "__main__":
     import sys
     fails = 0
