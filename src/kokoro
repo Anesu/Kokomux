@@ -178,10 +178,10 @@ usage() {        # kokoro --help
   printf '\n%sSpeak%s\n' "$B" "$R"
   opt_rows <<'ROWS'
 -p, --play|play as it's made
--o FILE|save as .wav .mp3 .ogg or .flac
+-o FILE|save as .wav .mp3 .ogg .flac, or .m4b for an audiobook
 -v VOICE|voice, e.g. af_heart, or a blend: af_heart:70+af_bella:30
 -s SPEED|0.5 to 2.0
--l LANG|en-us en-gb es fr-fr it pt-br hi
+-l LANG|en-us en-gb es fr-fr it pt-br hi ja cmn
 ROWS
   printf '\n%sRead from%s\n' "$B" "$R"
   opt_rows <<'ROWS'
@@ -607,7 +607,7 @@ done
 
 [[ "$voice" =~ $VOICE_RE ]] || die "\"$voice\" isn't a voice name." "One voice, like af_heart, or a blend, like af_heart:70+af_bella:30. See: kokoro --list-voices"
 [[ "$speed" =~ ^[0-9]*\.?[0-9]+$ ]] || die "Speed must be a number, like 1.2"
-[[ "$lang" =~ ^[A-Za-z0-9-]+$ ]] || die "\"$lang\" isn't a language code." "Try en-us, en-gb, es, fr-fr, it, pt-br or hi."
+[[ "$lang" =~ ^[A-Za-z0-9-]+$ ]] || die "\"$lang\" isn't a language code." "Try en-us, en-gb, es, fr-fr, it, pt-br, hi, ja or cmn."
 
 [ "$play" = 1 ] || out="${out:-$KOKORO_OUT}"
 ext=""
