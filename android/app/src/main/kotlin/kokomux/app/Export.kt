@@ -27,6 +27,8 @@ import kokomux.engine.Book
 import kokomux.engine.Books
 import kokomux.engine.Maker
 import kokomux.engine.VoiceId
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * Saving some of a book as an audiobook: its parts from one to another, made
@@ -49,15 +51,20 @@ class Export(context: Context, params: WorkerParameters) : CoroutineWorker(conte
         return try {
             val madeAt = if (VoiceId.makesAtSpeed(job.request.voice)) job.request.speed else 1f
             val cache = Maker.cacheDir(engine.cache, job.request.id, job.request.voice, madeAt, job.lang)
-            val speaker = engine.speaker(job.request.voice, job.request.speed, job.lang)
             val wavs = ArrayList<File>()
-            Maker(job.book, cache, speaker, ahead = Double.MAX_VALUE).run(job.from, { 0 }, { isStopped }, job.to) { made ->
-                wavs += made.wav
-                progress = wavs.size to total
-                setForegroundAsync(info(name, wavs.size, total))
+            // (hours of making, perhaps: on the threads for blocking work)
+            withContext(Dispatchers.IO) {
+                val speaker = engine.speaker(job.request.voice, job.request.speed, job.lang)
+                Maker(job.book, cache, speaker, ahead = Double.MAX_VALUE).run(job.from, { 0 }, { isStopped }, job.to) { made ->
+                    wavs += made.wav
+                    progress = wavs.size to total
+                    setForegroundAsync(info(name, wavs.size, total))
+                }
+                if (!isStopped) applicationContext.contentResolver.openFileDescriptor(job.uri, "rw")!!.use { fd ->
+                    encode(wavs, fd.fileDescriptor)
+                }
             }
             if (isStopped) return Result.failure()
-            applicationContext.contentResolver.openFileDescriptor(job.uri, "rw")!!.use { fd -> encode(wavs, fd.fileDescriptor) }
             Listening.note = "Saved: $name"
             Result.success()
         } catch (e: Throwable) {
