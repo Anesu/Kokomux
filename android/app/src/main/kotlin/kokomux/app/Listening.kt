@@ -5,6 +5,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import kokomux.app.ui.Sleep
 import kokomux.engine.Book
 import kokomux.engine.Maker
 
@@ -42,4 +43,6 @@ object Listening {
     val made = mutableStateListOf<Maker.Made>()
     /** How Kokoro ran for [made] (kokoro --benchmark's words). */
     var madeWith by mutableStateOf("")
+    /** The sleep timer, if it's set. */
+    var sleep by mutableStateOf<Sleep?>(null)
 }

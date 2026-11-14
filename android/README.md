@@ -4,30 +4,62 @@ kokomux as an Android app, for the same phone (a Samsung S26 Ultra), with
 the same rules: always the fp32 model and misaki, golden-ratio design, short
 plain wording. The Termux version in `src/` stays as it is.
 
-## What it does now (v0.2)
+## What it does now (v0.3)
 
-One screen, for now; the screens matching Termux's come next.
-
-- **Listen to a book, a file, a web page or a typed text.** **Open a book or
-  file** takes an EPUB, a PDF or a text file; **Web page** reads a page's
-  article, or one chapter of a web novel; the text box reads what's typed, in the
-  chosen voice. All 54 voices speak, in Kokoro's nine languages.
+- **Home**: what's playing, the bookshelf (books in progress, each with its
+  cover and how far through), and ways to start something new: open a file
+  (EPUB, PDF or text), read a web page (its article, or one chapter of a web
+  novel), read the clipboard (a copied link reads that page), or type
+  something. Below them, the voice.
+- **The reader**: the whole book in a reading column, the part being read on
+  the golden line with the spoken word lit, the text fading with its distance
+  from it (the focus effect); tap any part to hear it. Below: what's happening
+  and where, the progress bar (tap it to jump; it shows how far ahead parts are
+  made, and where chapters start), **Again**, **Play/Pause** and **Next**, and
+  the quieter **− speed +**, **Sleep**, **Chapters** and **Menu**.
+- **A new speed is heard at once**: the part playing carries on at it, pitch
+  kept, while the rest is made again at that speed. **A new voice** starts
+  again at the part you're on.
+- **The sleep timer** (15, 30 or 60 minutes, or the end of the chapter) fades
+  the voice over its last 13 seconds, counts only time spent playing, and keeps
+  your place. Carrying on after a minute away goes back 5 seconds first (10
+  after an hour).
 - **In the background**, with the notification's and the lock screen's
-  controls: one gapless playlist for the whole book, made about ten minutes
-  ahead of what's playing, as in Termux. On the screen: the book, the chapter,
-  the part being read, and **‹ Again**, **Pause**, **Next ›** and **Stop**.
-- **Books in progress** are on the shelf with their progress: tap one to carry
-  on where you stopped, in the voice it was in. A book heard to the end leaves
-  the shelf, with its kept audio.
-- **Made parts are kept** per book, voice, speed and language, so listening
-  again reuses them; the kept audio never grows past 50 GB, letting go of the
-  books heard least recently.
-- **The time each part took** (misaki and Kokoro separately), the speech it
-  made, and the real-time factor, to compare with `kokoro --benchmark`; the
-  text box starts with the benchmark's own text. The chips are the
-  benchmark's ways of running Kokoro (its own choice of threads, 2 to 8,
-  block 4): pick the one it kept in Termux.
-- **Check pronunciation** compares misaki here with engine.py's sounds.
+  controls: one gapless playlist, made about ten minutes ahead.
+- **Settings**, as Termux's: voice, speed, colours (auto, dark, light), the
+  focus effect, word highlighting and its timing; then how Kokoro runs
+  (`kokoro --benchmark`'s choices), how fast it makes speech here, the
+  pronunciation check, and the kept audio.
+- **The voice picker**: type to filter (`bf` is British and female), the
+  voices by language, the speaker to hear one say a line in its own language.
+
+## Design
+
+The Termux screens' rules (src/theme.sh, src/tui.sh), on a touch screen
+(`app/src/main/kotlin/kokomux/app/ui/Theme.kt`):
+
+- **The golden ratio throughout.** Spacing in Fibonacci dp (3, 5, 8, 13, 21,
+  34, 55, 89); type in √φ steps (10, 13, 16, 20, 26, 33 sp), the reading face
+  20 sp on 32 sp lines (φ); the part being read φ⁻² of the way down the reading
+  area; a screen's free space split 1 : φ above and below (the optical centre);
+  the play button φ times Again and Next (89 : 55 dp); covers as golden
+  rectangles; motion in Fibonacci milliseconds (144, 233, 377).
+- **Termux's palette.** Its dark and light colours, with greys in golden steps
+  (φ⁻¹ secondary text, ½ what's been heard, φ⁻² rules, φ⁻⁴ surfaces), and the
+  focus effect's fade a quarter golden step at a time, never below φ⁻⁴.
+- **Within reach.** The controls you use while listening are at the bottom,
+  where the thumb is; every target is at least 48 dp, the transport 55 and 89.
+- **One thing at a time.** One main action on each screen; how Kokoro runs and
+  the checks are in settings, out of everyday use.
+- **Words with the icons**, Termux's words: Again, Next, Sleep, Chapters,
+  Menu, Bookshelf, Start something new.
+- **Saying what's happening**: the reader's status line (playing, paused,
+  getting ready, made to, the sleep timer), "✓ Saved" in settings, and what
+  went wrong in plain words.
+
+`./gradlew :app:testDebugUnitTest` draws every screen (`app/build/screens/`),
+at the S26 Ultra's width and on DeX, dark and light, and taps through the
+flows; CI uploads the drawings (**screens**).
 
 ## How it works
 
@@ -115,17 +147,21 @@ with the model, and saves the screen before and after loading
 | `engine/…/Book.kt` | a book's parts and chapters, the text side's interface, book ids and languages |
 | `engine/…/Maker.kt` | engine.py's run_job: each part made and kept, ten minutes ahead of the player |
 | `engine/…/Bookmarks.kt` | where each book was left, as Termux's `.mark` files |
-| `app/src/main/kotlin/kokomux/app/ListenService.kt` | listening in the background: the playlist, the notification, the bookmark |
+| `app/src/main/kotlin/kokomux/app/ListenService.kt` | listening in the background: the playlist, the notification, the bookmark, speed, voice, the sleep timer |
+| `app/…/AppModel.kt` | the screens' state, from the service's and the settings; what each control does |
 | `app/…/Engine.kt` | what the app loads once: the models, Python, Kokoro, the bookmarks and kept parts |
-| `app/…/Listening.kt` | what's playing, shared by the service and the screen |
-| `app/…/Spike.kt` | the screen's state: download, load, open, the controls, the checks |
-| `app/…/Screen.kt`, `Theme.kt` | the screen, and the Termux palette (src/theme.sh) in Compose |
+| `app/…/Listening.kt` | what's playing, shared by the service and the screens |
+| `app/…/Store.kt` | the settings, under Termux's names |
+| `app/…/ui/Theme.kt`, `Glyphs.kt`, `Parts.kt` | the design system (golden ratio, Termux's palette), the icons, the shared pieces |
+| `app/…/ui/Home.kt`, `Reader.kt`, `Settings.kt`, `VoicesScreen.kt`, `Sheets.kt`, `FirstRun.kt` | the screens and the sheets |
+| `app/…/ui/App.kt`, `State.kt` | the screens together (where back goes), and what they show and can ask for |
 | `app/…/Text.kt`, `Models.kt` | the Python side, and downloading the model |
 | `app/src/main/python/kokomux_android.py` | what the app calls in Python (engine.py underneath) |
 | `app/src/main/cpp/CMakeLists.txt` | espeak-ng 1.52.0's library, built for arm64 |
 | `app/requirements.txt` | the phone's Python packages |
 | `app/build.gradle.kts` | the app's build, with the espeak data and wheels tasks |
-| `app/src/androidTest/…` | on the phone: pronunciation, reading, and a short text heard through the service |
+| `app/src/test/…/ui/` | the screens drawn and tapped through on this machine (Robolectric), and word timings |
+| `app/src/androidTest/…` | on the phone: pronunciation, reading, and a short text heard through the service (speed, sleep, the end) |
 | `tools/pronunciation.py`, `tools/golden.py` | engine.py's sounds and kokoro-onnx's speech, to check the app against |
 | `tools/test_text_side.py` | the app's Python side on this machine |
 | `tools/wheels.py` | wheels Chaquopy can't get from PyPI as they are |

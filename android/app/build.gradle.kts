@@ -1,5 +1,6 @@
-// The kokomux app: one screen for now (text, voice, Play), with misaki in
-// Python (Chaquopy) and Kokoro in Kotlin (:engine). Sideloaded, arm64 only.
+// The kokomux app: home, the reader, settings and voices (ui/), listening in
+// a background service, misaki in Python (Chaquopy) and Kokoro in Kotlin
+// (:engine). Sideloaded, arm64 only.
 import java.net.URI
 import java.security.MessageDigest
 import java.util.zip.ZipFile
@@ -19,8 +20,8 @@ android {
         applicationId = "kokomux.app"
         minSdk = 36                       // Android 16, what the S26 Ultra shipped with
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.3.0"
         ndk { abiFilters += "arm64-v8a" }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -41,6 +42,9 @@ android {
 
     // phonemizer loads espeak-ng by its path, so the library is kept as a file.
     packaging { jniLibs { useLegacyPackaging = true } }
+
+    // The screens are drawn on this machine too (Robolectric), to look at them: see src/test.
+    testOptions { unitTests { isIncludeAndroidResources = true } }
 
     // The instrumented tests read the repo's test fixtures (a PDF, recorded timings).
     sourceSets.getByName("androidTest").assets.directories.add("../../tests/fixtures")
@@ -142,7 +146,22 @@ dependencies {
     implementation(libs.media3.session)
     implementation(libs.coroutines.android)
 
+    testImplementation(libs.junit)
+    testImplementation(libs.robolectric)
+    testImplementation(platform(libs.compose.bom))
+    testImplementation(libs.compose.ui.test.junit4)
+    debugImplementation(libs.compose.ui.test.manifest)
+
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.junit)
+}
+
+// Screenshots of the screens (src/test): build/screens/*.png. The emulator's
+// system images come from Google's mirror of Maven Central, like the rest.
+tasks.withType<Test>().configureEach {
+    systemProperty("kokomux.screens", layout.buildDirectory.dir("screens").get().asFile.path)
+    systemProperty("robolectric.dependency.repo.url", "https://maven-central.storage-download.googleapis.com/maven2")
+    maxHeapSize = "4g"
+    jvmArgs("--add-opens=java.base/jdk.internal.access=ALL-UNNAMED", "--add-opens=java.base/java.io=ALL-UNNAMED")
 }

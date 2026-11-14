@@ -28,6 +28,13 @@ class ListenTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val context = instrumentation.targetContext
 
+    /** [read] on the main thread, where the controller lives. */
+    private fun <T> onMain(read: () -> T): T {
+        var got: T? = null
+        instrumentation.runOnMainSync { got = read() }
+        @Suppress("UNCHECKED_CAST") return got as T
+    }
+
     private fun until(what: String, minutes: Long, check: () -> Boolean) {
         val end = System.currentTimeMillis() + minutes * 60_000
         while (!check()) {
@@ -73,6 +80,24 @@ class ListenTest {
                 println("kokomux: part ${m.index}: ${"%.2f".format(m.speechSecs)} s of speech, " +
                     "misaki ${"%.2f".format(m.soundsSecs)} s, Kokoro ${"%.2f".format(m.kokoroSecs)} s")
             }
+
+            // A new speed: this part carries on sped up, the next is made again at it, and the bookmark keeps it.
+            instrumentation.runOnMainSync {
+                controller.sendCustomCommand(SessionCommand(ListenService.SPEED, Bundle.EMPTY), Bundle().apply { putFloat("speed", 1.5f) })
+            }
+            until("the next part to be made at the new speed", 15) { Listening.made.size == 3 || Listening.error.isNotEmpty() }
+            assertEquals("", Listening.error)
+            assertEquals(1.5f, Listening.now!!.request.speed)
+            assertEquals(1.5f, engine.bookmarks.get(id)?.speed)
+
+            // The sleep timer: the voice fades and stops, keeping its place.
+            instrumentation.runOnMainSync {
+                controller.sendCustomCommand(SessionCommand(ListenService.SLEEP, Bundle.EMPTY),
+                    Bundle().apply { putString("kind", "minutes"); putLong("ms", 1500) })
+                controller.play()
+            }
+            until("the sleep timer to stop it", 2) { Listening.sleep == null && !onMain { controller.isPlaying } }
+            assertTrue(Listening.now != null)
 
             // Heard to the end: the bookmark and the book's own copy go, as in Termux.
             instrumentation.runOnMainSync { controller.play() }

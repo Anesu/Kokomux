@@ -1,6 +1,6 @@
 # The Android app: build the debug APK (to install from the phone), test the
-# engine against kokoro-onnx, and check that the app's Python packages give
-# the sounds engine.py gives in the container.
+# engine against kokoro-onnx, draw and tap through the screens, and check that
+# the app's Python packages give the sounds engine.py gives in the container.
 name: Android
 
 on:
@@ -54,12 +54,18 @@ jobs:
         env:
           KOKOMUX_BUILD_PYTHON: ${{ env.pythonLocation }}/bin/python
           KOKOMUX_MODELS: ${{ github.workspace }}/models
-        run: ./gradlew --console=plain :engine:test :app:assembleDebug
+        run: ./gradlew --console=plain :engine:test :app:testDebugUnitTest :app:assembleDebug
 
       - name: The APK's size
         run: |
           ls -l android/app/build/outputs/apk/debug/app-debug.apk |
             awk '{printf "app-debug.apk: %.1f MB\n", $5 / 1e6}' | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: The screens, drawn by the tests
+        uses: actions/upload-artifact@v7
+        with:
+          name: screens
+          path: android/app/build/screens/
 
       - uses: actions/upload-artifact@v7
         with:

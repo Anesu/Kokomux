@@ -1,0 +1,378 @@
+package kokomux.app
+
+import android.app.Application
+import android.content.ClipboardManager
+import android.content.ComponentName
+import android.content.Context
+import android.net.Uri
+import android.os.Bundle
+import android.provider.OpenableColumns
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.session.MediaController
+import androidx.media3.session.SessionCommand
+import androidx.media3.session.SessionToken
+import kokomux.app.ui.Actions
+import kokomux.app.ui.Checked
+import kokomux.app.ui.Making
+import kokomux.app.ui.Playing
+import kokomux.app.ui.Prefs
+import kokomux.app.ui.Setup
+import kokomux.app.ui.ShelfBook
+import kokomux.app.ui.Sleep
+import kokomux.app.ui.UiState
+import kokomux.app.ui.Voices
+import kokomux.app.ui.WordSpan
+import kokomux.app.ui.wordSpans
+import kokomux.engine.Audio
+import kokomux.engine.Books
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.io.File
+
+/**
+ * What the screens show and what they can do: the screen's state made from
+ * the listening service's (Listening), the settings and the bookshelf; each
+ * action turned into a command to the service, or done here.
+ */
+class AppModel(app: Application) : AndroidViewModel(app), Actions {
+    private val engine = app.engine
+    private val store = Store(app)
+
+    private var prefs by mutableStateOf(store.load())
+    private var setup by mutableStateOf<Setup>(Setup.Missing)
+    private var shelf by mutableStateOf(emptyList<ShelfBook>())
+    private var voices by mutableStateOf(emptyList<String>())
+    private var playing by mutableStateOf(false)
+    private var loaded by mutableStateOf("")
+    private var checked by mutableStateOf<Checked?>(null)
+    private var checking by mutableStateOf(false)
+    private var kept by mutableStateOf(0L)
+    private var error by mutableStateOf("")
+    private var hearing by mutableStateOf("")
+    /** The part playing's word timings: (part, words). */
+    private var words by mutableStateOf(0 to emptyList<WordSpan>())
+    private val version = app.packageManager.getPackageInfo(app.packageName, 0).versionName.orEmpty()
+
+    private var controller: MediaController? = null
+    private val pending = mutableListOf<(MediaController) -> Unit>()   // asked for before the controller connected
+    private var preview: ExoPlayer? = null
+
+    init {
+        if (engine.models.ready()) load()
+        val token = SessionToken(app, ComponentName(app, ListenService::class.java))
+        val future = MediaController.Builder(app, token).buildAsync()
+        future.addListener({
+            val c = future.get()
+            c.addListener(object : Player.Listener {
+                override fun onIsPlayingChanged(isPlaying: Boolean) {
+                    playing = isPlaying
+                    refreshShelf()
+                }
+            })
+            playing = c.isPlaying
+            controller = c
+            pending.forEach { it(c) }
+            pending.clear()
+        }, ContextCompat.getMainExecutor(app))
+        refreshShelf()
+        // The part playing's word timings, read when it changes or is made.
+        viewModelScope.launch { snapshotFlow { Listening.at to Listening.made.size }.collect { readWords() } }
+    }
+
+    /** Everything the screens show (read while composing, so they follow every change). */
+    fun state(): UiState {
+        val now = Listening.now
+        val made = Listening.made.toList()
+        val fresh = made.filter { !it.kept }
+        return UiState(
+            setup = setup, prefs = prefs, shelf = shelf, opening = Listening.opening,
+            playing = now?.let { n ->
+                Playing(
+                    id = n.request.id, title = n.book.title, parts = n.book.parts.map { it.text }, chapters = n.book.chapters,
+                    at = Listening.at, playing = playing, madeTo = made.maxOfOrNull { it.index } ?: 0, making = Listening.making,
+                    voice = n.request.voice, speed = n.request.speed, sleep = Listening.sleep,
+                    words = if (words.first == Listening.at) words.second else emptyList(),
+                )
+            },
+            voices = voices,
+            making = if (fresh.isEmpty()) null else Making(fresh.size, fresh.sumOf { it.speechSecs },
+                fresh.sumOf { it.soundsSecs + it.kokoroSecs }, fresh.sumOf { it.kokoroSecs }, Listening.madeWith),
+            checked = checked, checking = checking, loaded = loaded, kept = kept,
+            error = error.ifEmpty { Listening.error }, hearing = hearing, version = version,
+        )
+    }
+
+    /** How far into the part playing the player is, in ms (for lighting the word being said). */
+    fun position(): Long = controller?.currentPosition ?: 0L
+
+    /** A web address on the clipboard, if there is one (to fill in "Read a web page"). */
+    fun link(): String = clipboard().takeIf { it.matches(URL) }.orEmpty()
+
+    private fun load() {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                setup = Setup.Loading("Kokoro")
+                // (if a book is playing, Kokoro is already loaded: it isn't loaded again under it)
+                if (engine.kokoro == null) engine.load(prefs.threads, prefs.block)
+                voices = engine.kokoro().voices.names
+                setup = Setup.Loading("misaki")
+                val misaki = engine.exclusive { engine.text.warm("en-us") + engine.text.warm("en-gb") }
+                loaded = "Kokoro loaded in ${"%.2f".format(engine.loadSeconds)} s, misaki and spaCy in ${"%.2f".format(misaki)} s"
+                setup = Setup.Ready
+            } catch (e: Throwable) {
+                setup = Setup.Failed(e.message ?: e.toString())
+            }
+        }
+    }
+
+    override fun download() {
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    var shown = -1L
+                    engine.models.download { label, done, total ->
+                        if (done - shown >= 1 shl 20 || done == total) {
+                            shown = done
+                            setup = Setup.Downloading(label, done, total)
+                        }
+                    }
+                }
+                load()
+            } catch (e: Exception) {
+                setup = Setup.Failed(e.message ?: e.toString())
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ opening
+
+    private fun open(id: String, kind: String, source: String, name: String) =
+        command(ListenService.OPEN, Request(id, kind, source, name, prefs.voice, prefs.speed).toBundle())
+
+    override fun openFile(uri: Uri) {
+        val resolver = getApplication<Application>().contentResolver
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val name = resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+                    if (it.moveToFirst()) it.getString(0) else null
+                } ?: "book"
+                engine.books.mkdirs()
+                val tmp = File(engine.books, "opened.tmp")
+                resolver.openInputStream(uri)!!.use { input -> tmp.outputStream().use { input.copyTo(it) } }
+                val id = Books.id(tmp.path)
+                val ext = name.substringAfterLast('.', "txt").lowercase().takeIf { it in setOf("epub", "pdf", "txt") } ?: "txt"
+                val file = File(engine.books, "$id.$ext")
+                tmp.renameTo(file)
+                withContext(Dispatchers.Main) { open(id, "file", file.path, name.substringBeforeLast('.')) }
+            } catch (e: Exception) {
+                error = "Couldn't open that file (${e.message})"
+            }
+        }
+    }
+
+    override fun openPage(address: String) = open(Books.id(address), "url", address, address)
+
+    override fun readClipboard() {
+        val text = clipboard().trim()
+        when {
+            text.isEmpty() -> error = "The clipboard is empty"
+            text.matches(URL) -> openPage(text)                          // a copied link reads that page
+            else -> readTyped(text)
+        }
+    }
+
+    override fun readTyped(text: String) {
+        val t = text.trim()
+        if (t.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            engine.books.mkdirs()
+            val tmp = File(engine.books, "typed.tmp").apply { writeText(t) }
+            val id = Books.id(tmp.path)
+            val file = File(engine.books, "$id.txt")
+            tmp.renameTo(file)
+            val words = t.split(Regex("\\s+"))
+            val name = words.take(6).joinToString(" ") + if (words.size > 6) "…" else ""
+            withContext(Dispatchers.Main) { open(id, "text", file.path, name) }
+        }
+    }
+
+    override fun resume(id: String) {
+        val m = engine.bookmarks.get(id) ?: return
+        command(ListenService.OPEN, Request(m.id, m.kind, m.source, m.title, m.voice, m.speed).toBundle())
+    }
+
+    override fun remove(id: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            engine.bookmarks.remove(id)
+            File(engine.cache, id).deleteRecursively()
+            engine.books.listFiles { f -> f.name.startsWith("$id.") }?.forEach { it.delete() }
+            refreshShelf()
+        }
+    }
+
+    // ------------------------------------------------------------ listening
+
+    override fun playPause() = withController { if (it.isPlaying) it.pause() else it.play() }
+    override fun again() = withController { it.seekTo(0) }
+    override fun next() = withController { it.seekToNextMediaItem() }
+    override fun stop() = command(ListenService.STOP)
+    override fun jump(part: Int) = command(ListenService.JUMP, Bundle().apply { putInt("part", part) })
+
+    override fun speed(speed: Float) {
+        prefs(prefs.copy(speed = speed))
+        if (Listening.now != null) command(ListenService.SPEED, Bundle().apply { putFloat("speed", speed) })
+    }
+
+    override fun sleep(choice: Sleep?) = command(ListenService.SLEEP, Bundle().apply {
+        when (choice) {
+            is Sleep.Minutes -> { putString("kind", "minutes"); putLong("ms", choice.leftMs) }
+            Sleep.EndOfChapter -> putString("kind", "chapter")
+            null -> putString("kind", "off")
+        }
+    })
+
+    override fun voice(voice: String) {
+        prefs(prefs.copy(voice = voice))
+        if (Listening.now != null) command(ListenService.VOICE, Bundle().apply { putString("voice", voice) })
+    }
+
+    /** A voice saying a line in its own language, the book paused meanwhile (tui.sh's voice_sample). */
+    override fun hear(voice: String) {
+        if (hearing.isNotEmpty() || setup != Setup.Ready) return
+        hearing = voice
+        val file = File(getApplication<Application>().cacheDir, "sample.wav")
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                engine.exclusive {
+                    val sounds = engine.text.speakable(Voices.sample(voice), Books.langOf(voice))
+                    Audio.writeWav(file, engine.kokoro().speak(sounds.sounds, voice, prefs.speed).samples)
+                }
+                withContext(Dispatchers.Main) {
+                    val resume = controller?.isPlaying == true
+                    controller?.pause()
+                    val p = preview ?: ExoPlayer.Builder(getApplication()).build().also { preview = it }
+                    p.clearMediaItems()
+                    p.addListener(object : Player.Listener {
+                        override fun onPlaybackStateChanged(state: Int) {
+                            if (state != Player.STATE_ENDED) return
+                            p.removeListener(this)
+                            hearing = ""
+                            if (resume) controller?.play()
+                        }
+                    })
+                    p.setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
+                    p.prepare()
+                    p.play()
+                }
+            } catch (e: Throwable) {
+                hearing = ""
+                error = e.message ?: e.toString()
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ settings and checks
+
+    override fun prefs(prefs: Prefs) {
+        val before = this.prefs
+        this.prefs = prefs
+        store.save(prefs)
+        if (prefs.threads != before.threads || prefs.block != before.block) {
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    val secs = engine.load(prefs.threads, prefs.block)
+                    loaded = "Kokoro loaded in ${"%.2f".format(secs)} s (${engine.tuning()})"
+                } catch (e: Throwable) {
+                    error = e.message ?: e.toString()
+                }
+            }
+        }
+    }
+
+    override fun check() {
+        if (checking) return
+        checking = true
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val r = JSONObject(engine.exclusive { engine.text.check() })
+                val differ = r.getJSONArray("differ")
+                checked = Checked(r.getInt("cases"), r.getDouble("seconds"), (0 until differ.length()).map {
+                    val d = differ.getJSONObject(it)
+                    Triple("${d.getString("lang")}: ${d.getString("text")}", d.getString("want"), d.getString("got"))
+                })
+            } catch (e: Throwable) {
+                error = e.message ?: e.toString()
+            } finally {
+                checking = false
+            }
+        }
+    }
+
+    override fun clearKept() {
+        viewModelScope.launch(Dispatchers.IO) {
+            engine.cache.listFiles()?.forEach { it.deleteRecursively() }
+            refreshShelf()
+        }
+    }
+
+    override fun dismissError() {
+        error = ""
+        Listening.error = ""
+    }
+
+    /** The bookshelf, from the bookmarks, and the kept audio's size. */
+    fun refreshShelf() {
+        viewModelScope.launch(Dispatchers.IO) {
+            shelf = engine.bookmarks.all().map { ShelfBook(it.id, it.title, it.part, it.parts, it.voice) }
+            kept = engine.cache.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+        }
+    }
+
+    /** The part playing's word timings, from its .words file (byte ranges in its text, as the Termux player reads them). */
+    private fun readWords() {
+        val at = Listening.at
+        val text = Listening.now?.book?.parts?.getOrNull(at - 1)?.text ?: return
+        val file = Listening.made.lastOrNull { it.index == at }?.words ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val spans = wordSpans(text, runCatching { file.readLines() }.getOrDefault(emptyList()))
+            words = at to spans
+        }
+    }
+
+    // ------------------------------------------------------------ the service
+
+    private fun command(action: String, args: Bundle = Bundle.EMPTY) = withController {
+        error = ""
+        it.sendCustomCommand(SessionCommand(action, Bundle.EMPTY), args)
+    }
+
+    private fun withController(then: (MediaController) -> Unit) {
+        val c = controller
+        if (c != null) then(c) else pending += then
+    }
+
+    private fun clipboard(): String {
+        val cm = getApplication<Application>().getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        return cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(getApplication())?.toString().orEmpty()
+    }
+
+    override fun onCleared() {
+        controller?.release()
+        preview?.release()
+    }
+
+    companion object {
+        private val URL = Regex("^https?://\\S+$")
+    }
+}
