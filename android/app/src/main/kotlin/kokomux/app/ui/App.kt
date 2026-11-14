@@ -75,8 +75,12 @@ fun KokomuxApp(state: UiState, position: () -> Long, link: () -> String, actions
             if (uri != null && parts != null) actions.saveAudiobook(uri, parts.first, parts.second)
             saveParts = null
         }
+        // Something new is shown in the reader, unless a book is playing: then it waits in Up next.
+        fun opened() {
+            if (state.playing == null) go(Screen.READER)
+        }
         val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-            if (uri != null) { actions.openFile(uri); go(Screen.READER) }
+            if (uri != null) { actions.openFile(uri); opened() }
         }
         // Something being opened (shared to the app, or the widget's play) is shown in the reader.
         LaunchedEffect(state.opening) { if (state.opening && screen != Screen.READER) go(Screen.READER) }
@@ -112,8 +116,14 @@ fun KokomuxApp(state: UiState, position: () -> Long, link: () -> String, actions
             }
         }
 
+        // Something just added to Up next: said for a moment, with the way to hear it now instead.
+        val added = state.added
+        if (added != null && sheet == null) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+            LaunchedEffect(added) { delay(5000); actions.dismissAdded() }
+            Bar("Up next: ${added.title}", "Play now", Modifier.safeDrawingPadding()) { actions.playQueued(added.id); go(Screen.READER) }
+        }
         // A word for a moment ("Saved: …", "Up to date: …"), over whichever screen.
-        if (state.note.isNotEmpty() && sheet == null) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+        if (state.note.isNotEmpty() && added == null && sheet == null) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
             LaunchedEffect(state.note) { delay(5000); actions.dismissError() }
             Bar(state.note, "OK", Modifier.safeDrawingPadding(), actions::dismissError)
         }
@@ -131,8 +141,8 @@ fun KokomuxApp(state: UiState, position: () -> Long, link: () -> String, actions
                 }
                 Sheet.SLEEP -> if (p != null) SleepSheet(p) { actions.sleep(it); sheet = null }
                 Sheet.SPEED -> SpeedSheet(p?.speed ?: state.prefs.speed, actions::speed)
-                Sheet.PAGE -> WebSheet(link(), state, actions) { actions.openPage(it); go(Screen.READER) }
-                Sheet.TYPE -> TypeSheet { actions.readTyped(it); go(Screen.READER) }
+                Sheet.PAGE -> WebSheet(link(), state, actions) { actions.openPage(it); sheet = null; opened() }
+                Sheet.TYPE -> TypeSheet { actions.readTyped(it); sheet = null; opened() }
                 Sheet.SAVED -> SavedSheet(state.passages.filter { it.book == p?.id }, actions) { sheet = null }
                 Sheet.AUDIOBOOK -> if (p != null) AudiobookSheet(p, state.saving) { what, from, to ->
                     saveParts = from to to

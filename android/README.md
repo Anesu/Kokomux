@@ -60,6 +60,9 @@ plain wording. The Termux version in `src/` stays as it is.
   reader that follow every change; then how Kokoro runs (`kokoro --benchmark`'s
   choices), how fast the voice in use makes speech here, the pronunciation
   check, the kept audio and each engine's files (with Remove).
+- **Up next**: something opened or shared while a book is playing waits its
+  turn, and is heard when the book ends (a bar says so, with **Play now**).
+  Home lists what's waiting: tap one to hear it now, × to take it out.
 - **A backup** (Settings, **Backup**): **Save** writes one file where you
   choose, with the bookshelf and the books' own copies, the listens, the saved
   passages, the voices you made and the settings. **Restore** adds a backup to
@@ -220,6 +223,7 @@ with the model, and saves the screen before and after loading
 | `engine/…/Maker.kt` | engine.py's run_job: each part made and kept, ten minutes ahead of the player |
 | `engine/…/Bookmarks.kt` | where each book was left, as Termux's `.mark` files |
 | `engine/…/Stats.kt` | the listens kept, and what they add up to |
+| `engine/…/UpNext.kt` | what's waiting to be heard, as Termux's queue file |
 | `engine/…/Plain.kt` | what went wrong, in a few plain words to show |
 | `engine/…/Backup.kt` | a backup: what's in the file, and how one is added to what's on the phone |
 | `engine/…/ming/` | Ming-3.0-tts's host side (from its Android sample, MIT: see `LICENSE` there) and its speaker |

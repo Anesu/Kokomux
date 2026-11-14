@@ -74,6 +74,9 @@ class ScreensTest {
     @Test fun homeDark() = shot("home-dark", ThemeMode.DARK, home)
     @Test fun homeLight() = shot("home-light", ThemeMode.LIGHT, home)
     @Test @Config(qualifiers = WIDE) fun homeWide() = shot("home-wide", ThemeMode.LIGHT, home)
+    @Test fun homeUpNext() = shot("home-up-next", ThemeMode.DARK) {
+        HomeScreen(Fake.state.copy(upNext = Fake.upNext, shelf = Fake.shelf.take(2)), Fake.actions, {}, {}, {}, {}, {}, {})
+    }
     @Test fun homeEmpty() = shot("home-empty", ThemeMode.DARK) {
         HomeScreen(Fake.state.copy(shelf = emptyList(), playing = null), Fake.actions, {}, {}, {}, {}, {}, {})
     }

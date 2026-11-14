@@ -40,7 +40,8 @@ import kotlinx.coroutines.delay
 
 /**
  * The home screen (tui.sh's tui_home): the voice new things are read in, and
- * settings; what's playing; four ways to start something new; the bookshelf
+ * settings; what's playing; four ways to start something new (while a book
+ * plays, it waits in Up next); what's waiting in Up next; the bookshelf
  * of books in progress (one taken off it can be brought back for 5 s). On
  * the optical centre when there's room.
  */
@@ -85,7 +86,7 @@ fun HomeScreen(
             val tiles: List<Pair<Pair<ImageVector, String>, () -> Unit>> = listOf(
                 (Glyphs.file to "File") to onOpenFile,
                 (Glyphs.globe to "Web page") to onPage,
-                (Glyphs.paste to "Clipboard") to { actions.readClipboard(); onReader() },
+                (Glyphs.paste to "Clipboard") to { actions.readClipboard(); if (state.playing == null) onReader() },
                 (Glyphs.type to "Type") to onType,
             )
             BoxWithConstraints {
@@ -108,6 +109,15 @@ fun HomeScreen(
             if (state.passages.isNotEmpty()) ListRow(Glyphs.bookmark, "Saved",
                 if (state.passages.size == 1) "1 passage" else "${state.passages.size} passages",
                 trailing = { Icon(Glyphs.forward, null, Modifier.size(Space.l - 3.dp), tint = t.dim) }, onClick = onSaved)
+
+            if (state.upNext.isNotEmpty()) {
+                Spacer(Modifier.height(Space.s))
+                SectionTitle("Up next")
+                for (q in state.upNext) ListRow(
+                    when (q.kind) { "url" -> Glyphs.globe; "text" -> Glyphs.type; else -> Glyphs.file }, q.title,
+                    trailing = { GlyphButton(Glyphs.close, "Take ${q.title} out of Up next") { actions.unqueue(q.id) } },
+                ) { actions.playQueued(q.id); onReader() }
+            }
 
             val shelf = state.shelf.filter { it.id != state.playing?.id && it.id != removal?.book?.id }
             if (shelf.isNotEmpty()) {

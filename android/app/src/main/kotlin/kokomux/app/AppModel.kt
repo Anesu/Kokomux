@@ -26,6 +26,7 @@ import kokomux.app.ui.Saved
 import kokomux.app.ui.Making
 import kokomux.app.ui.Playing
 import kokomux.app.ui.Prefs
+import kokomux.app.ui.Queued
 import kokomux.app.ui.Setup
 import kokomux.app.ui.ShelfBook
 import kokomux.app.ui.Sleep
@@ -36,6 +37,7 @@ import kokomux.app.ui.wordSpans
 import kokomux.engine.Backup
 import kokomux.engine.Book
 import kokomux.engine.Books
+import kokomux.engine.UpNext
 import kokomux.engine.VoiceId
 import kokomux.engine.plain
 import kotlinx.coroutines.Dispatchers
@@ -63,6 +65,8 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
     private var error by mutableStateOf("")
     private var stats by mutableStateOf<kokomux.engine.Stats?>(null)
     private var passages by mutableStateOf(emptyList<Saved>())
+    private var upNext by mutableStateOf(emptyList<Queued>())
+    private var added by mutableStateOf<Queued?>(null)
     /** The part playing's word timings: (part, words). */
     private var words by mutableStateOf(0 to emptyList<WordSpan>())
     private val version = app.packageManager.getPackageInfo(app.packageName, 0).versionName.orEmpty()
@@ -127,7 +131,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
             recording = studio.recording, clip = studio.clip, cloning = studio.cloning,
             toc = novels.toc.map { e -> e.copy(now = now?.book?.chapterOf(Listening.at.coerceAtLeast(1))?.url == e.url) },
             tocLoading = novels.tocLoading, found = novels.found, searching = novels.searching, stats = stats, passages = passages,
-            saving = Export.progress,
+            saving = Export.progress, upNext = upNext, added = added,
         )
     }
 
@@ -190,8 +194,44 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
 
     // ------------------------------------------------------------ opening
 
-    private fun open(id: String, kind: String, source: String, name: String) =
-        command(ListenService.OPEN, Request(id, kind, source, name, prefs.voice, prefs.speed).toBundle())
+    /** Listen to something new: now, or after what's playing (it waits in Up next). */
+    private fun open(id: String, kind: String, source: String, name: String) {
+        if (Listening.now == null && !Listening.opening) return play(UpNext.Item(id, kind, source, name))
+        if (id == Listening.now?.request?.id) return
+        viewModelScope.launch(Dispatchers.IO) {
+            engine.upNext.add(UpNext.Item(id, kind, source, name))
+            refreshQueue()
+            added = Queued(id, name, kind)
+        }
+    }
+
+    private fun play(item: UpNext.Item) =
+        command(ListenService.OPEN, Request(item.id, item.kind, item.source, item.title, prefs.voice, prefs.speed).toBundle())
+
+    // ------------------------------------------------------------ Up next
+
+    override fun playQueued(id: String) {
+        added = null
+        engine.upNext.all().firstOrNull { it.id == id }?.let(::play)
+    }
+
+    override fun unqueue(id: String) {
+        if (added?.id == id) added = null
+        viewModelScope.launch(Dispatchers.IO) {
+            val gone = engine.upNext.remove(id)
+            // (its own copy goes too, unless it's a book on the shelf)
+            if (gone != null && gone.kind != "url" && engine.bookmarks.get(id) == null) File(gone.source).delete()
+            refreshQueue()
+        }
+    }
+
+    override fun dismissAdded() {
+        added = null
+    }
+
+    private fun refreshQueue() {
+        upNext = engine.upNext.all().map { Queued(it.id, it.title, it.kind) }
+    }
 
     override fun openFile(uri: Uri) {
         val resolver = getApplication<Application>().contentResolver
@@ -463,9 +503,10 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
         Listening.note = ""
     }
 
-    /** The bookshelf, from the bookmarks, and the kept audio's size. */
+    /** The bookshelf, from the bookmarks, what's waiting in Up next, and the kept audio's size. */
     fun refreshShelf() {
         viewModelScope.launch(Dispatchers.IO) {
+            refreshQueue()
             shelf = engine.bookmarks.all().map {
                 val latest = if (it.kind == "novel") engine.novels.known(it.novel)?.latest ?: it.number else 0
                 ShelfBook(it.id, it.title, it.part, it.parts, it.voice, it.chapter, it.number, maxOf(latest, it.number), it.done)

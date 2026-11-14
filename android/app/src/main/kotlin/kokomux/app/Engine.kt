@@ -11,6 +11,7 @@ import kokomux.engine.Speakable
 import kokomux.engine.Speaker
 import kokomux.engine.TextSide
 import kokomux.engine.Timing
+import kokomux.engine.UpNext
 import kokomux.engine.VoiceId
 import kokomux.engine.ming.Ming
 import kokomux.engine.ming.MingSpeaker
@@ -58,6 +59,8 @@ class Engine(private val context: Context) {
     val cache = File(context.filesDir, "kokomux-cache")
     /** Passages saved while listening. */
     val passages = Passages(File(context.filesDir, "passages.tsv"))
+    /** What's waiting to be heard after what's playing. */
+    val upNext = UpNext(File(context.filesDir, "queue.tsv"))
     /** The listens, for the stats. */
     val stats = File(context.filesDir, "stats/listens.tsv")
     /** Web novels' chapters, kept as they're fetched. */

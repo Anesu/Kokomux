@@ -55,6 +55,7 @@ import kotlinx.coroutines.withContext
  *    next is fetched (or taken from those kept ahead) and added on the end;
  *    its bookmark is the novel's, the chapter and the part in it, and stays,
  *    done, once the latest chapter has been heard
+ *  - when a book ends, what's first in Up next is listened to
  *
  * The sleep timer is [SleepTimer]'s and the listens are [ListenLog]'s.
  *
@@ -154,6 +155,7 @@ class ListenService : MediaSessionService() {
         Listening.made.clear()
         Listening.unpaced()
         reading = read(request) { b, lang ->
+            engine.upNext.remove(request.id)       // (it isn't waiting any more)
             // A novel's chapter is the novel's: its bookmark, if it's in this chapter (or heard to the end of it).
             val r = b.novel?.let { n -> request.copy(id = Books.id(n.url), kind = "novel", source = b.chapters.first().url) } ?: request
             val mark = engine.bookmarks.get(r.id)?.takeIf { b.novel == null || it.source == r.source }
@@ -456,6 +458,7 @@ class ListenService : MediaSessionService() {
     private fun finished() {
         val now = Listening.now ?: return
         val id = now.request.id
+        val sleep = Listening.sleep as? Sleep.Minutes
         making?.cancel()
         log.finished(now.book, at)
         val b = book
@@ -473,6 +476,18 @@ class ListenService : MediaSessionService() {
         player.clearMediaItems()
         book = null
         request = null
+        playNext(sleep)
+    }
+
+    /**
+     * What's first in Up next, if anything is waiting, in the voice and at the speed of the
+     * settings; a sleep timer counting minutes ([sleep]) carries on through it.
+     */
+    private fun playNext(sleep: Sleep.Minutes?) {
+        val next = engine.upNext.all().firstOrNull() ?: return
+        val prefs = Store(this).load()
+        open(Request(next.id, next.kind, next.source, next.title, prefs.voice, prefs.speed))
+        if (sleep != null) sleepTimer.set(sleep)
     }
 
     private fun failed(message: String) {

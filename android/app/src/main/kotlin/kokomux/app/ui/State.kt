@@ -28,6 +28,9 @@ data class ShelfBook(val id: String, val title: String, val part: Int, val parts
     val fresh get() = if (novel) (latest - number).coerceAtLeast(0) else 0
 }
 
+/** Something waiting in Up next: its id, its title, and what it is ("url", "file" or "text"). */
+data class Queued(val id: String, val title: String, val kind: String)
+
 /** A chapter in a novel's list: its number, label and address, whether it's been heard, and whether it's the one playing. */
 data class TocEntry(val number: Int, val label: String, val url: String, val heard: Boolean, val now: Boolean)
 
@@ -153,9 +156,15 @@ data class UiState(
     /** Novels found by name, and whether a search is going. */
     val found: List<Found> = emptyList(),
     val searching: Boolean = false,
+    /** What's waiting to be heard after what's playing, in order; and the one just added (to say so for a moment). */
+    val upNext: List<Queued> = emptyList(),
+    val added: Queued? = null,
 )
 
-/** What the screens can ask for. */
+/**
+ * What the screens can ask for. Something opened (a file, a page, the clipboard, typed text)
+ * while a book is playing waits in Up next, and is heard when the book ends.
+ */
 interface Actions {
     fun download()
     fun openFile(uri: android.net.Uri)
@@ -164,6 +173,10 @@ interface Actions {
     fun readTyped(text: String)
     fun resume(id: String)
     fun remove(id: String)
+    /** Hear something waiting in Up next now; take it out of Up next; stop saying one was just added. */
+    fun playQueued(id: String)
+    fun unqueue(id: String)
+    fun dismissAdded()
     fun playPause()
     /** Back to the start of the part, or to the one before if it has only just started (any player's ⏮). */
     fun previous()
