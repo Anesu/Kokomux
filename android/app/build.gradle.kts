@@ -1,6 +1,7 @@
 // The kokomux app: home, the reader, settings and voices (ui/), listening in
-// a background service, misaki in Python (Chaquopy) and Kokoro in Kotlin
-// (:engine). Sideloaded, arm64 only.
+// a background service, misaki in Python (Chaquopy), and the engines in Kotlin
+// (:engine): Kokoro and Qwen on ONNX Runtime, Ming on the NPU through LiteRT.
+// Sideloaded, arm64 only.
 import java.net.URI
 import java.security.MessageDigest
 import java.util.zip.ZipFile
@@ -20,8 +21,8 @@ android {
         applicationId = "kokomux.app"
         minSdk = 36                       // Android 16, what the S26 Ultra shipped with
         targetSdk = 36
-        versionCode = 7
-        versionName = "0.4.3"
+        versionCode = 8
+        versionName = "0.5.0"
         ndk { abiFilters += "arm64-v8a" }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -40,8 +41,15 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    // phonemizer loads espeak-ng by its path, so the library is kept as a file.
-    packaging { jniLibs { useLegacyPackaging = true } }
+    // phonemizer loads espeak-ng by its path, and the NPU opens its Hexagon library from the
+    // app's library folder, so libraries are kept as files. Of Qualcomm's runtime, only what
+    // the S26 Ultra's NPU (Hexagon v81) uses goes in.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+            excludes += listOf("**/libQnnDsp*.so", "**/libQnnGpu.so", "**/libQnnHtpV6*.so", "**/libQnnHtpV7*.so")
+        }
+    }
 
     // The screens are drawn on this machine too (Robolectric), to look at them: see src/test.
     testOptions { unitTests { isIncludeAndroidResources = true } }
@@ -138,6 +146,9 @@ androidComponents {
 dependencies {
     implementation(project(":engine"))
     implementation(libs.onnxruntime.android)
+    implementation(libs.litert)
+    implementation(libs.litert.npu.qualcomm)
+    implementation(libs.qnn.runtime)
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.material3)
     implementation(libs.compose.ui)

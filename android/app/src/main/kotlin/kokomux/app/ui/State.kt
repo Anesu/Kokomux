@@ -1,6 +1,7 @@
 package kokomux.app.ui
 
 import kokomux.engine.Chapter
+import kokomux.engine.VoiceId
 
 /** Getting ready on first run: Kokoro's files to fetch, fetching, loading, ready, or stuck. */
 sealed interface Setup {
@@ -60,11 +61,24 @@ data class Prefs(
     val block: Int = 0,
 )
 
-/** How fast Kokoro made the parts of this listen. */
-data class Making(val parts: Int, val speech: Double, val took: Double, val kokoro: Double, val tuning: String) {
+/** How fast the voice made the parts of this listen: [engine] is its name ("Kokoro", "Ming 3.0"). */
+data class Making(val parts: Int, val speech: Double, val took: Double, val voice: Double, val engine: String, val tuning: String) {
     val realTime get() = speech / took
-    val kokoroRealTime get() = speech / kokoro
+    val voiceRealTime get() = speech / voice
 }
+
+/**
+ * An engine's files on this phone: its id (kokomux.engine.VoiceId's), its name, how big
+ * they are and how much is here; [done] is how far a download has got (-1: none going).
+ */
+data class EngineFiles(val id: String, val title: String, val total: Long, val have: Long = 0, val done: Long = -1,
+                       val error: String = "") {
+    val ready get() = have >= total
+    val downloading get() = done >= 0
+}
+
+/** A clip to make a voice from: how long it is, and whether it's playing back. */
+data class Clip(val seconds: Double, val playing: Boolean = false)
 
 /** A pronunciation check: how many parts, and which sound different from engine.py's. */
 data class Checked(val cases: Int, val seconds: Double, val differ: List<Triple<String, String, String>>)
@@ -91,6 +105,16 @@ data class UiState(
     val hearing: String = "",
     /** The app's version. */
     val version: String = "",
+    /** Kokoro's, Ming's and Qwen's files. */
+    val engines: List<EngineFiles> = emptyList(),
+    /** An engine getting ready for its first listen on this phone, in words ("" when none is). */
+    val preparing: String = "",
+    /** Recording a clip for a new voice: how long so far, and how loud it is now (0 to 1); null when not. */
+    val recording: Pair<Double, Float>? = null,
+    /** The clip recorded or picked, for a new voice. */
+    val clip: Clip? = null,
+    /** A new voice is being made from the clip. */
+    val cloning: Boolean = false,
 )
 
 /** What the screens can ask for. */
@@ -114,23 +138,71 @@ interface Actions {
     fun sleep(choice: Sleep?)
     fun voice(voice: String)
     fun hear(voice: String)
+    /** Download an engine's files (kokomux.engine.VoiceId's id), or let them go. */
+    fun fetchEngine(id: String)
+    fun removeEngine(id: String)
+    /** A clip for a new voice: recorded from the microphone, or picked from the phone's files. */
+    fun record()
+    fun stopRecording()
+    fun pickClip(uri: android.net.Uri)
+    fun playClip()
+    fun dropClip()
+    /** A voice made from the clip, its [words] (blank if not known), [name] and language; it becomes the voice. */
+    fun makeVoice(words: String, name: String, lang: String)
+    fun forgetVoice(voice: String)
     fun prefs(prefs: Prefs)
     fun check()
     fun clearKept()
     fun dismissError()
 }
 
-/** engine.py's LANGS: a voice's first letter is its language. */
+/**
+ * The voices, whichever engine they're in: Kokoro's (engine.py's LANGS: a
+ * voice's first letter is its language), Ming's built-in ones ("ming:US_Emma")
+ * and those cloned with Qwen ("qwen:en-us:Anna").
+ */
 object Voices {
     val languages = listOf(
         'a' to "American English", 'b' to "British English", 'e' to "Spanish", 'f' to "French",
         'h' to "Hindi", 'i' to "Italian", 'j' to "Japanese", 'p' to "Brazilian Portuguese", 'z' to "Mandarin Chinese",
     )
 
-    fun language(voice: String) = languages.firstOrNull { it.first == voice.firstOrNull() }?.second ?: "Other"
-    fun gender(voice: String) = if (voice.getOrNull(1) == 'm') "male" else "female"
-    /** "bf_emma" -> "Emma". */
-    fun name(voice: String) = voice.substringAfter('_').replaceFirstChar { it.uppercase() }
+    /** Ming's built-in voices. */
+    val ming = listOf("US_Emma", "US_James", "US_Stella", "UK_George", "UK_Charlotte", "灵小萌", "灵岩", "灵小雅").map { "ming:$it" }
+    private val mingMale = setOf("US_James", "UK_George", "灵岩")
+
+    /** The languages a cloned voice can read: kokomux's code and its name. */
+    val cloneLanguages = listOf(
+        "en-us" to "American English", "en-gb" to "British English", "es" to "Spanish", "fr-fr" to "French",
+        "it" to "Italian", "pt-br" to "Brazilian Portuguese", "ja" to "Japanese", "cmn" to "Mandarin Chinese",
+    )
+
+    /** The engines, in the order they're shown: id and name. */
+    val engines = listOf(VoiceId.KOKORO to "Kokoro", VoiceId.MING to "Ming 3.0", VoiceId.QWEN to "Qwen3-TTS")
+
+    fun engine(voice: String) = VoiceId.engine(voice)
+    fun engineTitle(voice: String) = engines.first { it.first == engine(voice) }.second
+
+    fun language(voice: String): String = when (engine(voice)) {
+        VoiceId.MING -> VoiceId.name(voice).let {
+            if (it.startsWith("US_")) "American English" else if (it.startsWith("UK_")) "British English" else "Mandarin Chinese"
+        }
+        VoiceId.QWEN -> voice.split(':').getOrNull(1).let { l -> cloneLanguages.firstOrNull { it.first == l }?.second ?: "English" }
+        else -> languages.firstOrNull { it.first == voice.firstOrNull() }?.second ?: "Other"
+    }
+
+    fun gender(voice: String) = when (engine(voice)) {
+        VoiceId.MING -> if (VoiceId.name(voice) in mingMale) "male" else "female"
+        VoiceId.QWEN -> "cloned"
+        else -> if (voice.getOrNull(1) == 'm') "male" else "female"
+    }
+
+    /** "bf_emma" -> "Emma", "ming:UK_George" -> "George", "qwen:en-us:Anna" -> "Anna". */
+    fun name(voice: String) = when (engine(voice)) {
+        VoiceId.KOKORO -> voice.substringAfter('_').replaceFirstChar { it.uppercase() }
+        else -> VoiceId.name(voice).substringAfter('_')
+    }
+
     /** "American English" -> "American", "Brazilian Portuguese" -> "Portuguese": a language in a word. */
     fun shortLanguage(name: String) = when {
         name.endsWith(" English") -> name.substringBefore(' ')
@@ -142,15 +214,26 @@ object Voices {
     fun describe(voice: String) = "${language(voice)}, ${gender(voice)}"
 
     /** A line in the voice's own language, to hear it by (tui.sh's TUI_SAMPLE). */
-    fun sample(voice: String) = when (voice.firstOrNull()) {
-        'e' -> "¡Hola! Así sueno cuando leo para ti."
-        'f' -> "Bonjour ! Voici ma voix quand je lis pour vous."
-        'i' -> "Ciao! Ecco come suono quando leggo per te."
-        'p' -> "Olá! É assim que eu soo lendo para você."
-        'h' -> "नमस्ते! मैं ऐसे पढ़कर सुनाती हूँ।"
-        'j' -> "こんにちは。私はこんな声で読みます。"
-        'z' -> "你好！我就是这样为你朗读的。"
+    fun sample(voice: String) = when (kokomux.engine.Books.langOf(voice).take(2)) {
+        "es" -> "¡Hola! Así sueno cuando leo para ti."
+        "fr" -> "Bonjour ! Voici ma voix quand je lis pour vous."
+        "it" -> "Ciao! Ecco come suono quando leggo per te."
+        "pt" -> "Olá! É assim que eu soo lendo para você."
+        "hi" -> "नमस्ते! मैं ऐसे पढ़कर सुनाती हूँ।"
+        "ja" -> "こんにちは。私はこんな声で読みます。"
+        "cm" -> "你好！我就是这样为你朗读的。"
         else -> "Hello! This is how I sound when I read to you."
+    }
+
+    /** What to read aloud for a new voice: a few seconds of plain, varied speech in its language. */
+    fun passage(lang: String) = when (lang.take(2)) {
+        "es" -> "La biblioteca olía a lluvia y a papel viejo, y cada estante guardaba una historia esperando a ser contada."
+        "fr" -> "La bibliothèque sentait la pluie et le vieux papier, et chaque étagère gardait une histoire prête à être racontée."
+        "it" -> "La biblioteca profumava di pioggia e di carta antica, e ogni scaffale custodiva una storia da raccontare."
+        "pt" -> "A biblioteca cheirava a chuva e a papel antigo, e cada estante guardava uma história esperando para ser contada."
+        "ja" -> "図書館は雨と古い紙の匂いがして、どの棚にも語られるのを待つ物語がありました。"
+        "cm" -> "图书馆里弥漫着雨水和旧纸的气味，每一个书架上都藏着一个等待被讲述的故事。"
+        else -> "The quiet library smelled of rain and old paper, and every shelf held a story waiting to be told."
     }
 }
 

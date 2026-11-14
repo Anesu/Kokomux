@@ -91,6 +91,19 @@ object Glyphs {
         moveTo(4f, 20f); lineTo(5f, 15.5f); lineTo(15.5f, 5f); lineTo(19f, 8.5f); lineTo(8.5f, 19f); close()
         moveTo(13f, 7.5f); lineTo(16.5f, 11f)
     }
+    val mic = glyph("microphone") {
+        moveTo(9f, 6f); arcTo(3f, 3f, 0f, false, true, 15f, 6f); lineTo(15f, 11f)
+        arcTo(3f, 3f, 0f, false, true, 9f, 11f); close()
+        moveTo(5.5f, 11f); arcTo(6.5f, 6.5f, 0f, false, false, 18.5f, 11f); moveTo(12f, 17.5f); lineTo(12f, 21f)
+    }
+    val download = glyph("download") {
+        moveTo(12f, 4f); lineTo(12f, 15f); moveTo(7f, 10.5f); lineTo(12f, 15.5f); lineTo(17f, 10.5f)
+        moveTo(5f, 19.5f); lineTo(19f, 19.5f)
+    }
+    val trash = glyph("remove") {
+        moveTo(5f, 7f); lineTo(19f, 7f); moveTo(10f, 7f); lineTo(10f, 4.5f); lineTo(14f, 4.5f); lineTo(14f, 7f)
+        moveTo(7f, 7f); lineTo(8f, 19.5f); lineTo(16f, 19.5f); lineTo(17f, 7f)
+    }
     val check = glyph("check") { moveTo(5f, 12.5f); lineTo(10f, 17.5f); lineTo(19f, 7f) }
     val plus = glyph("plus") { moveTo(6f, 12f); lineTo(18f, 12f); moveTo(12f, 6f); lineTo(12f, 18f) }
     val minus = glyph("minus") { moveTo(6f, 12f); lineTo(18f, 12f) }

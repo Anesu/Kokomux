@@ -4,10 +4,19 @@ import android.app.Application
 import android.content.Context
 import android.os.PowerManager
 import kokomux.engine.Bookmarks
+import kokomux.engine.Books
 import kokomux.engine.Kokoro
+import kokomux.engine.KokoroSpeaker
 import kokomux.engine.Speakable
+import kokomux.engine.Speaker
 import kokomux.engine.TextSide
 import kokomux.engine.Timing
+import kokomux.engine.VoiceId
+import kokomux.engine.ming.Ming
+import kokomux.engine.ming.MingSpeaker
+import kokomux.engine.qwen.Clone
+import kokomux.engine.qwen.Qwen
+import kokomux.engine.qwen.QwenSpeaker
 import java.io.File
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -20,20 +29,29 @@ class KokomuxApp : Application() {
 /** The app's [Engine]. */
 val Context.engine: Engine get() = (applicationContext as KokomuxApp).engine
 
+/** A voice cloned with Qwen: its id ("qwen:en-us:Anna"), the name it was given, and what it's made of. */
+class Cloned(val voice: String, val name: String, val file: File)
+
 /**
- * What the phone needs once: the model files, the text side (Python),
- * Kokoro (loaded once, and again when how it runs changes), the bookmarks,
- * the books and the kept parts. One thing at a time uses Python and the model
+ * What the phone needs once: each engine's files, the text side (Python),
+ * Kokoro (loaded once, and again when how it runs changes), Ming and Qwen
+ * (loaded when one of their voices is wanted; one of the two at a time, as
+ * each takes gigabytes), the voices cloned with Qwen, the bookmarks, the books
+ * and the kept parts. One thing at a time uses Python and a model
  * ([exclusive]), as engine.py's SYNTH_LOCK has it, with the CPU kept awake.
  */
 class Engine(private val context: Context) {
-    val models = Models(File(context.filesDir, "models"))
+    val kokoroFiles = Pack.kokoro(context.filesDir)
+    val mingFiles = Pack.ming(context.filesDir)
+    val qwenFiles = Pack.qwen(context.filesDir)
     val text = Text(context)
     /** Books opened or typed (<id>.epub, .pdf, .txt) and their bookmarks (<id>.mark), as Termux's $BOOKS. */
     val books = File(context.filesDir, "books")
     val bookmarks = Bookmarks(books)
     /** Made parts, kept per book and settings, as Termux's $PREFIX/tmp/kokomux-cache. */
     val cache = File(context.filesDir, "kokomux-cache")
+    /** Voices cloned with Qwen: <hash>.qwen (the voice) and <hash>.voice (its id). */
+    val clones = File(context.filesDir, "voices")
 
     private val lock = ReentrantLock()
     private val wake = (context.getSystemService(Context.POWER_SERVICE) as PowerManager)
@@ -41,6 +59,8 @@ class Engine(private val context: Context) {
 
     @Volatile var kokoro: Kokoro? = null
         private set
+    @Volatile private var ming: Ming? = null
+    @Volatile private var qwen: Qwen? = null
     /** How onnxruntime runs Kokoro, as kokoro --benchmark tries it: threads (0: its own choice) and block. */
     @Volatile var threads = 0
         private set
@@ -50,7 +70,7 @@ class Engine(private val context: Context) {
     @Volatile var loadSeconds = 0.0
         private set
 
-    /** Run [work] with Python and the model to itself, the CPU awake. */
+    /** Run [work] with Python and the models to itself, the CPU awake. */
     fun <T> exclusive(work: () -> T): T = lock.withLock {
         wake.acquire(10 * 60 * 1000L)
         try {
@@ -70,9 +90,33 @@ class Engine(private val context: Context) {
         this.threads = threads
         this.block = block
         val t0 = System.nanoTime()
-        kokoro = Kokoro(models.model, models.voices, threads, block)
+        kokoro = Kokoro(kokoroFiles.file(Pack.KOKORO_MODEL), kokoroFiles.file(Pack.KOKORO_VOICES), threads, block)
         loadSeconds = (System.nanoTime() - t0) / 1e9
         loadSeconds
+    }
+
+    /** Ming on the NPU, loaded if it isn't yet (Qwen let go first); [preparing] hears of a first load's compiling. */
+    fun ming(preparing: (Int, Int) -> Unit = { _, _ -> }): Ming = exclusive {
+        ming ?: run {
+            qwen?.close()
+            qwen = null
+            Ming(mingFiles.dir, MingNpu.graphs(context, mingFiles.dir, preparing)).also { ming = it }
+        }
+    }
+
+    /** Qwen, loaded if it isn't yet (Ming let go first). */
+    fun qwen(): Qwen = exclusive {
+        qwen ?: run {
+            ming?.close()
+            ming = null
+            Qwen(qwenFiles.dir).also { qwen = it }
+        }
+    }
+
+    /** Let go of an engine whose files are being removed. */
+    fun unload(engine: String) = exclusive {
+        if (engine == VoiceId.MING) { ming?.close(); ming = null }
+        if (engine == VoiceId.QWEN) { qwen?.close(); qwen = null }
     }
 
     /** "its own choice", "6 threads, block 4": kokoro --benchmark's words. */
@@ -85,4 +129,65 @@ class Engine(private val context: Context) {
         override fun wordRows(text: String, lang: String, speakable: Speakable, timings: List<Timing>) =
             exclusive { this@Engine.text.wordRows(text, lang, speakable, timings) }
     }
+
+    /**
+     * The speaker for [voice] reading text in [lang] at [speed] (Kokoro's: the others are made at
+     * 1× and sped up as they play). Loads the engine it needs; call it off the main thread.
+     */
+    fun speaker(voice: String, speed: Float, lang: String, preparing: (Int, Int) -> Unit = { _, _ -> }): Speaker =
+        when (VoiceId.engine(voice)) {
+            VoiceId.MING -> {
+                val m = ming(preparing)
+                val s = MingSpeaker(m, VoiceId.name(voice), if (lang == "cmn") "zh" else "en")
+                Speaker { t -> exclusive { s.say(t) } }
+            }
+            VoiceId.QWEN -> {
+                val q = qwen()
+                val clone = cloned(voice) ?: error("That voice is gone")
+                val s = QwenSpeaker(q, Clone.load(clone.file), QwenSpeaker.language(lang) ?: "auto")
+                Speaker { t -> exclusive { s.say(t) } }
+            }
+            else -> {
+                val k = kokoro()
+                KokoroSpeaker(textSide, lang) { sounds -> exclusive { k.speak(sounds, voice, speed) } }
+            }
+        }
+
+    /** Every voice cloned with Qwen, in the order they were made. */
+    fun cloned(): List<Cloned> = clones.listFiles { f -> f.name.endsWith(".qwen") }.orEmpty().sortedBy { it.lastModified() }
+        .mapNotNull { f ->
+            val voice = File(clones, f.name.removeSuffix(".qwen") + ".voice").takeIf { it.exists() }?.readText()?.trim()
+            voice?.let { Cloned(it, VoiceId.name(it), f) }
+        }
+
+    fun cloned(voice: String): Cloned? = File(clones, "${fileOf(voice)}.qwen").takeIf { it.exists() }
+        ?.let { Cloned(voice, VoiceId.name(voice), it) }
+
+    /** A cloned voice's files are named by its id's hash (its name can be anything). */
+    private fun fileOf(voice: String) = kokomux.engine.Books.id(voice.replace("qwen:", "https://qwen/"))
+
+    /**
+     * A new voice from [clip] (24 kHz mono) and its [words] (blank if they aren't known), named
+     * [name] (made unique), reading [lang]; returns its id ("qwen:en-us:Anna").
+     */
+    fun clone(clip: FloatArray, words: String, name: String, lang: String): String {
+        val made = exclusive { qwen().clone(clip, words) }
+        clones.mkdirs()
+        val base = name.replace(':', ' ').replace('\n', ' ').trim().ifEmpty { "My voice" }
+        val taken = cloned().map { VoiceId.name(it.voice) }.toSet()
+        val unique = generateSequence(1) { it + 1 }.map { if (it == 1) base else "$base $it" }.first { it !in taken }
+        val voice = "qwen:$lang:$unique"
+        File(clones, "${fileOf(voice)}.voice").writeText(voice)
+        made.save(File(clones, "${fileOf(voice)}.qwen"))
+        return voice
+    }
+
+    /** Forget a cloned voice. */
+    fun forget(voice: String) {
+        File(clones, "${fileOf(voice)}.qwen").delete()
+        File(clones, "${fileOf(voice)}.voice").delete()
+    }
+
+    /** The language [voice] reads. */
+    fun langOf(voice: String) = Books.langOf(voice)
 }

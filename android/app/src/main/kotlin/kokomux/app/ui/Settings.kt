@@ -61,8 +61,8 @@ import androidx.compose.ui.unit.dp
 /**
  * Settings (tui.sh's tui_settings): the voice and speed; how reading looks,
  * shown in a sample of the reader that follows every change; how Kokoro runs
- * on this phone and how fast; the kept audio; the versions. A change is kept
- * as it's made.
+ * on this phone and how fast the voice is making speech; the engines' files
+ * and the kept audio; the versions. A change is kept as it's made.
  */
 @Composable
 fun SettingsScreen(state: UiState, actions: Actions, onBack: () -> Unit, onVoices: () -> Unit) {
@@ -110,9 +110,11 @@ fun SettingsScreen(state: UiState, actions: Actions, onBack: () -> Unit, onVoice
 
             SectionTitle("Storage")
             KeptAudio(state, actions)
+            for (e in state.engines) EngineStorage(e, actions, onVoices)
 
             SectionTitle("About")
-            Dim("kokomux ${state.version}\nKokoro 82M v1.0, fp32 · misaki 0.7.4 · spaCy 3.8.7 · espeak-ng 1.52.0")
+            Dim("kokomux ${state.version}\nKokoro 82M v1.0, fp32 · misaki 0.7.4 · spaCy 3.8.7 · espeak-ng 1.52.0\n" +
+                "Ming-3.0-tts 0.5B on the NPU (LiteRT 2.3.2, QNN 2.47) · Qwen3-TTS 0.6B Base, 4-bit")
         }
     }
 }
@@ -248,18 +250,37 @@ private fun Tuning(prefs: Prefs, enabled: Boolean, set: (Prefs) -> Unit) {
     }
 }
 
-/** How fast speech was made this listen: times real time, all in and Kokoro alone. */
+/** How fast speech was made this listen: times real time, all in and the voice alone. */
 @Composable
 private fun HowFast(m: Making) {
     val t = LocalTokens.current
     Row(Modifier.fillMaxWidth().padding(vertical = Space.s), verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(Space.m)) {
-        Text("${"%.1f".format(m.realTime)}×", style = Type.headline, color = t.accent2)
+        Text("${"%.1f".format(m.realTime)}×", style = Type.headline, color = if (m.realTime >= 1) t.accent2 else t.red)
         Column(Modifier.weight(1f)) {
             Text("real time", style = Type.label, color = t.fg)
-            Dim("Kokoro ${"%.1f".format(m.kokoroRealTime)}× · ${m.parts} parts · ${m.tuning}", maxLines = 2)
+            Dim(listOf("${m.engine} ${"%.1f".format(m.voiceRealTime)}×", "${m.parts} parts", m.tuning)
+                .filter { it.isNotEmpty() }.joinToString(" · "), maxLines = 2)
         }
     }
+}
+
+/** An engine's files: how much they take up, and letting them go (Kokoro's stay); one not here yet leads to its download. */
+@Composable
+private fun EngineStorage(e: EngineFiles, actions: Actions, onVoices: () -> Unit) {
+    var asking by remember { mutableStateOf(false) }
+    Line(e.title, onClick = if (e.ready || e.id == "kokoro") null else onVoices) {
+        Dim(if (e.ready) sizeLabel(e.total) else if (e.downloading) "${sizeLabel(e.done, e.total)} of ${sizeLabel(e.total)}"
+            else "Not here", Modifier.padding(end = Space.s))
+        if (e.id != "kokoro" && e.ready) TextButton(onClick = { asking = true }) { Text("Remove", style = Type.label) }
+    }
+    if (asking) AlertDialog(
+        onDismissRequest = { asking = false },
+        confirmButton = { TextButton(onClick = { asking = false; actions.removeEngine(e.id) }) { Text("Remove") } },
+        dismissButton = { TextButton(onClick = { asking = false }) { Text("Cancel") } },
+        title = { Text("Remove ${e.title}?", style = Type.title) },
+        text = { Text("${sizeLabel(e.total)} back. Its voices come back with it.", style = Type.body) },
+    )
 }
 
 /** The pronunciation check: misaki here against engine.py's sounds; what differs, if anything. */

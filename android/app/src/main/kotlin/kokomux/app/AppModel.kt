@@ -23,6 +23,8 @@ import androidx.media3.session.SessionToken
 import java.io.File
 import kokomux.app.ui.Actions
 import kokomux.app.ui.Checked
+import kokomux.app.ui.Clip
+import kokomux.app.ui.EngineFiles
 import kokomux.app.ui.Making
 import kokomux.app.ui.Playing
 import kokomux.app.ui.Prefs
@@ -36,6 +38,7 @@ import kokomux.app.ui.wordSpans
 import kokomux.engine.Audio
 import kokomux.engine.Book
 import kokomux.engine.Books
+import kokomux.engine.VoiceId
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -61,6 +64,12 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
     private var kept by mutableStateOf(0L)
     private var error by mutableStateOf("")
     private var hearing by mutableStateOf("")
+    private var engineFiles by mutableStateOf(emptyMap<String, EngineFiles>())
+    private var recording by mutableStateOf<Pair<Double, Float>?>(null)
+    private var clip by mutableStateOf<Clip?>(null)
+    private var clipSamples: FloatArray? = null
+    private var recorder: Clips.Recorder? = null
+    private var cloning by mutableStateOf(false)
     /** The part playing's word timings: (part, words). */
     private var words by mutableStateOf(0 to emptyList<WordSpan>())
     private val version = app.packageManager.getPackageInfo(app.packageName, 0).versionName.orEmpty()
@@ -70,7 +79,8 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
     private var preview: ExoPlayer? = null
 
     init {
-        if (engine.models.ready()) load()
+        if (engine.kokoroFiles.ready()) load()
+        refreshEngines()
         val token = SessionToken(app, ComponentName(app, ListenService::class.java))
         val future = MediaController.Builder(app, token).buildAsync()
         future.addListener({
@@ -109,9 +119,13 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
             },
             voices = voices,
             making = if (fresh.isEmpty()) null else Making(fresh.size, fresh.sumOf { it.speechSecs },
-                fresh.sumOf { it.soundsSecs + it.kokoroSecs }, fresh.sumOf { it.kokoroSecs }, Listening.madeWith),
+                fresh.sumOf { it.prepSecs + it.voiceSecs }, fresh.sumOf { it.voiceSecs },
+                Voices.engineTitle(now?.request?.voice ?: prefs.voice),
+                if (VoiceId.engine(now?.request?.voice ?: prefs.voice) == VoiceId.KOKORO) Listening.madeWith else ""),
             checked = checked, checking = checking, loaded = loaded, kept = kept,
             error = error.ifEmpty { Listening.error }, hearing = hearing, version = version,
+            engines = Voices.engines.mapNotNull { engineFiles[it.first] }, preparing = Listening.preparing,
+            recording = recording, clip = clip, cloning = cloning,
         )
     }
 
@@ -141,7 +155,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
                 setup = Setup.Loading("Kokoro")
                 // (if a book is playing, Kokoro is already loaded: it isn't loaded again under it)
                 if (engine.kokoro == null) engine.load(prefs.threads, prefs.block)
-                voices = engine.kokoro().voices.names
+                voices = engine.kokoro().voices.names + Voices.ming + engine.cloned().map { it.voice }
                 setup = Setup.Loading("misaki")
                 val misaki = engine.exclusive { engine.text.warm("en-us") + engine.text.warm("en-gb") }
                 loaded = "Kokoro loaded in ${"%.2f".format(engine.loadSeconds)} s, misaki and spaCy in ${"%.2f".format(misaki)} s"
@@ -157,10 +171,10 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
             try {
                 withContext(Dispatchers.IO) {
                     var shown = -1L
-                    engine.models.download { label, done, total ->
+                    engine.kokoroFiles.download { done, total ->
                         if (done - shown >= 1 shl 20 || done == total) {
                             shown = done
-                            setup = Setup.Downloading(label, done, total)
+                            setup = Setup.Downloading("Kokoro", done, total)
                         }
                     }
                 }
@@ -264,6 +278,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
 
     override fun voice(voice: String) {
         prefs(prefs.copy(voice = voice))
+        refreshVoices()
         if (Listening.now != null) command(ListenService.VOICE, Bundle().apply { putString("voice", voice) })
     }
 
@@ -274,10 +289,8 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
         val file = File(getApplication<Application>().cacheDir, "sample.wav")
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                engine.exclusive {
-                    val sounds = engine.text.speakable(Voices.sample(voice), Books.langOf(voice))
-                    Audio.writeWav(file, engine.kokoro().speak(sounds.sounds, voice, prefs.speed).samples)
-                }
+                val said = engine.speaker(voice, prefs.speed, Books.langOf(voice)).say(Voices.sample(voice))
+                Audio.writeWav(file, said.samples, said.rate)
                 withContext(Dispatchers.Main) {
                     val resume = controller?.isPlaying == true
                     controller?.pause()
@@ -292,6 +305,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
                         }
                     })
                     p.setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
+                    p.setPlaybackSpeed(if (VoiceId.makesAtSpeed(voice)) 1f else prefs.speed)
                     p.prepare()
                     p.play()
                 }
@@ -299,6 +313,161 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
                 hearing = ""
                 error = e.message ?: e.toString()
             }
+        }
+    }
+
+    // ------------------------------------------------------------ engines and new voices
+
+    private fun pack(id: String) = when (id) {
+        VoiceId.MING -> engine.mingFiles
+        VoiceId.QWEN -> engine.qwenFiles
+        else -> engine.kokoroFiles
+    }
+
+    /** What each engine has on the phone. */
+    private fun refreshEngines() {
+        viewModelScope.launch(Dispatchers.IO) {
+            engineFiles = Voices.engines.associate { (id, title) ->
+                val p = pack(id)
+                id to (engineFiles[id]?.takeIf { it.downloading } ?: EngineFiles(id, title, p.total,
+                    if (p.ready()) p.total else p.size().coerceAtMost(p.total - 1)))
+            }
+        }
+    }
+
+    override fun fetchEngine(id: String) {
+        if (engineFiles[id]?.downloading == true) return
+        val p = pack(id)
+        engineFiles = engineFiles + (id to EngineFiles(id, p.title, p.total, done = 0))
+        viewModelScope.launch(Dispatchers.IO) {
+            var shown = -1L
+            try {
+                p.download { done, total ->
+                    if (done - shown >= 4 shl 20 || done == total) {
+                        shown = done
+                        engineFiles = engineFiles + (id to EngineFiles(id, p.title, total, done = done))
+                    }
+                }
+                engineFiles = engineFiles + (id to EngineFiles(id, p.title, p.total, p.total))
+            } catch (e: Exception) {
+                engineFiles = engineFiles + (id to EngineFiles(id, p.title, p.total, p.size(), error = e.message ?: e.toString()))
+            }
+        }
+    }
+
+    override fun removeEngine(id: String) {
+        if (id == VoiceId.KOKORO) return
+        if (VoiceId.engine(prefs.voice) == id) prefs(prefs.copy(voice = Prefs().voice))
+        viewModelScope.launch(Dispatchers.IO) {
+            engine.unload(id)
+            pack(id).remove()
+            refreshEngines()
+        }
+    }
+
+    override fun record() {
+        if (recorder != null) return
+        clip = null
+        clipSamples = null
+        recording = 0.0 to 0f
+        recorder = Clips.Recorder { secs, level -> viewModelScope.launch { if (recorder != null) recording = secs to level } }
+            .also { it.start() }
+    }
+
+    override fun stopRecording() {
+        val r = recorder ?: return
+        recorder = null
+        viewModelScope.launch(Dispatchers.IO) {
+            val pcm = r.stop()
+            recording = null
+            useClip(pcm)
+        }
+    }
+
+    override fun pickClip(uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                useClip(Clips.decode(getApplication(), uri))
+            } catch (e: Exception) {
+                error = "Couldn't read that clip (${e.message})"
+            }
+        }
+    }
+
+    private fun useClip(pcm: FloatArray) {
+        if (pcm.size < Clips.RATE) {
+            error = "That clip is too short: a few seconds of speaking is right"
+            return
+        }
+        clipSamples = pcm
+        clip = Clip(pcm.size.toDouble() / Clips.RATE)
+        Audio.writeWav(File(getApplication<Application>().cacheDir, "clip.wav"), pcm, Clips.RATE)
+    }
+
+    override fun playClip() {
+        val c = clip ?: return
+        val p = preview ?: ExoPlayer.Builder(getApplication()).build().also { preview = it }
+        if (c.playing) {
+            p.stop()
+            clip = c.copy(playing = false)
+            return
+        }
+        controller?.pause()
+        p.clearMediaItems()
+        p.setPlaybackSpeed(1f)
+        p.addListener(object : Player.Listener {
+            override fun onPlaybackStateChanged(state: Int) {
+                if (state != Player.STATE_ENDED && state != Player.STATE_IDLE) return
+                p.removeListener(this)
+                clip = clip?.copy(playing = false)
+            }
+        })
+        p.setMediaItem(MediaItem.fromUri(Uri.fromFile(File(getApplication<Application>().cacheDir, "clip.wav"))))
+        p.prepare()
+        p.play()
+        clip = c.copy(playing = true)
+    }
+
+    override fun dropClip() {
+        recorder?.stop()
+        recorder = null
+        recording = null
+        clip = null
+        clipSamples = null
+    }
+
+    override fun makeVoice(words: String, name: String, lang: String) {
+        val pcm = clipSamples ?: return
+        if (cloning) return
+        cloning = true
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val voice = engine.clone(pcm, words, name, lang)
+                withContext(Dispatchers.Main) {
+                    dropClip()
+                    voice(voice)
+                }
+            } catch (e: Throwable) {
+                error = e.message ?: e.toString()
+            } finally {
+                cloning = false
+            }
+        }
+    }
+
+    override fun forgetVoice(voice: String) {
+        if (prefs.voice == voice) prefs(prefs.copy(voice = Prefs().voice))
+        viewModelScope.launch(Dispatchers.IO) {
+            engine.forget(voice)
+            refreshVoices()
+        }
+    }
+
+    /** Every voice there is: Kokoro's, Ming's, and those cloned with Qwen. */
+    private fun refreshVoices() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val kokoro = engine.kokoro?.voices?.names ?: voices.filter { VoiceId.engine(it) == VoiceId.KOKORO }
+            voices = kokoro + Voices.ming + engine.cloned().map { it.voice }
         }
     }
 

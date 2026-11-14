@@ -49,11 +49,40 @@ jobs:
           [ -s models/voices-v1.0.bin ] || curl -fsSL -o models/voices-v1.0.bin \
             https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
 
+      # Ming's host files (its tokenizer's tables and small tensors, 15 MB: its graphs run only
+      # on the phone's NPU) and Qwen's files as the app downloads them (1.7 GB), for their tests.
+      - name: Ming's host files and Qwen, for the engine's tests
+        uses: actions/cache@v6
+        with:
+          path: |
+            ming
+            qwen
+          key: ming-3db0f978-qwen-2b18c0a0-177cd39e
+
+      - name: Download them if they aren't cached
+        run: |
+          mkdir -p ming qwen
+          M=https://huggingface.co/litert-community/Ming-3.0-tts-0.5B/resolve/3db0f978908bc5f9c503850045853d8301e4b203
+          for f in tokenizer_vocab.txt tokenizer_merges.txt tokenizer_added.txt char_classes.bin stop_head.bin istft_window.bin temb_epss10.bin; do
+            [ -s ming/$f ] || curl -fsSL -o ming/$f $M/$f
+          done
+          Q=https://huggingface.co/onnx-community/Qwen3-TTS-12Hz-0.6B-Base/resolve/2b18c0a044a190e35f1a907779aa51cda0fb1fff/cpu_int4
+          for f in text_embed talker_cache tok_decoder tok_encoder speaker_encoder; do
+            [ -s qwen/$f.onnx ] || curl -fsSL -o qwen/$f.onnx $Q/$f.onnx
+          done
+          W=https://huggingface.co/wavekat/Qwen3-TTS-0.6B-Base-ONNX/resolve/177cd39e2ddab0d4d7ce5152a7abc2d382621158
+          for f in int4/code_predictor.onnx int4/code_predictor.onnx.data embeddings/talker_codec_embedding.npy \
+                   $(seq -f 'embeddings/cp_codec_embedding_%g.npy' 0 14); do
+            [ -s qwen/$(basename $f) ] || curl -fsSL -o qwen/$(basename $f) $W/$f
+          done
+
       - name: Test the engine and build the APK
         working-directory: android
         env:
           KOKOMUX_BUILD_PYTHON: ${{ env.pythonLocation }}/bin/python
           KOKOMUX_MODELS: ${{ github.workspace }}/models
+          KOKOMUX_MING: ${{ github.workspace }}/ming
+          KOKOMUX_QWEN: ${{ github.workspace }}/qwen
         run: ./gradlew --console=plain :engine:test :app:testDebugUnitTest :app:assembleDebug
 
       - name: The APK's size

@@ -28,6 +28,7 @@ import kokomux.engine.Bookmarks
 import kokomux.engine.Books
 import kokomux.engine.Maker
 import kokomux.engine.ReadError
+import kokomux.engine.VoiceId
 
 /**
  * Listening, in the background: one ExoPlayer plays the whole book as a
@@ -137,7 +138,6 @@ class ListenService : MediaSessionService() {
         Thread({
             try {
                 val lang = Books.langOf(request.voice)
-                engine.kokoro()
                 val b = engine.textSide.read(request.source, request.name, lang)
                 Maker.trim(engine.cache, request.id, CACHE_LIMIT)
                 main.post { if (run == runs) then(b, lang) }
@@ -186,15 +186,17 @@ class ListenService : MediaSessionService() {
         }
         Listening.making = true
         val engine = engine
-        val cache = Maker.cacheDir(engine.cache, r.id, r.voice, r.speed, lang)
+        val madeAt = madeAt(r)
+        val cache = Maker.cacheDir(engine.cache, r.id, r.voice, madeAt, lang)
         val lang = lang
         Thread({
             try {
-                val kokoro = engine.kokoro()
-                val maker = Maker(b, cache, engine.textSide, lang, { sounds ->
-                    engine.exclusive { kokoro.speak(sounds, r.voice, r.speed) }
-                })
-                maker.run(from, { at }, { stop.get() }) { made -> main.post { if (run == runs) queue(b, made, r.speed) } }
+                val speaker = engine.speaker(r.voice, r.speed, lang) { graph, of ->
+                    main.post { if (run == runs) Listening.preparing = "Getting Ming ready for this phone · $graph of $of" }
+                }
+                main.post { if (run == runs) Listening.preparing = "" }
+                val maker = Maker(b, cache, speaker)
+                maker.run(from, { at }, { stop.get() }) { made -> main.post { if (run == runs) queue(b, made, madeAt) } }
                 if (!stop.get()) main.post {
                     if (run != runs) return@post
                     allMade = true
@@ -207,10 +209,13 @@ class ListenService : MediaSessionService() {
         }, "kokomux-making").start()
     }
 
+    /** The speed [r]'s parts are made at: Kokoro's own, 1× for the others (the player speeds them up). */
+    private fun madeAt(r: Request) = if (VoiceId.makesAtSpeed(r.voice)) r.speed else 1f
+
     /** Append a made part to the playlist (made at [speed]), and start playing with the first. */
     private fun queue(b: Book, made: Maker.Made, speed: Float) {
         Listening.made += made
-        Listening.paced(b.parts[made.index - 1].text.length, made.speechSecs * speed)
+        Listening.paced(b.parts[made.index - 1].text.length, made.seconds * speed)
         val chapter = b.chapterOf(made.index)?.title?.takeIf { b.chapters.size > 1 }
         player.addMediaItem(
             MediaItem.Builder()
@@ -255,16 +260,19 @@ class ListenService : MediaSessionService() {
         player.play()
     }
 
-    /** A new speed, heard at once: this part sped up (pitch kept), the rest made again at it. */
+    /**
+     * A new speed, heard at once: this part sped up (pitch kept), and for Kokoro the rest made
+     * again at it (the other voices are made at 1× and only played faster).
+     */
     private fun speed(speed: Float) {
         val r = request ?: return
         if (speed == r.speed || speed !in 0.5f..2f) return
         request = r.copy(speed = speed)
         Listening.now = Listening.now?.let { Listening.Now(request!!, it.book, it.first, it.lang) }
-        val madeAt = player.currentMediaItem?.mediaId?.substringAfter('@')?.toFloatOrNull() ?: r.speed
+        val madeAt = player.currentMediaItem?.mediaId?.substringAfter('@')?.toFloatOrNull() ?: madeAt(r)
         player.playbackParameters = PlaybackParameters(speed / madeAt)
         // (before the first part plays, everything is made again from where it starts)
-        startMaking(if (at > 0) at + 1 else first, keepPlaying = at > 0)
+        if (VoiceId.makesAtSpeed(r.voice)) startMaking(if (at > 0) at + 1 else first, keepPlaying = at > 0)
         arrivedBookmark()
     }
 
@@ -276,6 +284,7 @@ class ListenService : MediaSessionService() {
         val from = at.coerceAtLeast(1)
         Listening.unpaced()
         if (Books.langOf(voice) == lang) {
+            Listening.preparing = ""
             request = next
             Listening.now = Listening.now?.let { Listening.Now(next, it.book, it.first, it.lang) }
             startMaking(from, keepPlaying = false)
@@ -383,6 +392,7 @@ class ListenService : MediaSessionService() {
 
     private fun failed(message: String) {
         Listening.error = message
+        Listening.preparing = ""
         Listening.opening = false
         Listening.making = false
     }

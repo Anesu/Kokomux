@@ -9,8 +9,11 @@ kokomux is a **personal** app: Kokoro text-to-speech in Termux on one phone, a
 Samsung S26 Ultra with 1 TB of storage (sometimes in DeX with a keyboard and
 mouse). Build for that phone, not for every device:
 
-- Always full precision (the fp32 model) and misaki pronunciation. Don't add
-  quality options, smaller models or fallbacks for weaker hardware.
+- Kokoro: always full precision (the fp32 model) and misaki pronunciation.
+  Don't add quality options, smaller models or fallbacks for weaker hardware.
+- The Android app's other engines run as the phone build that keeps up on
+  this phone: Ming 3.0 at fp16 on the NPU (LiteRT), Qwen3-TTS 0.6B Base at
+  4-bit on ONNX Runtime. One build each; no choice of precision.
 - No caveats, hedging or "if this fails, try…" wording in the UI or docs.
   Messages are short and plain.
 - Don't keep compatibility or migration code for old versions once the update

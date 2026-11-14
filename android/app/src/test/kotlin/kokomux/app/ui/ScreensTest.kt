@@ -88,8 +88,21 @@ class ScreensTest {
     @Test fun settingsPlain() = shot("settings-plain", ThemeMode.LIGHT) {
         SettingsScreen(Fake.state.copy(prefs = Fake.state.prefs.copy(focus = false, words = false)), Fake.actions, {}, {})
     }
-    @Test fun voices() = shot("voices", ThemeMode.DARK) { VoicesScreen(Fake.state.copy(hearing = "af_heart"), Fake.actions) {} }
-    @Test fun voicesLight() = shot("voices-light", ThemeMode.LIGHT) { VoicesScreen(Fake.state, Fake.actions) {} }
+    @Test fun voices() = shot("voices", ThemeMode.DARK) { VoicesScreen(Fake.state.copy(hearing = "af_heart"), Fake.actions, {}, {}) }
+    @Test fun voicesLight() = shot("voices-light", ThemeMode.LIGHT) { VoicesScreen(Fake.state, Fake.actions, {}, {}) }
+    @Test fun voicesMing() = shot("voices-ming-downloading", ThemeMode.DARK) {
+        VoicesScreen(Fake.state.copy(prefs = Fake.state.prefs.copy(voice = "ming:UK_George")), Fake.actions, {}, {})
+    }
+    @Test fun voicesQwen() = shot("voices-qwen", ThemeMode.LIGHT) {
+        VoicesScreen(Fake.state.copy(prefs = Fake.state.prefs.copy(voice = "qwen:en-us:Anesu")), Fake.actions, {}, {})
+    }
+    @Test fun newVoice() = shot("new-voice", ThemeMode.DARK) { NewVoiceScreen(Fake.state, Fake.actions) {} }
+    @Test fun newVoiceRecording() = shot("new-voice-recording", ThemeMode.LIGHT) {
+        NewVoiceScreen(Fake.state.copy(recording = 6.4 to 0.62f), Fake.actions) {}
+    }
+    @Test fun newVoiceClip() = shot("new-voice-clip", ThemeMode.DARK) {
+        NewVoiceScreen(Fake.state.copy(clip = Clip(7.2)), Fake.actions) {}
+    }
 
     @Test fun sheetChapters() = shot("sheet-chapters", ThemeMode.DARK, sheet { ChaptersSheet(Fake.playing()) {} })
     @Test fun sheetSleep() = shot("sheet-sleep", ThemeMode.DARK, sheet { SleepSheet(Fake.playing(sleep = Sleep.EndOfChapter)) {} })
@@ -100,7 +113,7 @@ class ScreensTest {
     @Test @Config(qualifiers = NARROW) fun speedNarrow() = shot("narrow-speed", ThemeMode.DARK, sheet { SpeedSheet(1.2f) {} })
     @Test @Config(fontScale = 1.3f) fun homeLargeText() = shot("large-text-home", ThemeMode.LIGHT, home)
     @Test @Config(fontScale = 1.3f) fun readerLargeText() = shot("large-text-reader", ThemeMode.LIGHT, reader)
-    @Test @Config(fontScale = 1.3f) fun voicesLargeText() = shot("large-text-voices", ThemeMode.DARK) { VoicesScreen(Fake.state, Fake.actions) {} }
+    @Test @Config(fontScale = 1.3f) fun voicesLargeText() = shot("large-text-voices", ThemeMode.DARK) { VoicesScreen(Fake.state, Fake.actions, {}, {}) }
     @Test @Config(fontScale = 1.3f) fun speedLargeText() = shot("large-text-speed", ThemeMode.LIGHT, sheet { SpeedSheet(1.2f) {} })
 
     @Test fun sheetSpeed() = shot("sheet-speed", ThemeMode.LIGHT, sheet { SpeedSheet(1.2f) {} })

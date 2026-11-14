@@ -45,8 +45,14 @@ object Fake {
 
     val state = UiState(
         setup = Setup.Ready, prefs = Prefs(voice = "bf_emma", speed = 1.1f), shelf = shelf, playing = playing(),
-        voices = voices, making = Making(37, 412.0, 98.0, 91.0, "6 threads, block 4"),
+        voices = voices + Voices.ming + listOf("qwen:en-us:Anesu", "qwen:en-gb:Narrator"),
+        making = Making(37, 412.0, 98.0, 91.0, "Kokoro", "6 threads, block 4"),
         loaded = "Kokoro loaded in 2.14 s, misaki and spaCy in 3.60 s", kept = 1_234_000_000,
+        engines = listOf(
+            EngineFiles("kokoro", "Kokoro", 353_746_569, 353_746_569),
+            EngineFiles("ming", "Ming 3.0", 2_839_549_649, done = 1_123_000_000),
+            EngineFiles("qwen", "Qwen3-TTS", 1_689_175_579, 1_689_175_579),
+        ),
     )
 
     /** Actions that do nothing. */
@@ -68,6 +74,15 @@ object Fake {
         override fun sleep(choice: Sleep?) {}
         override fun voice(voice: String) {}
         override fun hear(voice: String) {}
+        override fun fetchEngine(id: String) {}
+        override fun removeEngine(id: String) {}
+        override fun record() {}
+        override fun stopRecording() {}
+        override fun pickClip(uri: Uri) {}
+        override fun playClip() {}
+        override fun dropClip() {}
+        override fun makeVoice(words: String, name: String, lang: String) {}
+        override fun forgetVoice(voice: String) {}
         override fun prefs(prefs: Prefs) {}
         override fun check() {}
         override fun clearKept() {}

@@ -46,7 +46,7 @@ class ListenTest {
     @Test
     fun aShortTextIsMadeAndPlayed() {
         val engine = context.engine
-        assumeTrue("the model isn't on this device", engine.models.ready())
+        assumeTrue("the model isn't on this device", engine.kokoroFiles.ready())
         engine.books.mkdirs()
         val file = File(engine.books, "listen-test.txt").apply { writeText("The road left the village. It climbed into the hills.") }
         val id = Books.id(file.path)
@@ -78,7 +78,7 @@ class ListenTest {
                 assertTrue("${m.wav} is too short", Audio.wavSeconds(m.wav) > 0.5)
                 assertTrue(m.words.readText().startsWith("confidence\t"))
                 println("kokomux: part ${m.index}: ${"%.2f".format(m.speechSecs)} s of speech, " +
-                    "misaki ${"%.2f".format(m.soundsSecs)} s, Kokoro ${"%.2f".format(m.kokoroSecs)} s")
+                    "misaki ${"%.2f".format(m.prepSecs)} s, Kokoro ${"%.2f".format(m.voiceSecs)} s")
             }
 
             // A new speed: this part carries on sped up, the next is made again at it, and the bookmark keeps it.

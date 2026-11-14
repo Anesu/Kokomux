@@ -32,17 +32,7 @@ fun FirstRun(setup: Setup, actions: Actions) {
         Spacer(Modifier.height(Space.xl))
         when (setup) {
             Setup.Missing -> MainButton("Download Kokoro · 354 MB", onClick = actions::download)
-            is Setup.Downloading -> {
-                val share = if (setup.total > 0) setup.done.toFloat() / setup.total else 0f
-                Box(
-                    Modifier.fillMaxWidth().heightIn(min = Space.touch).clip(Corner.l).background(t.surf)
-                        .semantics { contentDescription = "Downloading, ${(share * 100).toInt()}%" },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Box(Modifier.matchParentSize()) { Box(Modifier.fillMaxHeight().fillMaxWidth(share).background(Tokens.mix(t.surf, t.accent, Phi.inv(2f)))) }
-                    Text("${setup.done / 1_000_000} of ${setup.total / 1_000_000} MB", style = Type.label, color = t.fg)
-                }
-            }
+            is Setup.Downloading -> ProgressFill(setup.done, setup.total)
             is Setup.Loading -> Dim("Loading ${setup.what}…", style = Type.body)
             is Setup.Failed -> {
                 Text(setup.message, style = Type.body, color = t.red)

@@ -27,8 +27,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 
-/** The screens: home, the reader, settings, the voice picker. */
-enum class Screen { HOME, READER, SETTINGS, VOICES }
+/** The screens: home, the reader, settings, the voice picker, making a voice. */
+enum class Screen { HOME, READER, SETTINGS, VOICES, NEW_VOICE }
 
 /** What slides up over a screen. */
 enum class Sheet { CHAPTERS, SLEEP, SPEED, PAGE, TYPE }
@@ -90,7 +90,8 @@ fun KokomuxApp(state: UiState, position: () -> Long, link: () -> String, actions
                         chapters = { sheet = Sheet.CHAPTERS }, voices = { go(Screen.VOICES) }, settings = { go(Screen.SETTINGS) }))
                 }
                 Screen.SETTINGS -> SettingsScreen(state, actions, onBack = ::back, onVoices = { go(Screen.VOICES) })
-                Screen.VOICES -> VoicesScreen(state, actions, onBack = ::back)
+                Screen.VOICES -> VoicesScreen(state, actions, onBack = ::back, onNewVoice = { go(Screen.NEW_VOICE) })
+                Screen.NEW_VOICE -> NewVoiceScreen(state, actions, onBack = ::back)
             }
         }
 

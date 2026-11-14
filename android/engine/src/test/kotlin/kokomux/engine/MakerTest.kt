@@ -46,23 +46,23 @@ class MakerTest {
         val fake = Fake()
         val cache = temp()
         val made = mutableListOf<Maker.Made>()
-        Maker(book(3, pause = 0.25), cache, fake, "en-us", fake::speak).run(1, { 0 }, { false }) { made += it }
+        Maker(book(3, pause = 0.25), cache, KokoroSpeaker(fake, "en-us", fake::speak)).run(1, { 0 }, { false }) { made += it }
         assertEquals(listOf(1, 2, 3), made.map { it.index })
         assertEquals("Part 2.", File(cache, "0002.txt").readText())
         assertTrue(File(cache, "0002.words").readText().startsWith("confidence\t1.0\n"))
         assertEquals(0.35, made[1].seconds, 1e-6)                    // 0.1 s of speech, 0.25 s of pause
-        assertTrue(made.none { it.kept } && made.all { it.kokoroSecs >= 0 })
+        assertTrue(made.none { it.kept } && made.all { it.voiceSecs >= 0 })
     }
 
     @Test
     fun keptPartsAreReusedUnlessTheirTextChanged() {
         val cache = temp()
-        Fake().let { f -> Maker(book(3), cache, f, "en-us", f::speak).run(1, { 0 }, { false }) {} }
+        Fake().let { f -> Maker(book(3), cache, KokoroSpeaker(f, "en-us", f::speak)).run(1, { 0 }, { false }) {} }
         val again = Fake()
         val changed = Book("A book", listOf(Part("Part 1.", 0.0), Part("Part two, rewritten.", 0.0), Part("Part 3.", 0.0)),
             emptyList())
         val made = mutableListOf<Maker.Made>()
-        Maker(changed, cache, again, "en-us", again::speak).run(1, { 0 }, { false }) { made += it }
+        Maker(changed, cache, KokoroSpeaker(again, "en-us", again::speak)).run(1, { 0 }, { false }) { made += it }
         assertEquals(listOf(true, false, true), made.map { it.kept })
         assertEquals(listOf("sounds of Part two, rewritten."), again.said)
     }
@@ -73,7 +73,7 @@ class MakerTest {
         val at = AtomicInteger(0)
         val stop = AtomicBoolean(false)
         val made = Collections.synchronizedList(mutableListOf<Int>())
-        val maker = Maker(book(10), temp(), fake, "en-us", fake::speak, ahead = 0.35)
+        val maker = Maker(book(10), temp(), KokoroSpeaker(fake, "en-us", fake::speak), ahead = 0.35)
         val t = Thread { maker.run(1, at::get, stop::get) { made += it.index } }.apply { start() }
         until("four parts") { made.size == 4 }                  // 0.1 + 0.1 + 0.1 < 0.35, then the fourth
         Thread.sleep(700)
@@ -90,7 +90,7 @@ class MakerTest {
     fun startsWhereItsToldAndKeepsEachSettingApart() {
         val fake = Fake()
         val made = mutableListOf<Int>()
-        Maker(book(5), temp(), fake, "en-us", fake::speak).run(4, { 0 }, { false }) { made += it.index }
+        Maker(book(5), temp(), KokoroSpeaker(fake, "en-us", fake::speak)).run(4, { 0 }, { false }) { made += it.index }
         assertEquals(listOf(4, 5), made)
         val root = temp()
         val a = Maker.cacheDir(root, "0123456789abcdef", "af_heart", 1.0f, "en-us")
@@ -139,6 +139,13 @@ class MakerTest {
         assertEquals(URL_ID, Books.id("https://example.com/a"))
         assertEquals("en-gb", Books.langOf("bm_george"))
         assertEquals("pt-br", Books.langOf("pf_dora"))
+        // Ming's voices read the language of their name; a cloned voice the one it was made for.
+        assertEquals("en-gb", Books.langOf("ming:UK_George"))
+        assertEquals("cmn", Books.langOf("ming:灵小萌"))
+        assertEquals("fr-fr", Books.langOf("qwen:fr-fr:Amélie"))
+        assertEquals(listOf("kokoro", "ming", "qwen"), listOf("af_heart", "ming:US_Emma", "qwen:en-us:A").map(VoiceId::engine))
+        assertEquals("Anna 2", VoiceId.name("qwen:en-us:Anna 2"))
+        assertTrue(VoiceId.makesAtSpeed("bf_emma") && !VoiceId.makesAtSpeed("ming:US_Emma"))
     }
 
     companion object {

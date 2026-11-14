@@ -37,6 +37,8 @@ object Listening {
     var opening by mutableStateOf(false)
     /** Parts are still to be made. */
     var making by mutableStateOf(false)
+    /** An engine getting ready for its first listen on this phone, in words to show ("" when it isn't). */
+    var preparing by mutableStateOf("")
     /** The part playing (counting from 1), 0 before it starts. */
     var at by mutableStateOf(0)
     var error by mutableStateOf("")

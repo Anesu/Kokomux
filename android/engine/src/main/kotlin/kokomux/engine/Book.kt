@@ -49,13 +49,42 @@ object Books {
             hex(md.digest()).take(16)
         }
 
-    /** The language a voice speaks ("bf_emma" -> "en-gb"), engine.py's LANGS. */
-    fun langOf(voice: String): String = when (voice.firstOrNull()) {
-        'a' -> "en-us"; 'b' -> "en-gb"; 'e' -> "es"; 'f' -> "fr-fr"; 'h' -> "hi"
-        'i' -> "it"; 'j' -> "ja"; 'p' -> "pt-br"; 'z' -> "cmn"
-        else -> "en-us"
+    /**
+     * The language a voice reads ("bf_emma" -> "en-gb", engine.py's LANGS; "ming:UK_George" -> "en-gb";
+     * "qwen:en-us:anna" -> "en-us"): what a book is tidied and split for.
+     */
+    fun langOf(voice: String): String = when (VoiceId.engine(voice)) {
+        VoiceId.MING -> VoiceId.name(voice).let { if (it.startsWith("US_")) "en-us" else if (it.startsWith("UK_")) "en-gb" else "cmn" }
+        VoiceId.QWEN -> voice.split(':').getOrElse(1) { "en-us" }
+        else -> when (voice.firstOrNull()) {
+            'a' -> "en-us"; 'b' -> "en-gb"; 'e' -> "es"; 'f' -> "fr-fr"; 'h' -> "hi"
+            'i' -> "it"; 'j' -> "ja"; 'p' -> "pt-br"; 'z' -> "cmn"
+            else -> "en-us"
+        }
     }
 
     internal fun sha256(bytes: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(bytes)
     internal fun hex(bytes: ByteArray) = bytes.joinToString("") { "%02x".format(it) }
+}
+
+/**
+ * Voices by engine: Kokoro's by their own names ("bf_emma"), Ming's built-in
+ * ones as "ming:US_Emma", and voices cloned with Qwen as "qwen:<language>:<id>".
+ */
+object VoiceId {
+    const val KOKORO = "kokoro"
+    const val MING = "ming"
+    const val QWEN = "qwen"
+
+    fun engine(voice: String): String = when {
+        voice.startsWith("ming:") -> MING
+        voice.startsWith("qwen:") -> QWEN
+        else -> KOKORO
+    }
+
+    /** The voice's own name in its engine ("US_Emma", or a cloned voice's id). */
+    fun name(voice: String): String = voice.substringAfterLast(':')
+
+    /** Kokoro makes speech at the speed asked for; the others make it at 1× and the player speeds it up. */
+    fun makesAtSpeed(voice: String) = engine(voice) == KOKORO
 }

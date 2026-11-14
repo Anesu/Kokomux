@@ -5,23 +5,24 @@ import java.security.MessageDigest
 
 /**
  * Making a book's parts to listen to, as engine.py's run_job makes them for
- * the Termux player: from a part on, each part's sounds (the text side), its
- * speech (Kokoro) with softened edges and the pause after it, and its word
- * timings. Parts are kept per book and settings, so listening again reuses
- * them, and only [ahead] seconds of speech are made ahead of the part the
- * player is on, so a long book doesn't keep the phone busy for hours.
+ * the Termux player: from a part on, each part said by the [speaker] (its
+ * speech with softened edges and the pause after it, and its word timings).
+ * Parts are kept per book and settings, so listening again reuses them, and
+ * only [ahead] seconds of speech are made ahead of the part the player is on,
+ * so a long book doesn't keep the phone busy for hours.
  */
 class Maker(
     private val book: Book,
     private val cache: File,
-    private val text: TextSide,
-    private val lang: String,
-    private val speak: (sounds: String) -> Speech,
+    private val speaker: Speaker,
     private val ahead: Double = AHEAD,
 ) {
-    /** A part ready to play: its files, its length, and how long misaki and Kokoro took (0 if it was kept). */
+    /**
+     * A part ready to play: its files, its length, how long getting it ready and the voice took (0 if
+     * it was kept), and its speech's length without the pause.
+     */
     class Made(val index: Int, val wav: File, val words: File, val seconds: Double,
-               val soundsSecs: Double, val kokoroSecs: Double, val speechSecs: Double, val kept: Boolean)
+               val prepSecs: Double, val voiceSecs: Double, val speechSecs: Double, val kept: Boolean)
 
     /**
      * Make the parts from [first] to the end, handing each to [ready] as it's done.
@@ -36,28 +37,19 @@ class Maker(
             val name = "%04d".format(i)
             val wav = File(cache, "$name.wav")
             val words = File(cache, "$name.words")
-            var soundsSecs = 0.0
-            var kokoroSecs = 0.0
-            var speechSecs = 0.0
+            var said: Said? = null
             val kept = kept(name, chunk)
             if (!kept) {
                 if (!keepAhead(made, at, stop)) return
-                val t0 = System.nanoTime()
-                val sounds = text.speakable(chunk, lang)
-                val t1 = System.nanoTime()
-                val speech = speak(sounds.sounds)
-                val t2 = System.nanoTime()
-                soundsSecs = (t1 - t0) / 1e9
-                kokoroSecs = (t2 - t1) / 1e9
-                speechSecs = speech.seconds
+                said = speaker.say(chunk)
                 // The text and word timings first, the audio last: its presence means the part is ready.
                 write(File(cache, "$name.txt"), chunk)
-                write(words, text.wordRows(chunk, lang, sounds, speech.timings))
-                Audio.writeWav(wav, speech.withPause(pause))
+                write(words, said.rows)
+                Audio.writeWav(wav, said.withPause(pause), said.rate)
             }
             val seconds = Audio.wavSeconds(wav)
             made[i] = seconds
-            ready(Made(i, wav, words, seconds, soundsSecs, kokoroSecs, speechSecs, kept))
+            ready(Made(i, wav, words, seconds, said?.prepSecs ?: 0.0, said?.voiceSecs ?: 0.0, said?.seconds ?: 0.0, kept))
         }
     }
 

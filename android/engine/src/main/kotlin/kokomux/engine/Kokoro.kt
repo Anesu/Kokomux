@@ -117,7 +117,3 @@ class Kokoro(model: File, voices: File, threads: Int = 0, block: Int = 0) : Auto
         }
     }
 }
-
-/** A part ready to play: its speech with softened edges and the pause after it (engine.py's run_job). */
-fun Speech.withPause(pause: Double): FloatArray =
-    Audio.join(listOf(Audio.softenEdges(samples), Audio.silence(pause)))

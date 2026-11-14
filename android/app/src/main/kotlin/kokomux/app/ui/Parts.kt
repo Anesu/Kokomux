@@ -24,6 +24,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -283,4 +285,41 @@ fun timeLeftLabel(seconds: Double): String {
 fun speedLabel(speed: Float): String {
     val tenths = Math.round(speed * 100) / 100f
     return (if (tenths * 10 % 1f == 0f) "%.1f" else "%.2f").format(tenths) + "×"
+}
+
+/**
+ * A download or a long task that fills as it goes: a thumb-high bar, the part done in the
+ * accent, saying how far it's got ("1.2 of 2.8 GB").
+ */
+@Composable
+fun ProgressFill(done: Long, total: Long, label: String = "${sizeLabel(done, total)} of ${sizeLabel(total)}") {
+    val t = LocalTokens.current
+    val share = if (total > 0) (done.toFloat() / total).coerceIn(0f, 1f) else 0f
+    Box(
+        Modifier.fillMaxWidth().heightIn(min = Space.touch).clip(Corner.l).background(t.surf)
+            .semantics { contentDescription = "$label, ${(share * 100).toInt()}%" },
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(Modifier.matchParentSize()) {
+            Box(Modifier.fillMaxHeight().fillMaxWidth(share).background(Tokens.mix(t.surf, t.accent, Phi.inv(2f))))
+        }
+        Text(label, style = Type.label, color = t.fg)
+    }
+}
+
+/** "1.2" of "2.8 GB": a size in the same unit as [of]. */
+fun sizeLabel(bytes: Long, of: Long): String = if (of >= 1_000_000_000) "%.1f".format(bytes / 1e9) else "%.0f".format(bytes / 1e6)
+
+/** One of a few choices (a language, an engine, a period): the one in effect filled. */
+@Composable
+fun Chip(label: String, on: Boolean, onClick: () -> Unit) {
+    val t = LocalTokens.current
+    Box(
+        Modifier.heightIn(min = 48.dp).clip(CircleShape).selectable(selected = on, role = Role.Tab, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(label, style = Type.label, color = if (on) t.fg else quiet(), maxLines = 1,
+            modifier = Modifier.clip(CircleShape).background(if (on) t.psel else t.surf)
+                .padding(horizontal = Space.m, vertical = Space.s))
+    }
 }
