@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.18.2"
+KOKOMUX_VERSION="0.18.3"
 DISTRO=kokoro
 
 VERBOSE=0
@@ -557,10 +557,13 @@ MODELS = os.path.join(APP, "models")
 MODEL = os.path.join(MODELS, "kokoro-v1.0-timestamped.fp32.onnx")
 MODEL_SRC = ("https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX-timestamped/resolve/"
              "dd4401a9add81ac692d20e240d22ec9dda82cc29/onnx/model.onnx")
+MODEL_SHA256 = "651ea8291843a92276a4a003581a215cb07d15e47dde6fcfb1b768f9a1682054"
 # A voice, or several blended: "af_heart", "af_heart+af_bella", "af_heart:70+af_bella:30"
-VOICE_SPEC = re.compile(r"^[a-z]{2}_[a-z]+(?::\d{1,3})?(?:\+[a-z]{2}_[a-z]+(?::\d{1,3})?){0,3}$")
+# (the kokoro command checks the same rule: VOICE_RE)
+VOICE_SPEC = re.compile(r"^[a-z]{2}_[a-z0-9]+(?::[0-9]{1,3})?(?:\+[a-z]{2}_[a-z0-9]+(?::[0-9]{1,3})?){0,3}$")
 VOICES = os.path.join(MODELS, "voices-v1.0.bin")
 VOICES_SRC = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
+VOICES_SHA256 = "bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d"
 SERVER_DIR = "/tmp/kokoro-server"
 JOB_DIR_RE = re.compile(r"^/tmp/kokoro\.[A-Za-z0-9]+$")
 FORMATS = ("wav", "mp3", "ogg", "flac")
@@ -1558,15 +1561,8 @@ def _novel_more(jobdir, chapter, chunks, starts, serial, lang):
     return nxt
 
 
-def run_job(path):
-    import numpy as np
-    import soundfile as sf
-    import words
-
-    t0 = time.time()
-    jobdir, job = read_job(path)
-    engine = tts()
-
+def _job_voice(engine, job):
+    """How a job is spoken: (voice style, speed, lang), each checked."""
     voice = voice_style(engine, job.get("voice", "af_heart"))
     try:
         speed = float(job.get("speed", "1.0"))
@@ -1574,7 +1570,111 @@ def run_job(path):
         raise JobError("Speed must be a number, e.g. 1.2") from None
     if not 0.5 <= speed <= 2.0:
         raise JobError("Speed must be between 0.5 and 2.0")
-    lang = job.get("lang", "en-us")
+    return voice, speed, job.get("lang", "en-us")
+
+
+def _job_int(job, key, default):
+    """A whole number from the job (DEFAULT if it's missing or isn't one)."""
+    try:
+        return int(job.get(key, default))
+    except ValueError:
+        return default
+
+
+def _job_text(jobdir, job, stream):
+    """What a job reads: (title, [(chapter title, text)], novel), where novel is the
+    chapter's details when a page being listened to is a web novel's (else None)."""
+    if not (job.get("url") and stream):
+        title, chapters = read_source(jobdir, job)
+        return title, chapters, None
+    log(f"Fetching {job['url']}")
+    title, text, novel = read_page(job["url"])
+    if novel and job.get("skip") == "1":       # on from a chapter already heard
+        heard, novel = novel, novel_next(novel)
+        if not novel:
+            raise JobError(f"No new chapter after {heard['label']} yet")
+        text = novel["text"]
+    return title, [(novel["label"] if novel else title, text)], novel
+
+
+def _job_meta(jobdir, job):
+    """For an audiobook: who wrote the EPUB (`author`), and its cover (`cover.<ext>`)."""
+    src = os.path.join(jobdir, job.get("file", "in.txt"))
+    if job.get("url") or not zipfile.is_zipfile(src):
+        return
+    author, cover, ext = epub_meta(src)
+    _write_atomic(os.path.join(jobdir, "author"), author.replace("\n", " ")[:200] + "\n")
+    if cover:
+        with open(os.path.join(jobdir, f"cover.{ext}"), "wb") as fh:
+            fh.write(cover)
+
+
+def _job_parts(jobdir, job, chapters, novel, lang):
+    """A job's parts: (chunks, starts, serial). Each chapter is split on its own, so a part
+    never runs across chapters, and where each starts is written down for the player's
+    chapter list (starts: "first-part<TAB>title"; serial: a novel's, see _novel_add)."""
+    chunks, starts, serial = [], [], []
+    if novel:
+        base = max(1, _job_int(job, "base", 1))     # this chapter's first part, in the whole listen
+        starts, serial = _novel_listed(jobdir, base)
+        chunks = [None] * (base - 1)
+        _novel_add(jobdir, novel, chunks, starts, serial, lang, new=base == 1 or not serial)
+        chapters = []
+    for heading, text in chapters:
+        parts = split_text(normalise(text, lang))
+        if parts:
+            starts.append(f"{len(chunks) + 1}\t{heading.replace(chr(9), ' ').replace(chr(10), ' ')[:80]}")
+            parts[-1] = (parts[-1][0], PAUSE["chapter"])         # a longer breath between chapters
+            chunks += parts
+    if not chunks:
+        raise JobError("No text to read")
+    if len(starts) > 1 and not novel:
+        _write_atomic(os.path.join(jobdir, "chapters"), "\n".join(starts) + "\n")
+    return chunks, starts, serial
+
+
+def _job_first(job, chunks, novel, serial):
+    """The part a job begins at: its start, mapped if the bookmark counted other parts."""
+    first = _job_int(job, "start", 1)
+    was = _job_int(job, "of", 0)        # the bookmark's count of parts, if it had one
+    if was > 1 and was != len(chunks):
+        # Made with another version's parts: the same place, as a fraction of the text.
+        first = 1 + round((first - 1) * len(chunks) / was)
+    if novel:
+        return max(first, int(serial[-1].split("\t", 1)[0]))   # (not before this chapter)
+    if not 1 <= first <= len(chunks):
+        return 1   # a bookmark past the end: start again
+    return first
+
+
+def _make_part(engine, g2p, chunk, pause, speak, home, name, i):
+    """Say a part and keep it in HOME (the cache or the stream folder; None: nowhere):
+    (samples with the pause after them, rate). SPEAK: (voice, speed, lang, timed)."""
+    import numpy as np
+    import soundfile as sf
+    import words
+    voice, speed, lang, timed = speak
+    samples, rate, marks = synthesize(engine, g2p, chunk, voice, speed, lang, timed, i)
+    samples = np.concatenate([edges(samples, rate), silence(pause, rate)])   # mpv plays them back to back
+    if home:
+        # The text and word timings first, so the player has them when the audio lands.
+        _write_atomic(os.path.join(home, f"{name}.txt"), chunk)
+        if marks is not None:
+            _write_atomic(os.path.join(home, f"{name}.words"), words.player_rows(chunk, marks))
+        tmp = os.path.join(home, f"{name}.tmp.wav")
+        sf.write(tmp, samples, rate)
+        os.replace(tmp, os.path.join(home, f"{name}.wav"))
+    return samples, rate
+
+
+def run_job(path):
+    """Run the job at PATH (see the top of this file); returns a line saying what was made."""
+    import soundfile as sf
+
+    t0 = time.time()
+    jobdir, job = read_job(path)
+    engine = tts()
+    voice, speed, lang = _job_voice(engine, job)
     g2p = g2p_for(lang)
 
     out = job.get("out")
@@ -1596,64 +1696,13 @@ def run_job(path):
     writer = None
     total = 0.0
     try:
-        novel = None        # a web novel: read on from chapter to chapter, as the listener gets there
-        if job.get("url") and stream:
-            log(f"Fetching {job['url']}")
-            title, text, novel = read_page(job["url"])
-            if novel and job.get("skip") == "1":       # on from a chapter already heard
-                heard, novel = novel, novel_next(novel)
-                if not novel:
-                    raise JobError(f"No new chapter after {heard['label']} yet")
-                text = novel["text"]
-            chapters = [(novel["label"] if novel else title, text)]
-        else:
-            title, chapters = read_source(jobdir, job)
+        # (a web novel is read on from chapter to chapter, as the listener gets there)
+        title, chapters, novel = _job_text(jobdir, job, stream)
         _write_atomic(os.path.join(jobdir, "title"), (title or "").replace("\n", " ")[:120] + "\n")
-        if job.get("meta") == "1":            # for an audiobook: who wrote it, and its cover
-            src = os.path.join(jobdir, job.get("file", "in.txt"))
-            if not job.get("url") and zipfile.is_zipfile(src):
-                author, cover, ext = epub_meta(src)
-                _write_atomic(os.path.join(jobdir, "author"), author.replace("\n", " ")[:200] + "\n")
-                if cover:
-                    with open(os.path.join(jobdir, f"cover.{ext}"), "wb") as fh:
-                        fh.write(cover)
-        # Each chapter is split on its own, so a part never runs across chapters, and
-        # where each chapter starts is written down for the player's chapter list.
-        chunks, starts, serial = [], [], []
-        if novel:
-            try:
-                base = max(1, int(job.get("base", "1")))   # this chapter's first part, in the whole listen
-            except ValueError:
-                base = 1
-            starts, serial = _novel_listed(jobdir, base)
-            chunks = [None] * (base - 1)
-            _novel_add(jobdir, novel, chunks, starts, serial, lang, new=base == 1 or not serial)
-            chapters = []
-        for heading, text in chapters:
-            parts = split_text(normalise(text, lang))
-            if parts:
-                starts.append(f"{len(chunks) + 1}\t{heading.replace(chr(9), ' ').replace(chr(10), ' ')[:80]}")
-                parts[-1] = (parts[-1][0], PAUSE["chapter"])         # a longer breath between chapters
-                chunks += parts
-        if not chunks:
-            raise JobError("No text to read")
-        if len(starts) > 1 and not novel:
-            _write_atomic(os.path.join(jobdir, "chapters"), "\n".join(starts) + "\n")
-        try:
-            first = int(job.get("start", "1"))
-        except ValueError:
-            first = 1
-        try:
-            was = int(job.get("of", "0"))       # the bookmark's count of parts, if it had one
-        except ValueError:
-            was = 0
-        if was > 1 and was != len(chunks):
-            # Made with another version's parts: the same place, as a fraction of the text.
-            first = 1 + round((first - 1) * len(chunks) / was)
-        if novel:
-            first = max(first, int(serial[-1].split("\t", 1)[0]))   # (not before this chapter)
-        elif not 1 <= first <= len(chunks):
-            first = 1   # a bookmark past the end: start again
+        if job.get("meta") == "1":
+            _job_meta(jobdir, job)
+        chunks, starts, serial = _job_parts(jobdir, job, chapters, novel, lang)
+        first = _job_first(job, chunks, novel, serial)
         if stream:
             _write_atomic(os.path.join(stream, "first"), f"{first}\n")
 
@@ -1678,25 +1727,16 @@ def run_job(path):
             _write_atomic(os.path.join(jobdir, "progress"), f"{i} {len(chunks)}\n")
             name = f"{i:04d}"
             got = cached_part(cache, name, chunk) if cache else None
-            if not got and stream and not out:
-                _keep_ahead(jobdir, made)       # (a kept part costs nothing: it's linked at once)
             if got:
                 info = sf.info(got)
                 rate, length = info.samplerate, info.frames
                 samples = sf.read(got, dtype="float32")[0] if out else None
             else:
-                samples, rate, marks = synthesize(engine, g2p, chunk, voice, speed, lang, timed, i)
-                samples = np.concatenate([edges(samples, rate), silence(pause, rate)])   # mpv plays them back to back
+                if stream and not out:
+                    _keep_ahead(jobdir, made)       # (a kept part costs nothing: it's linked at once)
+                samples, rate = _make_part(engine, g2p, chunk, pause, (voice, speed, lang, timed),
+                                           cache or stream, name, i)
                 length = len(samples)
-                home = cache or stream
-                if home:
-                    # The text and word timings first, so the player has them when the audio lands.
-                    _write_atomic(os.path.join(home, f"{name}.txt"), chunk)
-                    if marks is not None:
-                        _write_atomic(os.path.join(home, f"{name}.words"), words.player_rows(chunk, marks))
-                    tmp = os.path.join(home, f"{name}.tmp.wav")
-                    sf.write(tmp, samples, rate)
-                    os.replace(tmp, os.path.join(home, f"{name}.wav"))
             if stream and cache:
                 for ext in ("txt", "words", "wav"):                  # (the audio last: the player waits for it)
                     src = os.path.join(cache, f"{name}.{ext}")
@@ -1865,9 +1905,21 @@ def benchmark():
     print(f"@@best {best[0]} {best[1]} {best[2]:.1f}", flush=True)
 
 
+def sha256_of(path):
+    """A file's SHA-256, in hex."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while block := fh.read(1 << 20):
+            h.update(block)
+    return h.hexdigest()
+
+
 def download():
+    """Fetch the model and the voices, picking up a download that was cut off; a file is
+    kept only if its SHA-256 is the one written above."""
     os.makedirs(MODELS, exist_ok=True)
-    for dest, src, label in ((MODEL, MODEL_SRC, "model"), (VOICES, VOICES_SRC, "voices")):
+    for dest, src, label, sha in ((MODEL, MODEL_SRC, "model", MODEL_SHA256), (VOICES, VOICES_SRC, "voices", VOICES_SHA256)):
         name = os.path.basename(dest)
         if os.path.exists(dest) and os.path.getsize(dest) > 0:
             print(f"@@progress {label} 100 0 0")
@@ -1894,6 +1946,9 @@ def download():
                                 shown = pct
                                 # "@@progress LABEL PCT DONE_MB TOTAL_MB"
                                 print(f"@@progress {label} {pct} {done / 2**20:.0f} {size / 2**20:.0f}", flush=True)
+                if sha256_of(part) != sha:
+                    os.remove(part)                 # (nothing of it is worth resuming)
+                    raise OSError("it arrived damaged")
                 os.replace(part, dest)
                 break
             except OSError as e:
@@ -4000,7 +4055,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
 # in player.sh, the colours in theme.sh (all three loaded below).
 set -euo pipefail
 
-KOKOMUX_VERSION="0.18.2"
+KOKOMUX_VERSION="0.18.3"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 

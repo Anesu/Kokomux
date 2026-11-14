@@ -25,6 +25,7 @@ import kokomux.engine.Bookmarks
 import kokomux.engine.Books
 import kokomux.engine.Maker
 import kokomux.engine.VoiceId
+import kokomux.engine.plain
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -173,7 +174,7 @@ class ListenService : MediaSessionService() {
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
-            return@launch failed(e.message ?: e.toString())
+            return@launch failed(e.plain())
         }
         then(b, lang)
     }
@@ -261,7 +262,7 @@ class ListenService : MediaSessionService() {
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
-            failed(e.message ?: e.toString())
+            failed(e.plain())
             return false
         }
     }
@@ -290,7 +291,7 @@ class ListenService : MediaSessionService() {
             // Offline with nothing kept ahead: what's made plays out, and the next chapter is tried again then.
             allMade = true
             Listening.making = false
-            Listening.error = "Couldn't get the next chapter (${e.message})"
+            Listening.error = "Couldn't get the next chapter (${e.plain()})"
             if (player.playbackState == Player.STATE_ENDED) finished()
             return false
         }

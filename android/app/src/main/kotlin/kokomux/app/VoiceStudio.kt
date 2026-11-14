@@ -16,6 +16,7 @@ import kokomux.app.ui.Voices
 import kokomux.engine.Audio
 import kokomux.engine.Books
 import kokomux.engine.VoiceId
+import kokomux.engine.plain
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -106,7 +107,7 @@ class VoiceStudio(
                 }
             } catch (e: Throwable) {
                 hearing = ""
-                failed(e.message ?: e.toString())
+                failed(e.plain())
             }
         }
     }
@@ -148,7 +149,7 @@ class VoiceStudio(
                 }
                 engineFiles = engineFiles + (id to EngineFiles(id, p.title, p.total, p.total))
             } catch (e: Exception) {
-                engineFiles = engineFiles + (id to EngineFiles(id, p.title, p.total, p.size(), error = e.message ?: e.toString()))
+                engineFiles = engineFiles + (id to EngineFiles(id, p.title, p.total, p.size(), error = e.plain()))
             }
         }
     }
@@ -189,7 +190,7 @@ class VoiceStudio(
             try {
                 useClip(Clips.decode(app, uri))
             } catch (e: Exception) {
-                failed("Couldn't read that clip (${e.message})")
+                failed("Couldn't read that clip (${e.plain()})")
             }
         }
     }
@@ -250,7 +251,7 @@ class VoiceStudio(
                     chosen(voice)
                 }
             } catch (e: Throwable) {
-                failed(e.message ?: e.toString())
+                failed(e.plain())
             } finally {
                 cloning = false
             }

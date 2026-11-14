@@ -150,7 +150,8 @@ Screen ──OPEN──► ListenService (MediaSession, ExoPlayer: one gapless p
   `tools/wheels.py`. **espeak-ng** 1.52.0 is built with the NDK
   (`app/src/main/cpp`), with the data from the espeakng-loader 0.2.4 wheel.
 - **Each engine's files download** into the app's storage from addresses
-  pinned to a commit (`Models.kt`): Kokoro on first run (354 MB), Ming and
+  pinned to a commit, each kept only if its SHA-256 is the one written in
+  `Models.kt`: Kokoro on first run (354 MB), Ming and
   Qwen when one of their voices is first wanted.
 
 ## Building
@@ -214,6 +215,7 @@ with the model, and saves the screen before and after loading
 | `engine/…/Maker.kt` | engine.py's run_job: each part made and kept, ten minutes ahead of the player |
 | `engine/…/Bookmarks.kt` | where each book was left, as Termux's `.mark` files |
 | `engine/…/Stats.kt` | the listens kept, and what they add up to |
+| `engine/…/Plain.kt` | what went wrong, in a few plain words to show |
 | `engine/…/ming/` | Ming-3.0-tts's host side (from its Android sample, MIT: see `LICENSE` there) and its speaker |
 | `engine/…/qwen/` | Qwen3-TTS: cloning a voice, the talker and code predictor's loop, decoding; its speaker |
 | `app/src/main/kotlin/kokomux/app/ListenService.kt` | listening in the background: the playlist, the notification, the bookmark, speed, voice, a novel's next chapter; reading and making as jobs that cancel |

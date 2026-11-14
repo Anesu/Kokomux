@@ -305,7 +305,7 @@ Kokoro's Python packages (`onnxruntime`, `espeakng-loader`, `soundfile`) only sh
 - **`words.py`** (inside Debian): turns Kokoro's per-sound timings into word timings, for the highlight.
 - **Sharing files:** the two sides exchange text and audio through `$PREFIX/tmp`, which the container sees as `/tmp`.
 
-The installer only keeps what's needed in the container. It skips documentation and man pages, and clears the apt and pip download caches after installing. The model is the full-precision timestamped export from onnx-community (326 MB, pinned to one version), plus about 28 MB of voices.
+The installer only keeps what's needed in the container. It skips documentation and man pages, and clears the apt and pip download caches after installing. The model is the full-precision timestamped export from onnx-community (326 MB, pinned to one version), plus about 28 MB of voices. Each is kept only if its SHA-256 is the one written in `engine.py`.
 
 **Why not run natively in Termux?** Termux now packages onnxruntime, numpy, espeak and libsndfile, but kokoro-onnx's own dependencies still can't be installed there. `espeakng-loader` ships only glibc builds. `phonemizer` needs `segments`, which needs the `regex` C extension, and `soundfile` needs `cffi`; Termux packages neither, so both would have to be compiled on the phone. Until that's simpler, and can be tested on a real device, the container stays.
 

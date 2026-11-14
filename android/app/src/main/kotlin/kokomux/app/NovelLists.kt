@@ -7,6 +7,7 @@ import kokomux.app.ui.Found
 import kokomux.app.ui.TocEntry
 import kokomux.engine.Book
 import kokomux.engine.Books
+import kokomux.engine.plain
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -38,7 +39,7 @@ class NovelLists(private val engine: Engine, private val scope: CoroutineScope, 
                 val playing = b.chapterOf(at.coerceAtLeast(1))?.number ?: c.number
                 toc = engine.novels.toc(got).map { (n, label, url) -> TocEntry(n, label, url, n < playing, false) }
             } catch (e: Exception) {
-                failed(e.message ?: e.toString())
+                failed(e.plain())
             } finally {
                 tocLoading = false
             }
@@ -55,7 +56,7 @@ class NovelLists(private val engine: Engine, private val scope: CoroutineScope, 
                 found = engine.exclusive { engine.text.search(query) }.map { (title, url, latest) -> Found(title, url, latest) }
                 if (found.isEmpty()) failed("No novel called that")
             } catch (e: Exception) {
-                failed(e.message ?: e.toString())
+                failed(e.plain())
             } finally {
                 searching = false
             }
@@ -73,7 +74,7 @@ class NovelLists(private val engine: Engine, private val scope: CoroutineScope, 
                 toc = list.map { (n, label, url) -> TocEntry(n, label, url, n < heard, n == heard) }
                 if (toc.isEmpty()) failed("Couldn't find that novel's chapters")
             } catch (e: Exception) {
-                failed(e.message ?: e.toString())
+                failed(e.plain())
             } finally {
                 tocLoading = false
             }

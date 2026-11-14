@@ -27,6 +27,7 @@ import kokomux.engine.Book
 import kokomux.engine.Books
 import kokomux.engine.Maker
 import kokomux.engine.VoiceId
+import kokomux.engine.plain
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -68,7 +69,7 @@ class Export(context: Context, params: WorkerParameters) : CoroutineWorker(conte
             Listening.note = "Saved: $name"
             Result.success()
         } catch (e: Throwable) {
-            Listening.error = "Couldn't save the audiobook (${e.message})"
+            Listening.error = "Couldn't save the audiobook (${e.plain()})"
             Result.failure()
         } finally {
             progress = null

@@ -36,6 +36,7 @@ import kokomux.app.ui.wordSpans
 import kokomux.engine.Book
 import kokomux.engine.Books
 import kokomux.engine.VoiceId
+import kokomux.engine.plain
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -162,7 +163,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
                 loaded = "Kokoro loaded in ${"%.2f".format(engine.loadSeconds)} s, misaki and spaCy in ${"%.2f".format(misaki)} s"
                 setup = Setup.Ready
             } catch (e: Throwable) {
-                setup = Setup.Failed(e.message ?: e.toString())
+                setup = Setup.Failed(e.plain())
             }
         }
     }
@@ -181,7 +182,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
                 }
                 load()
             } catch (e: Exception) {
-                setup = Setup.Failed(e.message ?: e.toString())
+                setup = Setup.Failed(e.plain())
             }
         }
     }
@@ -207,7 +208,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
                 tmp.renameTo(file)
                 withContext(Dispatchers.Main) { open(id, "file", file.path, name.substringBeforeLast('.')) }
             } catch (e: Exception) {
-                error = "Couldn't open that file (${e.message})"
+                error = "Couldn't open that file (${e.plain()})"
             }
         }
     }
@@ -388,7 +389,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
                     val secs = engine.load(prefs.threads, prefs.block)
                     loaded = "Kokoro loaded in ${"%.2f".format(secs)} s (${engine.tuning()})"
                 } catch (e: Throwable) {
-                    error = e.message ?: e.toString()
+                    error = e.plain()
                 }
             }
         }
@@ -406,7 +407,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
                     Triple("${d.getString("lang")}: ${d.getString("text")}", d.getString("want"), d.getString("got"))
                 })
             } catch (e: Throwable) {
-                error = e.message ?: e.toString()
+                error = e.plain()
             } finally {
                 checking = false
             }
