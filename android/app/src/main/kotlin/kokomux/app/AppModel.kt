@@ -76,6 +76,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
     private var tocLoading by mutableStateOf(false)
     private var found by mutableStateOf(emptyList<Found>())
     private var searching by mutableStateOf(false)
+    private var stats by mutableStateOf<kokomux.engine.Stats?>(null)
     /** The part playing's word timings: (part, words). */
     private var words by mutableStateOf(0 to emptyList<WordSpan>())
     private val version = app.packageManager.getPackageInfo(app.packageName, 0).versionName.orEmpty()
@@ -95,6 +96,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
                 override fun onIsPlayingChanged(isPlaying: Boolean) {
                     playing = isPlaying
                     refreshShelf()
+                    loadStats()
                 }
             })
             playing = c.isPlaying
@@ -103,6 +105,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
             pending.clear()
         }, ContextCompat.getMainExecutor(app))
         refreshShelf()
+        loadStats()
         // The part playing's word timings, read when it changes or is made.
         viewModelScope.launch { snapshotFlow { Listening.at to Listening.made.size }.collect { readWords() } }
     }
@@ -133,7 +136,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
             engines = Voices.engines.mapNotNull { engineFiles[it.first] }, preparing = Listening.preparing,
             recording = recording, clip = clip, cloning = cloning,
             toc = toc.map { e -> e.copy(now = now?.book?.chapterOf(Listening.at.coerceAtLeast(1))?.url == e.url) },
-            tocLoading = tocLoading, found = found, searching = searching,
+            tocLoading = tocLoading, found = found, searching = searching, stats = stats,
         )
     }
 
@@ -476,6 +479,15 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
         viewModelScope.launch(Dispatchers.IO) {
             val kokoro = engine.kokoro?.voices?.names ?: voices.filter { VoiceId.engine(it) == VoiceId.KOKORO }
             voices = kokoro + Voices.ming + engine.cloned().map { it.voice }
+        }
+    }
+
+    // ------------------------------------------------------------ stats
+
+    override fun loadStats() {
+        viewModelScope.launch(Dispatchers.IO) {
+            stats = kokomux.engine.Stats(kokomux.engine.Sessions(engine.stats).all(), java.time.ZoneId.systemDefault(),
+                java.time.LocalDate.now())
         }
     }
 

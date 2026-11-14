@@ -27,8 +27,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 
-/** The screens: home, the reader, settings, the voice picker, making a voice. */
-enum class Screen { HOME, READER, SETTINGS, VOICES, NEW_VOICE }
+/** The screens: home, the reader, settings, the voice picker, making a voice, listening stats. */
+enum class Screen { HOME, READER, SETTINGS, VOICES, NEW_VOICE, STATS }
 
 /** What slides up over a screen. */
 enum class Sheet { CHAPTERS, SLEEP, SPEED, PAGE, TYPE }
@@ -52,6 +52,7 @@ fun KokomuxApp(state: UiState, position: () -> Long, link: () -> String, actions
         var stack by rememberSaveable { mutableStateOf(if (state.playing != null) listOf(Screen.HOME, Screen.READER) else listOf(Screen.HOME)) }
         val screen = stack.last()
         var sheet by rememberSaveable { mutableStateOf<Sheet?>(null) }
+        var statsOf by rememberSaveable { mutableStateOf<String?>(null) }       // the book the stats open on (null: all)
         fun go(to: Screen) {
             sheet = null
             stack = when (to) {
@@ -81,17 +82,20 @@ fun KokomuxApp(state: UiState, position: () -> Long, link: () -> String, actions
                     onReader = { go(Screen.READER) },
                     onOpenFile = { pick.launch(arrayOf("*/*")) },
                     onPage = { sheet = Sheet.PAGE }, onType = { sheet = Sheet.TYPE },
-                    onVoices = { go(Screen.VOICES) }, onSettings = { go(Screen.SETTINGS) })
+                    onVoices = { go(Screen.VOICES) }, onSettings = { go(Screen.SETTINGS) },
+                    onStats = { statsOf = it; actions.loadStats(); go(Screen.STATS) })
                 Screen.READER -> {
                     val p = state.playing
                     if (p == null) Opening(state, actions) { go(Screen.HOME) }
                     else ReaderScreen(p, state.prefs, position, actions, ReaderTo(
                         home = { go(Screen.HOME) }, speed = { sheet = Sheet.SPEED }, sleep = { sheet = Sheet.SLEEP },
-                        chapters = { sheet = Sheet.CHAPTERS }, voices = { go(Screen.VOICES) }, settings = { go(Screen.SETTINGS) }))
+                        chapters = { sheet = Sheet.CHAPTERS }, voices = { go(Screen.VOICES) }, settings = { go(Screen.SETTINGS) },
+                        stats = { statsOf = p.id; actions.loadStats(); go(Screen.STATS) }))
                 }
                 Screen.SETTINGS -> SettingsScreen(state, actions, onBack = ::back, onVoices = { go(Screen.VOICES) })
                 Screen.VOICES -> VoicesScreen(state, actions, onBack = ::back, onNewVoice = { go(Screen.NEW_VOICE) })
                 Screen.NEW_VOICE -> NewVoiceScreen(state, actions, onBack = ::back)
+                Screen.STATS -> StatsScreen(state.stats, onBack = ::back, book = statsOf)
             }
         }
 

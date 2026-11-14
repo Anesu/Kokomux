@@ -48,7 +48,7 @@ import kotlinx.coroutines.delay
 fun HomeScreen(
     state: UiState, actions: Actions,
     onReader: () -> Unit, onOpenFile: () -> Unit, onPage: () -> Unit, onType: () -> Unit,
-    onVoices: () -> Unit, onSettings: () -> Unit,
+    onVoices: () -> Unit, onSettings: () -> Unit, onStats: (String?) -> Unit = {},
 ) {
     val t = LocalTokens.current
     // A book taken off the shelf goes for good when its undo bar does (after 5 s, or on leaving home).
@@ -98,11 +98,20 @@ fun HomeScreen(
                 }
             }
 
+            state.stats?.takeIf { it.sessions.isNotEmpty() }?.let { s ->
+                Spacer(Modifier.height(Space.s))
+                ListRow(Glyphs.chart, "Today ${duration(s.on(s.today))}",
+                    listOf(if (s.streak == 1) "1 day in a row" else "${s.streak} days in a row", "${duration(s.total)} in all")
+                        .joinToString(" · "),
+                    trailing = { Icon(Glyphs.forward, null, Modifier.size(Space.l - 3.dp), tint = t.dim) }) { onStats(null) }
+            }
+
             val shelf = state.shelf.filter { it.id != state.playing?.id && it.id != removal?.book?.id }
             if (shelf.isNotEmpty()) {
                 Spacer(Modifier.height(Space.s))
                 SectionTitle("Bookshelf")
-                for (b in shelf) ShelfRow(b, onClick = { actions.resume(b.id); onReader() }, onRemove = { removal = Removal(b) })
+                for (b in shelf) ShelfRow(b, onClick = { actions.resume(b.id); onReader() }, onRemove = { removal = Removal(b) },
+                    onStats = { onStats(b.id) })
             }
         }
         removal?.let { r ->
@@ -167,7 +176,7 @@ private fun NowCard(p: Playing?, actions: Actions, onReader: () -> Unit) {
  * many more are out); tap to carry on, ⋮ to remove it.
  */
 @Composable
-private fun ShelfRow(b: ShelfBook, onClick: () -> Unit, onRemove: () -> Unit) {
+private fun ShelfRow(b: ShelfBook, onClick: () -> Unit, onRemove: () -> Unit, onStats: () -> Unit) {
     val t = LocalTokens.current
     var menu by remember { mutableStateOf(false) }
     Row(
@@ -189,6 +198,8 @@ private fun ShelfRow(b: ShelfBook, onClick: () -> Unit, onRemove: () -> Unit) {
         Box {
             GlyphButton(Glyphs.more, "More for ${b.title}") { menu = true }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                DropdownMenuItem(text = { Text("Listening", style = Type.body) }, onClick = { menu = false; onStats() },
+                    leadingIcon = { Icon(Glyphs.chart, null, Modifier.size(Space.l)) })
                 DropdownMenuItem(text = { Text("Remove", style = Type.body) }, onClick = { menu = false; onRemove() },
                     leadingIcon = { Icon(Glyphs.close, null, Modifier.size(Space.l)) })
             }

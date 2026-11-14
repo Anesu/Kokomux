@@ -2,6 +2,10 @@ package kokomux.app.ui
 
 import android.net.Uri
 import kokomux.engine.Chapter
+import kokomux.engine.Session
+import kokomux.engine.Stats
+import java.time.LocalDate
+import java.time.ZoneId
 
 /** Made-up books and listening, to draw the screens with. */
 object Fake {
@@ -43,11 +47,29 @@ object Fake {
     val voices = listOf("af_alloy", "af_bella", "af_heart", "af_nicole", "am_adam", "am_michael", "bf_emma", "bf_isabella",
         "bm_george", "bm_lewis", "ef_dora", "em_alex", "ff_siwis", "hf_alpha", "if_sara", "jf_alpha", "pf_dora", "zf_xiaobei")
 
+    /** Three weeks of listening to two books, evenings mostly, as of Saturday 14 November 2026. */
+    val stats: Stats by lazy {
+        val zone = ZoneId.of("UTC")
+        val today = LocalDate.of(2026, 11, 14)
+        val minutes = listOf(34, 0, 55, 21, 89, 13, 0, 0, 34, 47, 21, 8, 61, 34, 0, 21, 55, 13, 89, 34, 21, 72)
+        val sessions = minutes.mapIndexedNotNull { i, m ->
+            if (m == 0) return@mapIndexedNotNull null
+            val daysAgo = minutes.size - 1 - i
+            val start = today.minusDays(daysAgo.toLong()).atTime(if (i % 3 == 0) 7 else 21, 4).atZone(zone).toInstant().toEpochMilli()
+            val novel = i % 2 == 1
+            Session(i.toLong(), if (novel) "2" else "0123456789abcdef",
+                if (novel) "Starting with an SSS-Rank Goddess Summon" else "The Long Road", start, start + m * 60_000L, m * 60.0,
+                if (novel) "Chapter ${i / 2 + 1}" else "Chapter One: Departure", if (novel) "Chapter ${i / 2 + 2}" else "Chapter Two: The Harbour",
+                m * 150, if (novel) 1 else 0, 40_000 - i * 1000, if (novel) 11 - i / 2 else -1)
+        }
+        Stats(sessions, zone, today)
+    }
+
     val state = UiState(
         setup = Setup.Ready, prefs = Prefs(voice = "bf_emma", speed = 1.1f), shelf = shelf, playing = playing(),
         voices = voices + Voices.ming + listOf("qwen:en-us:Anesu", "qwen:en-gb:Narrator"),
         making = Making(37, 412.0, 98.0, 91.0, "Kokoro", "6 threads, block 4"),
-        loaded = "Kokoro loaded in 2.14 s, misaki and spaCy in 3.60 s", kept = 1_234_000_000,
+        loaded = "Kokoro loaded in 2.14 s, misaki and spaCy in 3.60 s", kept = 1_234_000_000, stats = stats,
         engines = listOf(
             EngineFiles("kokoro", "Kokoro", 353_746_569, 353_746_569),
             EngineFiles("ming", "Ming 3.0", 2_839_549_649, done = 1_123_000_000),
@@ -93,6 +115,7 @@ object Fake {
         override fun makeVoice(words: String, name: String, lang: String) {}
         override fun forgetVoice(voice: String) {}
         override fun loadToc() {}
+        override fun loadStats() {}
         override fun chapter(url: String) {}
         override fun search(query: String) {}
         override fun novelToc(found: Found) {}

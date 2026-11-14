@@ -139,6 +139,8 @@ data class UiState(
     /** The novel playing's list of chapters (empty until asked for), and whether it's being fetched. */
     val toc: List<TocEntry> = emptyList(),
     val tocLoading: Boolean = false,
+    /** The listens, added up (null until asked for). */
+    val stats: kokomux.engine.Stats? = null,
     /** Novels found by name, and whether a search is going. */
     val found: List<Found> = emptyList(),
     val searching: Boolean = false,
@@ -177,6 +179,8 @@ interface Actions {
     /** A voice made from the clip, its [words] (blank if not known), [name] and language; it becomes the voice. */
     fun makeVoice(words: String, name: String, lang: String)
     fun forgetVoice(voice: String)
+    /** The listens added up, again (for the stats). */
+    fun loadStats()
     /** The novel playing's list of chapters, fetched for the chapters sheet. */
     fun loadToc()
     /** Go to a chapter of the novel playing (one not in this listen starts it again there). */

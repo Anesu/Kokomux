@@ -140,6 +140,8 @@ object Type {
     val title = TextStyle(fontSize = 20.sp, lineHeight = 26.sp, fontWeight = FontWeight.SemiBold)
     val headline = TextStyle(fontSize = 26.sp, lineHeight = 34.sp, fontWeight = FontWeight.SemiBold)
     val display = TextStyle(fontSize = 33.sp, lineHeight = 42.sp, fontWeight = FontWeight.SemiBold)
+    /** The one big number a screen leads with (the stats' today). */
+    val hero = TextStyle(fontSize = 53.sp, lineHeight = 55.sp, fontWeight = FontWeight.SemiBold)
     /** The reading column: a book face, 20 sp on 32 sp lines (φ). */
     val reading = TextStyle(fontSize = 20.sp, lineHeight = 32.sp, fontFamily = FontFamily.Serif)
 }

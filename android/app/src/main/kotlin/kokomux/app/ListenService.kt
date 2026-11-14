@@ -28,6 +28,8 @@ import kokomux.engine.Bookmarks
 import kokomux.engine.Books
 import kokomux.engine.Maker
 import kokomux.engine.ReadError
+import kokomux.engine.Session
+import kokomux.engine.Sessions
 import kokomux.engine.VoiceId
 
 /**
@@ -43,6 +45,8 @@ import kokomux.engine.VoiceId
  *  - the sleep timer fades the voice out over its last 13 seconds, counting
  *    only time spent playing, and keeps your place
  *  - carrying on after a minute away goes back 5 seconds first (10 after an hour)
+ *  - each listen (from play to a pause of 3 minutes or more) is kept for the
+ *    stats: how long, from where to where, the words and chapters heard
  *  - a web novel goes on from chapter to chapter: as the chapter is made, the
  *    next is fetched (or taken from those kept ahead) and added on the end;
  *    its bookmark is the novel's, the chapter and the part in it, and stays,
@@ -81,7 +85,10 @@ class ListenService : MediaSessionService() {
             override fun onPlaybackStateChanged(state: Int) {
                 if (state == Player.STATE_ENDED && allMade) finished()
             }
-            override fun onIsPlayingChanged(isPlaying: Boolean) = backALittle(isPlaying)
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                backALittle(isPlaying)
+                track(isPlaying)
+            }
         })
         session = MediaSession.Builder(this, player)
             .setSessionActivity(
@@ -302,6 +309,7 @@ class ListenService : MediaSessionService() {
         val madeAt = item.mediaId.substringAfter('@').toFloatOrNull() ?: 1f
         val r = request ?: return
         player.playbackParameters = PlaybackParameters(r.speed / madeAt)
+        heard(now.book, part)
         at = part
         Listening.at = part
         mark(now.book, r, part, now.lang)
@@ -383,6 +391,75 @@ class ListenService : MediaSessionService() {
         if (at > 0) arrived()
     }
 
+    // ------------------------------------------------------------ listens, for the stats
+
+    private val sessions by lazy { Sessions(engine.stats) }
+    private var listen: Session? = null
+    /** When playing started (elapsed ms), 0 while paused. */
+    private var playingSince = 0L
+    /** Words in each part from it to the end of the book (worked out once a book). */
+    private var wordsFrom: Pair<Book?, IntArray> = null to IntArray(0)
+
+    private fun wordsFrom(b: Book, part: Int): Int {
+        if (wordsFrom.first !== b) {
+            val from = IntArray(b.parts.size + 2)
+            for (i in b.parts.indices.reversed()) from[i + 1] = from[i + 2] + b.parts[i].text.split(Regex("\\s+")).count { it.isNotEmpty() }
+            wordsFrom = b to from
+        }
+        return wordsFrom.second.getOrElse(part.coerceAtLeast(1)) { 0 }
+    }
+
+    /** Where [part] is, in words: its chapter, or "Part 4 of 12". */
+    private fun where(b: Book, part: Int) =
+        b.chapterOf(part)?.title?.takeIf { b.chapters.size > 1 || b.novel != null } ?: "Part $part of ${b.parts.size}"
+
+    /** A novel's chapters out after the one [part] is in (-1: not a novel). */
+    private fun chaptersLeft(b: Book, part: Int): Int {
+        val n = b.novel ?: return -1
+        val number = b.chapterOf(part)?.number ?: return -1
+        return ((engine.novels.known(n.url)?.latest ?: number) - number).coerceAtLeast(0)
+    }
+
+    /** Playing started or stopped: a listen begins (or carries on, after a short pause), or is kept as it stands. */
+    private fun track(playing: Boolean) {
+        val now = Listening.now ?: return
+        val b = now.book
+        val time = System.currentTimeMillis()
+        if (playing) {
+            val l = listen
+            if (l == null || l.book != now.request.id || time - l.end > Sessions.JOIN) {
+                val part = at.coerceAtLeast(now.first)
+                listen = Session(time, now.request.id, b.novel?.title ?: b.title, time, time, 0.0, where(b, part), where(b, part),
+                    0, 0, wordsFrom(b, part), chaptersLeft(b, part))
+            }
+            playingSince = SystemClock.elapsedRealtime()
+        } else {
+            keepListen()
+            playingSince = 0
+        }
+    }
+
+    /** Arriving at [part]: the part before it was heard (and its chapter, if [part] starts a new one). */
+    private fun heard(b: Book, part: Int) {
+        val l = listen ?: return
+        if (part != at + 1 || at < 1) return keepListen()
+        val chapter = if (b.chapterOf(part) != b.chapterOf(at)) 1 else 0
+        listen = l.copy(words = l.words + wordsFrom(b, at) - wordsFrom(b, part), chapters = l.chapters + chapter)
+        keepListen(part)
+    }
+
+    /** Keep the listen as it stands (time played so far; at [part]). */
+    private fun keepListen(part: Int = at) {
+        val l = listen ?: return
+        val b = book ?: Listening.now?.book ?: return
+        val played = if (playingSince > 0) (SystemClock.elapsedRealtime() - playingSince) / 1000.0 else 0.0
+        if (playingSince > 0) playingSince = SystemClock.elapsedRealtime()
+        val p = part.coerceAtLeast(1)
+        listen = l.copy(end = System.currentTimeMillis(), seconds = l.seconds + played, to = where(b, p),
+            left = wordsFrom(b, p), chaptersLeft = chaptersLeft(b, p))
+        if (listen!!.seconds >= 1) sessions.save(listen!!)
+    }
+
     // ------------------------------------------------------------ the sleep timer
 
     /** Set the sleep timer, or turn it off. */
@@ -462,6 +539,9 @@ class ListenService : MediaSessionService() {
         val now = Listening.now ?: return
         val id = now.request.id
         stop.set(true)
+        listen?.let { l -> listen = l.copy(words = l.words + wordsFrom(now.book, at), chapters = l.chapters + 1) }
+        keepListen(now.book.parts.size + 1)
+        listen = null
         val b = book
         if (b?.novel != null) {
             mark(b, now.request, b.parts.size, now.lang, done = true)
@@ -488,6 +568,9 @@ class ListenService : MediaSessionService() {
 
     /** Stop listening, keeping the bookmark (a book still opening is let go too). */
     private fun close() {
+        keepListen()
+        listen = null
+        playingSince = 0
         stop.set(true)
         runs++
         Listening.opening = false

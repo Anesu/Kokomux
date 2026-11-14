@@ -122,6 +122,10 @@ class ScreensTest {
     @Test @Config(fontScale = 1.3f) fun voicesLargeText() = shot("large-text-voices", ThemeMode.DARK) { VoicesScreen(Fake.state, Fake.actions, {}, {}) }
     @Test @Config(fontScale = 1.3f) fun speedLargeText() = shot("large-text-speed", ThemeMode.LIGHT, sheet { SpeedSheet(1.2f) {} })
 
+    @Test fun stats() = shot("stats", ThemeMode.DARK) { StatsScreen(Fake.stats, {}) }
+    @Test fun statsLight() = shot("stats-light", ThemeMode.LIGHT) { StatsScreen(Fake.stats, {}) }
+    @Test fun statsBook() = shot("stats-book", ThemeMode.LIGHT) { StatsScreen(Fake.stats, {}, book = "2") }
+    @Test fun statsNone() = shot("stats-none", ThemeMode.DARK) { StatsScreen(null, {}) }
     @Test fun sheetSpeed() = shot("sheet-speed", ThemeMode.LIGHT, sheet { SpeedSheet(1.2f) {} })
     @Test fun sheetPage() = shot("sheet-page", ThemeMode.DARK, sheet { WebSheet("https://example.com/the-long-road", Fake.state, Fake.actions) {} })
     @Test fun sheetType() = shot("sheet-type", ThemeMode.LIGHT, sheet { TypeSheet {} })
