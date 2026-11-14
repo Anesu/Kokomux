@@ -92,6 +92,9 @@ object Fake {
     val toc = (1..21).map { n -> TocEntry(n, if (n % 5 == 0) "Chapter $n" else "Chapter $n: ${listOf("The Summoning", "S-Rank", "The Goddess", "First Blood")[n % 4]}",
         "https://freewebnovel.com/novel/starting-with-an-sss-rank-goddess-summon/chapter-$n", n < 7, n == 7) }
 
+    /** Two names said your way. */
+    val fixes = listOf(Fix("Xiao Yan", "Shao Yen"), Fix("Nyx", "Nicks"))
+
     /** Two things waiting to be heard after the book. */
     val upNext = listOf(Queued("q1", "How lighthouses were built on open rock", "url"), Queued("q2", "Notes for Thursday", "text"))
 
@@ -122,6 +125,9 @@ object Fake {
         override fun sleep(choice: Sleep?) {}
         override fun voice(voice: String) {}
         override fun hear(voice: String) {}
+        override fun setFix(word: String, sayAs: String) {}
+        override fun removeFix(word: String) {}
+        override fun hearFix(sayAs: String) {}
         override fun fetchEngine(id: String) {}
         override fun removeEngine(id: String) {}
         override fun record() {}

@@ -11,8 +11,8 @@ import java.util.zip.ZipOutputStream
 /**
  * A backup: one zip file of what can't be made again. In it, as they lie in
  * the app's storage ([root]): books/ (the bookmarks, the books' own copies and
- * the novels' kept chapters), stats/listens.tsv, passages.tsv and voices/ (the
- * cloned voices); and `settings`, the settings as KOKORO_NAME=value lines. The
+ * the novels' kept chapters), stats/listens.tsv, passages.tsv, fixes.tsv (your
+ * pronunciations) and voices/ (the cloned voices); and `settings`, the settings as KOKORO_NAME=value lines. The
  * kept audio and the engines' files stay out: they're made or fetched again.
  *
  * Restoring adds to what's on the phone and takes nothing away: a book in
@@ -21,9 +21,11 @@ import java.util.zip.ZipOutputStream
  */
 object Backup {
     /** What a restore brought: the backup's settings, and how many books, listens, passages and voices were new or further on. */
-    class Restored(val settings: Map<String, String>, val books: Int, val listens: Int, val passages: Int, val voices: Int) {
+    class Restored(val settings: Map<String, String>, val books: Int, val listens: Int, val passages: Int, val voices: Int,
+                   val fixes: Int = 0) {
         /** "3 books, 12 listens, 1 voice" ("Nothing new" when it's all here already). */
-        fun inWords(): String = listOf(books to "book", listens to "listen", passages to "passage", voices to "voice")
+        fun inWords(): String = listOf(books to "book", listens to "listen", passages to "passage", voices to "voice",
+            fixes to "pronunciation")
             .filter { it.first > 0 }.joinToString(", ") { (n, what) -> "$n $what${if (n == 1) "" else "s"}" }.ifEmpty { "Nothing new" }
     }
 
@@ -31,6 +33,7 @@ object Backup {
     private const val SETTINGS = "settings"
     private const val STATS = "stats/listens.tsv"
     private const val PASSAGES = "passages.tsv"
+    private const val FIXES = "fixes.tsv"
     private val FOLDERS = listOf("books", "stats", "voices")
 
     /** Write a backup of [root] and [settings] to [out] (closed when done); [version] is the app's. */
@@ -44,7 +47,7 @@ object Backup {
             val now = System.currentTimeMillis()
             entry(MARKER, now) { "version=1\napp=$version\n".byteInputStream() }
             entry(SETTINGS, now) { settings.entries.joinToString("") { (k, v) -> "$k=${v.replace("\n", " ")}\n" }.byteInputStream() }
-            val files = FOLDERS.flatMap { File(root, it).walkTopDown().filter { f -> f.isFile } } + File(root, PASSAGES)
+            val files = FOLDERS.flatMap { File(root, it).walkTopDown().filter { f -> f.isFile } } + File(root, PASSAGES) + File(root, FIXES)
             for (f in files) {
                 if (!f.isFile || f.name.endsWith(".tmp")) continue
                 entry(f.relativeTo(root).invariantSeparatorsPath, f.lastModified()) { f.inputStream() }
@@ -67,7 +70,8 @@ object Backup {
                 if (at > 0) line.substring(0, at) to line.substring(at + 1) else null
             }.toMap()
             return Restored(settings, books(File(tmp, "books"), File(root, "books")), listens(File(tmp, STATS), File(root, STATS)),
-                lines(File(tmp, PASSAGES), File(root, PASSAGES)), voices(File(tmp, "voices"), File(root, "voices")))
+                lines(File(tmp, PASSAGES), File(root, PASSAGES)), voices(File(tmp, "voices"), File(root, "voices")),
+                lines(File(tmp, FIXES), File(root, FIXES)))
         } finally {
             tmp.deleteRecursively()
         }
@@ -79,7 +83,7 @@ object Backup {
             while (true) {
                 val e = zip.nextEntry ?: break
                 val name = e.name
-                val ours = name == MARKER || name == SETTINGS || name == PASSAGES || FOLDERS.any { name.startsWith("$it/") }
+                val ours = name == MARKER || name == SETTINGS || name == PASSAGES || name == FIXES || FOLDERS.any { name.startsWith("$it/") }
                 if (e.isDirectory || !ours || name.split('/').any { it == ".." || it.isEmpty() }) continue
                 val dest = File(dir, name)
                 dest.parentFile.mkdirs()
@@ -144,7 +148,7 @@ object Backup {
         return came
     }
 
-    /** The lines of [from] that [to] doesn't have (by their first field: when a passage was saved), added to it. Returns how many. */
+    /** The lines of [from] that [to] doesn't have (by their first field: when a passage was saved, a word said your way), added to it. Returns how many. */
     private fun lines(from: File, to: File): Int {
         if (!from.isFile) return 0
         fun key(line: String) = line.substringBefore('\t')

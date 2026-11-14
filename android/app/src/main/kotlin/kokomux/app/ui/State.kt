@@ -28,6 +28,9 @@ data class ShelfBook(val id: String, val title: String, val part: Int, val parts
     val fresh get() = if (novel) (latest - number).coerceAtLeast(0) else 0
 }
 
+/** A pronunciation of yours: a word or name, and how to say it, spelt as it sounds. */
+data class Fix(val word: String, val sayAs: String)
+
 /** Something waiting in Up next: its id, its title, and what it is ("url", "file" or "text"). */
 data class Queued(val id: String, val title: String, val kind: String)
 
@@ -159,6 +162,8 @@ data class UiState(
     /** What's waiting to be heard after what's playing, in order; and the one just added (to say so for a moment). */
     val upNext: List<Queued> = emptyList(),
     val added: Queued? = null,
+    /** Your pronunciations, in the order they were kept. */
+    val fixes: List<Fix> = emptyList(),
 )
 
 /**
@@ -189,6 +194,10 @@ interface Actions {
     fun sleep(choice: Sleep?)
     fun voice(voice: String)
     fun hear(voice: String)
+    /** A pronunciation of yours: kept (in place of the word's last one), forgotten, or its respelling heard in your voice. */
+    fun setFix(word: String, sayAs: String)
+    fun removeFix(word: String)
+    fun hearFix(sayAs: String)
     /** Download an engine's files (kokomux.engine.VoiceId's id), or let them go. */
     fun fetchEngine(id: String)
     fun removeEngine(id: String)

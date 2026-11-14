@@ -78,14 +78,17 @@ class VoiceStudio(
     }
 
     /** A voice saying a line in its own language, the book paused meanwhile (tui.sh's voice_sample). */
-    fun hear(voice: String) {
+    fun hear(voice: String) = say(voice, Voices.sample(voice))
+
+    /** [voice] saying [text], the book paused meanwhile. */
+    fun say(voice: String, text: String) {
         if (hearing.isNotEmpty()) return
         hearing = voice
         val speed = prefs().speed
         val file = File(app.cacheDir, "sample.wav")
         scope.launch(Dispatchers.IO) {
             try {
-                val said = engine.speaker(voice, speed, Books.langOf(voice)).say(Voices.sample(voice))
+                val said = engine.speaker(voice, speed, Books.langOf(voice)).say(text)
                 Audio.writeWav(file, said.samples, said.rate)
                 withContext(Dispatchers.Main) {
                     val resume = book()?.isPlaying == true

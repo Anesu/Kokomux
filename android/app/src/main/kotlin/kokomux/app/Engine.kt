@@ -5,6 +5,9 @@ import android.content.Context
 import android.os.PowerManager
 import kokomux.engine.Bookmarks
 import kokomux.engine.Books
+import kokomux.engine.FixFile
+import kokomux.engine.FixedSpeaker
+import kokomux.engine.Fixes
 import kokomux.engine.Kokoro
 import kokomux.engine.KokoroSpeaker
 import kokomux.engine.Speakable
@@ -59,6 +62,8 @@ class Engine(private val context: Context) {
     val cache = File(context.filesDir, "kokomux-cache")
     /** Passages saved while listening. */
     val passages = Passages(File(context.filesDir, "passages.tsv"))
+    /** Your pronunciations. */
+    val fixes = FixFile(File(context.filesDir, "fixes.tsv"))
     /** What's waiting to be heard after what's playing. */
     val upNext = UpNext(File(context.filesDir, "queue.tsv"))
     /** The listens, for the stats. */
@@ -147,9 +152,16 @@ class Engine(private val context: Context) {
 
     /**
      * The speaker for [voice] reading text in [lang] at [speed] (Kokoro's: the others are made at
-     * 1× and sped up as they play). Loads the engine it needs; call it off the main thread.
+     * 1× and sped up as they play), your pronunciations given to it as you spelt them. Loads the
+     * engine it needs; call it off the main thread.
      */
-    fun speaker(voice: String, speed: Float, lang: String, preparing: (Int, Int) -> Unit = { _, _ -> }): Speaker =
+    fun speaker(voice: String, speed: Float, lang: String, preparing: (Int, Int) -> Unit = { _, _ -> }): Speaker {
+        val plain = plainSpeaker(voice, speed, lang, preparing)
+        val yours = Fixes(fixes.all())
+        return if (yours.isEmpty) plain else FixedSpeaker(plain, yours)
+    }
+
+    private fun plainSpeaker(voice: String, speed: Float, lang: String, preparing: (Int, Int) -> Unit): Speaker =
         when (VoiceId.engine(voice)) {
             VoiceId.MING -> {
                 val m = ming(preparing)

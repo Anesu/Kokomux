@@ -133,6 +133,7 @@ class ListenService : MediaSessionService() {
                         JUMP -> jump(args.getInt("part"))
                         SPEED -> speed(args.getFloat("speed"))
                         VOICE -> voice(args.getString("voice")!!)
+                        REMAKE -> remake()
                         SLEEP -> sleep(when (args.getString("kind")) {
                             "minutes" -> Sleep.Minutes(args.getLong("ms"))
                             "chapter" -> Sleep.EndOfChapter
@@ -396,6 +397,14 @@ class ListenService : MediaSessionService() {
         arrivedBookmark()
     }
 
+    /**
+     * How parts are said has changed (a pronunciation of yours): the part playing carries on, and
+     * the rest are made as they're said now (those said the same are kept as they are).
+     */
+    private fun remake() {
+        if (request != null) startMaking(if (at > 0) at + 1 else first, keepPlaying = at > 0)
+    }
+
     /** A new voice: the part you're on starts again in it (read again if its language differs). */
     private fun voice(voice: String) {
         val r = request ?: return
@@ -536,7 +545,9 @@ class ListenService : MediaSessionService() {
         const val SLEEP = "kokomux.SLEEP"
         /** A novel's chapter that isn't in this listen: the novel starts again there. */
         const val CHAPTER = "kokomux.CHAPTER"
-        private val COMMANDS = listOf(OPEN, STOP, JUMP, SPEED, VOICE, SLEEP, CHAPTER)
+        /** How parts are said has changed: those not yet heard are made again. */
+        const val REMAKE = "kokomux.REMAKE"
+        private val COMMANDS = listOf(OPEN, STOP, JUMP, SPEED, VOICE, SLEEP, CHAPTER, REMAKE)
         /** KOKORO_CACHE_GB's default: 50 GB of kept parts at most. */
         const val CACHE_LIMIT = 50L * 1000 * 1000 * 1000
     }

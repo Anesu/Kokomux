@@ -61,13 +61,13 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 
 /**
- * Settings (tui.sh's tui_settings): the voice and speed; how reading looks,
+ * Settings (tui.sh's tui_settings): the voice, your pronunciations and the speed; how reading looks,
  * shown in a sample of the reader that follows every change; how Kokoro runs
  * on this phone and how fast the voice is making speech; the engines' files,
  * the kept audio and a backup; the versions. A change is kept as it's made.
  */
 @Composable
-fun SettingsScreen(state: UiState, actions: Actions, onBack: () -> Unit, onVoices: () -> Unit) {
+fun SettingsScreen(state: UiState, actions: Actions, onBack: () -> Unit, onVoices: () -> Unit, onWords: () -> Unit = {}) {
     val t = LocalTokens.current
     val prefs = state.prefs
     fun save(p: Prefs) = actions.prefs(p)
@@ -81,6 +81,11 @@ fun SettingsScreen(state: UiState, actions: Actions, onBack: () -> Unit, onVoice
             SectionTitle("Voice")
             ListRow(Glyphs.hear, Voices.name(prefs.voice), Voices.describe(prefs.voice), accent = true,
                 trailing = { Icon(Glyphs.forward, null, Modifier.size(Space.l - 3.dp), tint = t.dim) }, onClick = onVoices)
+            ListRow(Glyphs.type, "Said your way", when (state.fixes.size) {
+                0 -> "A name or word, spelt as it sounds"
+                1 -> "1 word"
+                else -> "${state.fixes.size} words"
+            }, trailing = { Icon(Glyphs.forward, null, Modifier.size(Space.l - 3.dp), tint = t.dim) }, onClick = onWords)
             SpeedSetting(prefs.speed) { save(prefs.copy(speed = it)) }
 
             SectionTitle("Reading")

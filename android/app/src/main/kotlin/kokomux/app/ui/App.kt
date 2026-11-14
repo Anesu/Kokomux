@@ -29,8 +29,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import kotlinx.coroutines.delay
 
-/** The screens: home, the reader, settings, the voice picker, making a voice, listening stats, saved passages. */
-enum class Screen { HOME, READER, SETTINGS, VOICES, NEW_VOICE, STATS, SAVED }
+/** The screens: home, the reader, settings, the voice picker, making a voice, listening stats, saved passages, your pronunciations. */
+enum class Screen { HOME, READER, SETTINGS, VOICES, NEW_VOICE, STATS, SAVED, WORDS }
 
 /** What slides up over a screen. */
 enum class Sheet { CHAPTERS, SLEEP, SPEED, PAGE, TYPE, SAVED, AUDIOBOOK }
@@ -108,7 +108,9 @@ fun KokomuxApp(state: UiState, position: () -> Long, link: () -> String, actions
                         stats = { statsOf = p.id; actions.loadStats(); go(Screen.STATS) }, saved = { sheet = Sheet.SAVED },
                         audiobook = { sheet = Sheet.AUDIOBOOK }))
                 }
-                Screen.SETTINGS -> SettingsScreen(state, actions, onBack = ::back, onVoices = { go(Screen.VOICES) })
+                Screen.SETTINGS -> SettingsScreen(state, actions, onBack = ::back, onVoices = { go(Screen.VOICES) },
+                    onWords = { go(Screen.WORDS) })
+                Screen.WORDS -> WordsScreen(state, actions, onBack = ::back)
                 Screen.VOICES -> VoicesScreen(state, actions, onBack = ::back, onNewVoice = { go(Screen.NEW_VOICE) })
                 Screen.NEW_VOICE -> NewVoiceScreen(state, actions, onBack = ::back)
                 Screen.STATS -> StatsScreen(state.stats, onBack = ::back, book = statsOf)

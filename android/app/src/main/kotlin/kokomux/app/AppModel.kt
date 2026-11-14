@@ -21,6 +21,7 @@ import androidx.media3.session.SessionToken
 import java.io.File
 import kokomux.app.ui.Actions
 import kokomux.app.ui.Checked
+import kokomux.app.ui.Fix
 import kokomux.app.ui.Found
 import kokomux.app.ui.Saved
 import kokomux.app.ui.Making
@@ -66,6 +67,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
     private var stats by mutableStateOf<kokomux.engine.Stats?>(null)
     private var passages by mutableStateOf(emptyList<Saved>())
     private var upNext by mutableStateOf(emptyList<Queued>())
+    private var fixes by mutableStateOf(emptyList<Fix>())
     private var added by mutableStateOf<Queued?>(null)
     /** The part playing's word timings: (part, words). */
     private var words by mutableStateOf(0 to emptyList<WordSpan>())
@@ -98,7 +100,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
         }, ContextCompat.getMainExecutor(app))
         refreshShelf()
         loadStats()
-        viewModelScope.launch(Dispatchers.IO) { refreshPassages() }
+        viewModelScope.launch(Dispatchers.IO) { refreshPassages(); refreshFixes() }
         // The part playing's word timings, read when it changes or is made.
         viewModelScope.launch { snapshotFlow { Listening.at to Listening.made.size }.collect { readWords() } }
     }
@@ -131,7 +133,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
             recording = studio.recording, clip = studio.clip, cloning = studio.cloning,
             toc = novels.toc.map { e -> e.copy(now = now?.book?.chapterOf(Listening.at.coerceAtLeast(1))?.url == e.url) },
             tocLoading = novels.tocLoading, found = novels.found, searching = novels.searching, stats = stats, passages = passages,
-            saving = Export.progress, upNext = upNext, added = added,
+            saving = Export.progress, upNext = upNext, added = added, fixes = fixes,
         )
     }
 
@@ -331,6 +333,37 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
         if (setup == Setup.Ready) studio.hear(voice)
     }
 
+    // ------------------------------------------------------------ your pronunciations
+
+    override fun setFix(word: String, sayAs: String) {
+        if (word.isBlank() || sayAs.isBlank()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            engine.fixes.set(word, sayAs)
+            fixesChanged()
+        }
+    }
+
+    override fun removeFix(word: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            engine.fixes.remove(word)
+            fixesChanged()
+        }
+    }
+
+    override fun hearFix(sayAs: String) {
+        if (setup == Setup.Ready && sayAs.isNotBlank()) studio.say(prefs.voice, sayAs.trim())
+    }
+
+    /** The pronunciations changed: the book playing says what's still to come with them. */
+    private fun fixesChanged() {
+        refreshFixes()
+        if (Listening.now != null) viewModelScope.launch { command(ListenService.REMAKE) }
+    }
+
+    private fun refreshFixes() {
+        fixes = engine.fixes.all().map { Fix(it.first, it.second) }
+    }
+
     override fun fetchEngine(id: String) = studio.fetchEngine(id)
 
     override fun removeEngine(id: String) {
@@ -488,6 +521,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
                 }
                 studio.loadVoices()
                 refreshPassages()
+                refreshFixes()
                 refreshShelf()
                 loadStats()
                 Listening.note = "Restored: ${got.inWords()}"

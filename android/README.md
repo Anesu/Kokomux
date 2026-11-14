@@ -60,6 +60,10 @@ plain wording. The Termux version in `src/` stays as it is.
   reader that follow every change; then how Kokoro runs (`kokoro --benchmark`'s
   choices), how fast the voice in use makes speech here, the pronunciation
   check, the kept audio and each engine's files (with Remove).
+- **Said your way** (Settings): a name or word and how to say it, spelt as
+  it sounds ("Xiao Yan", "Shao Yen"), with **Hear** to try it. Every voice
+  says it that way from then on; the reader still shows and lights the book's
+  own spelling, and only the kept parts with that word are made again.
 - **Up next**: something opened or shared while a book is playing waits its
   turn, and is heard when the book ends (a bar says so, with **Play now**).
   Home lists what's waiting: tap one to hear it now, × to take it out.
@@ -223,6 +227,7 @@ with the model, and saves the screen before and after loading
 | `engine/…/Maker.kt` | engine.py's run_job: each part made and kept, ten minutes ahead of the player |
 | `engine/…/Bookmarks.kt` | where each book was left, as Termux's `.mark` files |
 | `engine/…/Stats.kt` | the listens kept, and what they add up to |
+| `engine/…/Fixes.kt` | your pronunciations: what the voice is given, the book's words lit all the same, and the file they're kept in |
 | `engine/…/UpNext.kt` | what's waiting to be heard, as Termux's queue file |
 | `engine/…/Plain.kt` | what went wrong, in a few plain words to show |
 | `engine/…/Backup.kt` | a backup: what's in the file, and how one is added to what's on the phone |
@@ -240,7 +245,7 @@ with the model, and saves the screen before and after loading
 | `app/…/Listening.kt` | what's playing, shared by the service and the screens |
 | `app/…/Store.kt` | the settings, under Termux's names |
 | `app/…/ui/Theme.kt`, `Glyphs.kt`, `Parts.kt` | the design system (golden ratio, Termux's palette), the icons, the shared pieces |
-| `app/…/ui/Home.kt`, `Reader.kt`, `Settings.kt`, `VoicesScreen.kt`, `NewVoice.kt`, `StatsScreen.kt`, `Passages.kt`, `Sheets.kt`, `FirstRun.kt` | the screens and the sheets |
+| `app/…/ui/Home.kt`, `Reader.kt`, `Settings.kt`, `VoicesScreen.kt`, `NewVoice.kt`, `Words.kt`, `StatsScreen.kt`, `Passages.kt`, `Sheets.kt`, `FirstRun.kt` | the screens and the sheets |
 | `app/…/ui/App.kt`, `State.kt` | the screens together (where back goes), and what they show and can ask for |
 | `app/…/Text.kt`, `Models.kt` | the Python side, and downloading each engine's files |
 | `app/src/main/python/kokomux_android.py` | what the app calls in Python (engine.py underneath) |

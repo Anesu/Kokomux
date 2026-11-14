@@ -12,6 +12,9 @@ class Said(val samples: FloatArray, val rate: Int, val rows: String, val prepSec
 /** A voice that says a book's parts: Kokoro through misaki, Ming, or a voice cloned with Qwen. */
 fun interface Speaker {
     fun say(text: String): Said
+
+    /** [text] as this voice is given it: the text itself, unless some of its words are said your own way ([FixedSpeaker]). */
+    fun spoken(text: String): String = text
 }
 
 /**

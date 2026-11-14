@@ -38,12 +38,15 @@ class Maker(
             val wav = File(cache, "$name.wav")
             val words = File(cache, "$name.words")
             var said: Said? = null
-            val kept = kept(name, chunk)
+            val spoken = speaker.spoken(chunk)
+            val kept = kept(name, chunk, spoken)
             if (!kept) {
                 if (!keepAhead(made, at, stop)) return
                 said = speaker.say(chunk)
                 // The text and word timings first, the audio last: its presence means the part is ready.
                 write(File(cache, "$name.txt"), chunk)
+                // (how it was said, when that isn't as it's written: a kept part is made again if that changes)
+                if (spoken != chunk) write(File(cache, "$name.said"), spoken) else File(cache, "$name.said").delete()
                 write(words, said.rows)
                 Audio.writeWav(wav, said.withPause(pause), said.rate)
             }
@@ -53,11 +56,12 @@ class Maker(
         }
     }
 
-    /** A kept part, made from exactly this text (engine.py's cached_part). */
-    private fun kept(name: String, chunk: String): Boolean {
+    /** A kept part, made from exactly this text (engine.py's cached_part) and said as it would be now ([spoken]). */
+    private fun kept(name: String, chunk: String, spoken: String): Boolean {
         val txt = File(cache, "$name.txt")
+        val said = File(cache, "$name.said")
         return File(cache, "$name.wav").exists() && txt.exists() && txt.readText() == chunk &&
-            File(cache, "$name.words").exists()
+            File(cache, "$name.words").exists() && (if (said.exists()) said.readText() else chunk) == spoken
     }
 
     /** Wait until less than [ahead] seconds of speech is ready ahead of the player; false if stopped. */
