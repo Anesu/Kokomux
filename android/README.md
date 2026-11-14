@@ -11,8 +11,9 @@ plain wording. The Termux version in `src/` stays as it is.
   **Type**; the bookshelf, each book with its cover and how far through.
 - **The reader**: the whole book in a reading column, the part being read on
   the golden line with the spoken word lit, the text fading with its distance
-  from it (the focus effect); tap any part to hear it. Below: the bar (tap it
-  to jump; it shows how far ahead parts are made, and where chapters start),
+  from it (the focus effect); tap any part to hear it. Below: the bar (tap it,
+  or drag along it to see the part and chapter you'd land on; it shows how far
+  ahead parts are made, and where chapters start),
   the part and the time left, ⏮ ▶ ⏭ (⏮ goes back to the part before in its
   first three seconds), then the speed, the sleep timer, the chapters and the
   voice, each showing its value. ⌄ folds the reader away, still playing; ⋮ has
@@ -53,6 +54,8 @@ The Termux screens' rules (src/theme.sh, src/tui.sh), on a touch screen
 - **Termux's palette.** Its dark and light colours, with greys in golden steps
   (φ⁻¹ secondary text, ½ what's been heard, φ⁻² rules, φ⁻⁴ surfaces), and the
   focus effect's fade a quarter golden step at a time, never below φ⁻⁴.
+  Secondary text keeps 4.5 : 1 (WCAG AA): φ⁻¹ of the way to the text on the
+  page, 1 − φ⁻³ on a raised surface (a card, a sheet, the chosen row).
 - **Within reach.** The controls you use while listening are at the bottom,
   where the thumb is; every target is at least 48 dp, the transport 55 and 89.
 - **The icons every phone uses stand alone** (play, pause, ⏮ ⏭, back, ⌄,

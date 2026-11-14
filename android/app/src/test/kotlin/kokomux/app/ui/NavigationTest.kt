@@ -7,7 +7,11 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.click
+import androidx.compose.ui.test.percentOffset
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.swipe
 import org.junit.Assert.assertEquals
 import org.junit.Rule
 import org.junit.Test
@@ -32,6 +36,11 @@ class NavigationTest {
         override fun resume(id: String) { log += "resume $id" }
         override fun speed(speed: Float) { log += "speed $speed" }
         override fun stop() { log += "stop" }
+        override fun previous() { log += "previous" }
+        override fun sleep(choice: Sleep?) { log += "sleep $choice" }
+        override fun hear(voice: String) { log += "hear $voice" }
+        override fun readTyped(text: String) { log += "typed $text" }
+        override fun readClipboard() { log += "clipboard" }
     }
 
     private fun show(state: UiState, asked: Asked) =
@@ -119,5 +128,58 @@ class NavigationTest {
         show(Fake.state.copy(playing = null), asked)
         compose.onNodeWithText("A Short History of Nearly Everything").performClick()
         assertEquals(listOf("resume 3"), asked.log)
+    }
+
+    @Test
+    fun theBarIsTappedOrDraggedToAPart() {
+        val asked = Asked()
+        show(Fake.state.copy(playing = Fake.playing(playing = false)), asked)
+        val bar = compose.onNodeWithContentDescription("Position")
+        bar.performTouchInput { click(percentOffset(0.75f, 0.5f)) }              // 1 + round(0.75 × 11) = 9
+        bar.performTouchInput { swipe(percentOffset(0.1f, 0.5f), percentOffset(0.55f, 0.5f), 377) }   // 1 + round(0.55 × 11) = 7
+        assertEquals(listOf("jump 9", "jump 7"), asked.log)
+    }
+
+    @Test
+    fun previousSleepAndAVoiceFromTheReader() {
+        val asked = Asked()
+        show(Fake.state.copy(playing = Fake.playing(playing = false)), asked)
+        compose.onNodeWithContentDescription("Previous").performClick()
+        compose.onNodeWithContentDescription("Sleep timer").performClick()
+        compose.onNodeWithText("30 min").performClick()
+        compose.onNodeWithContentDescription("Voice Emma").performClick()
+        compose.onNodeWithContentDescription("Hear George").performClick()      // heard, not chosen: still on the picker
+        compose.onNodeWithText("All").assertExists()
+        assertEquals(listOf("previous", "sleep Minutes(leftMs=1800000)", "hear bm_george"), asked.log)
+    }
+
+    @Test
+    fun foldingTheReaderAwayAndBack() {
+        val asked = Asked()
+        show(Fake.state.copy(playing = Fake.playing(playing = false)), asked)
+        compose.onNodeWithContentDescription("Home").performClick()
+        compose.onNodeWithText("Bookshelf").assertExists()
+        compose.onNodeWithText("The Long Road").performClick()                  // the card of what's playing
+        compose.onNodeWithContentDescription("Chapters").assertExists()
+        assertEquals(emptyList<String>(), asked.log)
+    }
+
+    @Test
+    fun somethingTypedIsRead() {
+        val asked = Asked()
+        show(Fake.state.copy(playing = null), asked)
+        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithText("What should Kokoro read?").performTextInput("Hello there.")
+        compose.onNodeWithText("Read").performClick()
+        compose.onNodeWithText("Opening…").assertExists()                        // (the fake never opens it)
+        assertEquals(listOf("typed Hello there."), asked.log)
+    }
+
+    @Test
+    fun theClipboardIsReadInOneTap() {
+        val asked = Asked()
+        show(Fake.state.copy(playing = null), asked)
+        compose.onNodeWithText("Clipboard").performClick()
+        assertEquals(listOf("clipboard"), asked.log)
     }
 }

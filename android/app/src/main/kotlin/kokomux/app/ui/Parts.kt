@@ -8,7 +8,6 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -38,7 +37,6 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -115,16 +113,11 @@ fun ListRow(
 /**
  * How far through, as a line: the accent up to here, a hint of it over what's
  * made ahead, the track (φ⁻²) after, with a notch where each chapter starts.
- * Tap it to jump there ([onSeek] gets the share of the way across).
  */
 @Composable
-fun Track(progress: Float, modifier: Modifier = Modifier, made: Float = 0f, marks: List<Float> = emptyList(),
-          height: Dp = 3.dp, onSeek: ((Float) -> Unit)? = null) {
+fun Track(progress: Float, modifier: Modifier = Modifier, made: Float = 0f, marks: List<Float> = emptyList(), height: Dp = 3.dp) {
     val t = LocalTokens.current
-    val touch = if (onSeek != null) Modifier.height(Space.l).pointerInput(onSeek) {
-        detectTapGestures { onSeek(((it.x) / size.width).coerceIn(0f, 1f)) }
-    } else Modifier.height(height)
-    Canvas(modifier.fillMaxWidth().then(touch).semantics { contentDescription = "${(progress * 100).toInt()}% through" }) {
+    Canvas(modifier.fillMaxWidth().height(height).semantics { contentDescription = "${(progress * 100).toInt()}% through" }) {
         val y = size.height / 2
         val w = height.toPx()
         drawLine(t.line, Offset(0f, y), Offset(size.width, y), w, StrokeCap.Round)
@@ -260,7 +253,7 @@ fun Logo(height: Dp = Space.xl, live: Boolean = false) {
 /** A quiet line of secondary text. */
 @Composable
 fun Dim(text: String, modifier: Modifier = Modifier, style: androidx.compose.ui.text.TextStyle = Type.small, maxLines: Int = Int.MAX_VALUE) =
-    Text(text, modifier, style = style, color = LocalTokens.current.dim, maxLines = maxLines, overflow = TextOverflow.Ellipsis)
+    Text(text, modifier, style = style, color = quiet(), maxLines = maxLines, overflow = TextOverflow.Ellipsis)
 
 /** Something went wrong: what, in the palette's red, and a way to dismiss it. */
 @Composable

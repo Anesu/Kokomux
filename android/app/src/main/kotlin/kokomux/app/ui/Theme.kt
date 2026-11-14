@@ -95,6 +95,15 @@ class Tokens(
     val psel = mix(bg, tint, 0.236f)
     /** The word being spoken sits on the background moved φ⁻² towards the accent. */
     val hl = mix(bg, accent, 0.382f)
+    /** A sheet sliding up over the screen (φ⁻⁶). */
+    val sheet = mix(bg, fg, 0.056f)
+
+    /**
+     * Secondary text on a raised surface (a card, a sheet, a chosen row):
+     * 1 − φ⁻³ of the way from the surface to the text, so it keeps 4.5 : 1
+     * there as φ⁻¹ does on the page.
+     */
+    fun quietOn(surface: Color) = mix(surface, fg, 0.764f)
 
     /** The text colour faded to [level] of the way from the background (the focus effect). */
     fun tone(level: Float) = mix(bg, fg, level.coerceIn(0f, 1f))
@@ -137,6 +146,21 @@ object Type {
 
 val LocalTokens = staticCompositionLocalOf { Tokens.DARK }
 
+/** The raised surface the content sits on (a card, a sheet, a chosen row); null on the page itself. */
+val LocalSurface = staticCompositionLocalOf<Color?> { null }
+
+/** [content] on a raised [surface]: its secondary text is made stronger to stay legible there. */
+@Composable
+fun OnSurface(surface: Color, content: @Composable () -> Unit) =
+    CompositionLocalProvider(LocalSurface provides surface, content = content)
+
+/** Secondary text's colour here: φ⁻¹ on the page, [Tokens.quietOn] on a raised surface. */
+@Composable
+fun quiet(): Color {
+    val t = LocalTokens.current
+    return LocalSurface.current?.let { t.quietOn(it) } ?: t.dim
+}
+
 /** Colours: auto (follow the phone), dark or light, as KOKORO_THEME. */
 enum class ThemeMode { AUTO, DARK, LIGHT }
 
@@ -156,7 +180,7 @@ fun KokomuxTheme(mode: ThemeMode = ThemeMode.AUTO, content: @Composable () -> Un
         tertiary = t.green, error = t.red,
         background = t.bg, onBackground = t.fg, surface = t.bg, onSurface = t.fg,
         surfaceVariant = t.surf, onSurfaceVariant = t.dim,
-        surfaceContainerLowest = t.bg, surfaceContainerLow = Tokens.mix(t.bg, t.fg, 0.056f),
+        surfaceContainerLowest = t.bg, surfaceContainerLow = t.sheet,
         surfaceContainer = Tokens.mix(t.bg, t.fg, 0.09f), surfaceContainerHigh = t.surf,
         surfaceContainerHighest = t.ghost, surfaceBright = t.surf, surfaceDim = t.bg,
         outline = t.line, outlineVariant = t.ghost, scrim = Color.Black,

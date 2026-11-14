@@ -56,7 +56,7 @@ class ScreensTest {
         val t = LocalTokens.current
         Box(Modifier.fillMaxSize().background(t.ghost)) {
             Box(Modifier.align(androidx.compose.ui.Alignment.BottomCenter).fillMaxWidth()
-                .background(Tokens.mix(t.bg, t.fg, 0.056f), Corner.xl).padding(top = Space.l)) { content() }
+                .background(t.sheet, Corner.xl).padding(top = Space.l)) { content() }
         }
     }
 

@@ -81,7 +81,7 @@ private fun NowCard(p: Playing?, actions: Actions, onReader: () -> Unit) {
         Modifier.fillMaxWidth().clip(Corner.l).background(t.surf).clickable(role = Role.Button, onClick = onReader)
             .padding(Space.m),
         verticalArrangement = Arrangement.spacedBy(Space.s),
-    ) {
+    ) { OnSurface(t.surf) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.m)) {
             if (p == null) Box(Modifier.size(Space.xl, Space.xl * Phi.PHI), contentAlignment = Alignment.Center) { Logo(Space.l, live = true) }
             else Cover(p.title)
@@ -95,7 +95,7 @@ private fun NowCard(p: Playing?, actions: Actions, onReader: () -> Unit) {
         }
         if (p != null && p.parts.size > 1) Track((p.at - 1f).coerceAtLeast(0f) / (p.parts.size - 1),
             made = (p.madeTo - 1f).coerceAtLeast(0f) / (p.parts.size - 1))
-    }
+    } }
 }
 
 /** A book on the shelf: its cover, title and how far through; tap to carry on, ⋮ to remove it. */

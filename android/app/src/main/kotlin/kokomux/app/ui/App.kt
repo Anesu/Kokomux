@@ -97,7 +97,7 @@ fun KokomuxApp(state: UiState, position: () -> Long, link: () -> String, actions
         val open = sheet ?: return@KokomuxTheme
         ModalBottomSheet(
             onDismissRequest = { sheet = null }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
-            containerColor = Tokens.mix(t.bg, t.fg, 0.056f), contentColor = t.fg, shape = Corner.xl,
+            containerColor = t.sheet, contentColor = t.fg, shape = Corner.xl,
         ) {
             val p = state.playing
             when (open) {

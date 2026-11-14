@@ -4,6 +4,8 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -38,7 +40,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.progressBarRangeInfo
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.setProgress
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -207,17 +215,7 @@ private fun Footer(p: Playing, actions: Actions, to: ReaderTo) {
             Modifier.widthIn(max = Space.column).fillMaxWidth().padding(horizontal = Space.l).padding(bottom = Space.s),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Track(
-                progress = if (n > 1 && p.at > 0) (p.at - 1f) / (n - 1) else 0f,
-                made = if (n > 1) (p.madeTo - 1f).coerceAtLeast(0f) / (n - 1) else 0f,
-                marks = if (p.chapters.size > 1 && n > 1) p.chapters.drop(1).map { (it.first - 1f) / (n - 1) } else emptyList(),
-                onSeek = { f -> actions.jump(1 + Math.round(f * (n - 1))) },
-            )
-            Row(Modifier.fillMaxWidth().height(Space.l)) {
-                Dim(if (p.at > 0) "${p.at} of $n" else "", Modifier.weight(1f), maxLines = 1)
-                if (p.left > 0) Dim(timeLeftLabel(p.left), maxLines = 1)
-            }
-            Spacer(Modifier.height(Space.xs))
+            Seek(p, actions)
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.l)) {
                 RoundButton(Glyphs.previous, "Previous", Space.xxl, enabled = p.at > 0, onClick = actions::previous)
                 RoundButton(if (p.playing) Glyphs.pause else Glyphs.play, if (p.playing) "Pause" else "Play", Space.xxxl,
@@ -232,6 +230,53 @@ private fun Footer(p: Playing, actions: Actions, to: ReaderTo) {
                     description = "Sleep timer", onClick = to.sleep)
                 if (p.chapters.size > 1) QuietButton(Glyphs.chapters, "Chapters", onClick = to.chapters)
                 QuietButton(Glyphs.hear, Voices.name(p.voice), description = "Voice ${Voices.name(p.voice)}", onClick = to.voices)
+            }
+        }
+    }
+}
+
+/**
+ * The bar and, under it, the part and the time left: one strip a thumb high.
+ * Tap it to go there, or drag along it to see which part and chapter you'd
+ * land on, and let go to go there.
+ */
+@Composable
+private fun Seek(p: Playing, actions: Actions) {
+    val t = LocalTokens.current
+    val n = p.parts.size
+    var scrub by remember { mutableStateOf<Float?>(null) }
+    fun partAt(f: Float) = 1 + Math.round(f.coerceIn(0f, 1f) * (n - 1))
+    val seeking = if (n > 1) Modifier
+        .pointerInput(n) { detectTapGestures { actions.jump(partAt(it.x / size.width)) } }
+        .pointerInput(n) {
+            detectHorizontalDragGestures(
+                onDragStart = { scrub = it.x / size.width },
+                onDragEnd = { scrub?.let { actions.jump(partAt(it)) }; scrub = null },
+                onDragCancel = { scrub = null },
+            ) { change, _ -> scrub = (change.position.x / size.width).coerceIn(0f, 1f) }
+        }
+        .semantics {
+            contentDescription = "Position"
+            progressBarRangeInfo = ProgressBarRangeInfo(p.at.toFloat(), 1f..n.toFloat(), n - 2)
+            setProgress { v -> actions.jump(Math.round(v).coerceIn(1, n)); true }
+        } else Modifier
+    Box(Modifier.fillMaxWidth().height(Space.touch).then(seeking)) {
+        Track(
+            progress = scrub ?: if (n > 1 && p.at > 0) (p.at - 1f) / (n - 1) else 0f,
+            made = if (n > 1) (p.madeTo - 1f).coerceAtLeast(0f) / (n - 1) else 0f,
+            marks = if (p.chapters.size > 1 && n > 1) p.chapters.drop(1).map { (it.first - 1f) / (n - 1) } else emptyList(),
+            height = if (scrub != null) 5.dp else 3.dp,
+            modifier = Modifier.align(Alignment.TopCenter).padding(top = Space.s),
+        )
+        Row(Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(bottom = Space.xs)) {
+            val to = scrub?.let { partAt(it) }
+            if (to != null) {
+                val chapter = p.chapters.lastOrNull { it.first <= to }?.title?.takeIf { p.chapters.size > 1 }
+                Text(listOfNotNull("$to of $n", chapter).joinToString(" · "), style = Type.small, color = t.accent2,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+            } else {
+                Dim(if (p.at > 0) "${p.at} of $n" else "", Modifier.weight(1f), maxLines = 1)
+                if (p.left > 0) Dim(timeLeftLabel(p.left), maxLines = 1)
             }
         }
     }

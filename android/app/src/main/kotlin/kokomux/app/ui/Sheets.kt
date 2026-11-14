@@ -43,7 +43,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 
-/** A sheet's frame: its name (with its state on the right, if it has one), then its content, in the reading column. */
+/** A sheet's frame: its name (with its state on the right, if it has one), then its content, in the reading column, on the sheet's colour. */
 @Composable
 fun SheetFrame(title: String, aside: String = "", content: @Composable ColumnScope.() -> Unit) {
     val t = LocalTokens.current
@@ -54,7 +54,7 @@ fun SheetFrame(title: String, aside: String = "", content: @Composable ColumnSco
                 if (aside.isNotEmpty()) Text(aside, style = Type.small, color = t.accent2)
             }
             Spacer(Modifier.height(Space.m))
-            content()
+            OnSurface(t.sheet) { content() }
         }
     }
 }
@@ -71,7 +71,7 @@ fun Choice(title: String, caption: String = "", chosen: Boolean = false, onClick
         Box(Modifier.width(3.dp).height(Space.l).clip(CircleShape).background(if (chosen) t.accent else t.bg.copy(alpha = 0f)))
         Column(Modifier.weight(1f).padding(vertical = Space.s)) {
             Text(title, style = Type.label, color = t.fg, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            if (caption.isNotEmpty()) Dim(caption, maxLines = 1)
+            if (caption.isNotEmpty()) OnSurface(if (chosen) t.sel else LocalSurface.current ?: t.bg) { Dim(caption, maxLines = 1) }
         }
         if (chosen) Icon(Glyphs.check, null, Modifier.size(Space.l - 3.dp), tint = t.accent)
     }
@@ -95,9 +95,9 @@ fun ChaptersSheet(p: Playing, onPick: (Int) -> Unit) {
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Box(Modifier.width(3.dp).height(Space.l).clip(CircleShape).background(if (chosen) t.accent else t.bg.copy(alpha = 0f)))
-                    Text("${i + 1}", style = Type.small, color = if (chosen) t.accent else t.dim,
+                    Text("${i + 1}", style = Type.small, color = if (chosen) t.accent else quiet(),
                         textAlign = TextAlign.End, modifier = Modifier.width(Space.xl).padding(end = Space.m))
-                    Text(c.title, style = Type.label, color = if (i < here) t.dim else t.fg, maxLines = 2,
+                    Text(c.title, style = Type.label, color = if (i < here) quiet() else t.fg, maxLines = 2,
                         overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(vertical = Space.s))
                 }
             }
@@ -156,7 +156,7 @@ fun PageSheet(suggested: String, onRead: (String) -> Unit) {
     SheetFrame("Web page") {
         OutlinedTextField(
             value = address, onValueChange = { address = it }, singleLine = true, modifier = Modifier.fillMaxWidth(),
-            placeholder = { Text("https://…", style = Type.body, color = t.line) }, textStyle = Type.body, shape = Corner.l,
+            placeholder = { Text("https://…", style = Type.body, color = quiet()) }, textStyle = Type.body, shape = Corner.l,
             leadingIcon = { Icon(Glyphs.globe, null, Modifier.size(Space.l - 3.dp), tint = t.dim) },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Go),
             keyboardActions = KeyboardActions(onGo = { if (ok) onRead(address.trim()) }),
@@ -175,7 +175,7 @@ fun TypeSheet(onRead: (String) -> Unit) {
     SheetFrame("Type") {
         OutlinedTextField(
             value = text, onValueChange = { text = it }, minLines = 5, modifier = Modifier.fillMaxWidth(),
-            placeholder = { Text("What should Kokoro read?", style = Type.reading, color = t.line) },
+            placeholder = { Text("What should Kokoro read?", style = Type.reading, color = quiet()) },
             textStyle = Type.reading.copy(color = t.fg), shape = Corner.l,
             colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = t.accent, unfocusedBorderColor = t.line),
         )

@@ -115,7 +115,7 @@ private fun VoiceRow(voice: String, chosen: Boolean, hearing: Boolean, onHear: (
         }
         Column(Modifier.weight(1f)) {
             Text(Voices.name(voice), style = Type.label, color = t.fg)
-            Dim(Voices.gender(voice), maxLines = 1)
+            if (chosen) OnSurface(t.sel) { Dim(Voices.gender(voice), maxLines = 1) } else Dim(Voices.gender(voice), maxLines = 1)
         }
         if (chosen) Icon(Glyphs.check, "Chosen", Modifier.size(Space.l - 3.dp), tint = t.accent)
     }
