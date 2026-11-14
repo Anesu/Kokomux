@@ -361,4 +361,4 @@ python3 dev/screen.py --out reader.png -- dev/kokoro -p -f story.txt   # a pictu
 
 Each test file runs on its own (`python3 tests/test_text.py`) or with pytest.
 
-**An Android app** is under way in `android/`: Kokoro and misaki running in an app of their own, with engine.py's text side packaged in as it is. See [android/README.md](android/README.md); GitHub Actions builds its debug APK.
+**The Android app** is in `android/`: Kokoro and misaki in an app of their own, with engine.py's text side packaged in as it is, and two more engines (Ming 3.0 on the phone's NPU, and Qwen3-TTS for voices cloned from a clip), web novels heard chapter after chapter, listening stats, saved passages, audiobooks and a widget. See [android/README.md](android/README.md); GitHub Actions builds its debug APK.

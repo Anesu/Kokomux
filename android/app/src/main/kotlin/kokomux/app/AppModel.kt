@@ -127,6 +127,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
                     voice = n.request.voice, speed = n.request.speed, sleep = Listening.sleep,
                     words = if (words.first == Listening.at) words.second else emptyList(),
                     left = left(n.book, Listening.at, n.request.speed), novel = n.book.novel != null,
+                    preparing = Listening.preparing,
                 )
             },
             voices = voices,

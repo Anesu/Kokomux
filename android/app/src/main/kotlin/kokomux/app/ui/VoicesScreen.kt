@@ -55,11 +55,11 @@ fun VoicesScreen(state: UiState, actions: Actions, onBack: () -> Unit, onNewVoic
     var engine by rememberSaveable { mutableStateOf(Voices.engine(state.prefs.voice)) }
     Column(Modifier.fillMaxSize().background(t.bg).safeDrawingPadding(), horizontalAlignment = Alignment.CenterHorizontally) {
         TopBar("Voice", onBack)
-        Row(
-            Modifier.widthIn(max = Space.column).fillMaxWidth().padding(horizontal = Space.l).padding(bottom = Space.s),
-            horizontalArrangement = Arrangement.spacedBy(Space.s),
+        LazyRow(
+            Modifier.widthIn(max = Space.column).fillMaxWidth().padding(bottom = Space.s),
+            contentPadding = PaddingValues(horizontal = Space.l), horizontalArrangement = Arrangement.spacedBy(Space.s),
         ) {
-            for ((id, title) in Voices.engines) Chip(title, engine == id) { engine = id }
+            items(Voices.engines) { (id, title) -> Chip(title, engine == id) { engine = id } }
         }
         val files = state.engines.firstOrNull { it.id == engine }
         if (files != null && !files.ready) {

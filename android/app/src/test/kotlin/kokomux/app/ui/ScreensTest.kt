@@ -132,6 +132,22 @@ class ScreensTest {
     @Test fun saved() = shot("saved", ThemeMode.LIGHT) { SavedScreen(Fake.passages, Fake.actions, {}) {} }
     @Test fun sheetAudiobook() = shot("sheet-audiobook", ThemeMode.LIGHT, sheet { AudiobookSheet(Fake.playing(), null) { _, _, _ -> } })
     @Test fun sheetAudiobookSaving() = shot("sheet-audiobook-saving", ThemeMode.DARK, sheet { AudiobookSheet(Fake.playing(), 13 to 21) { _, _, _ -> } })
+    @Test @Config(qualifiers = NARROW) fun voicesNarrow() = shot("narrow-voices-qwen", ThemeMode.DARK) {
+        VoicesScreen(Fake.state.copy(prefs = Fake.state.prefs.copy(voice = "qwen:en-us:Anesu")), Fake.actions, {}, {})
+    }
+    @Test @Config(qualifiers = NARROW) fun statsNarrow() = shot("narrow-stats", ThemeMode.LIGHT) { StatsScreen(Fake.stats, {}) }
+    @Test @Config(qualifiers = NARROW) fun newVoiceNarrow() = shot("narrow-new-voice", ThemeMode.DARK) {
+        NewVoiceScreen(Fake.state.copy(clip = Clip(7.2)), Fake.actions) {}
+    }
+    @Test @Config(fontScale = 1.3f) fun statsLargeText() = shot("large-text-stats", ThemeMode.DARK) { StatsScreen(Fake.stats, {}) }
+    @Test @Config(fontScale = 1.3f) fun findLargeText() = shot("large-text-find-novel", ThemeMode.LIGHT, sheet {
+        WebSheet("goddess summon", Fake.state.copy(found = Fake.found), Fake.actions) {}
+    })
+    @Test @Config(qualifiers = NARROW, fontScale = 1.3f) fun readerNarrowLarge() = shot("narrow-large-reader", ThemeMode.DARK, reader)
+    @Test fun readerPreparingMing() = shot("reader-preparing-ming", ThemeMode.DARK) {
+        ReaderScreen(Fake.playing(at = 0).copy(voice = "ming:UK_George", preparing = "Getting Ming ready for this phone · 2 of 5"),
+            Fake.state.prefs, { 0L }, Fake.actions, ReaderTo())
+    }
     @Test fun sheetSpeed() = shot("sheet-speed", ThemeMode.LIGHT, sheet { SpeedSheet(1.2f) {} })
     @Test fun sheetPage() = shot("sheet-page", ThemeMode.DARK, sheet { WebSheet("https://example.com/the-long-road", Fake.state, Fake.actions) {} })
     @Test fun sheetType() = shot("sheet-type", ThemeMode.LIGHT, sheet { TypeSheet {} })

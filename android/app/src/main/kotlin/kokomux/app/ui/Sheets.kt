@@ -188,16 +188,10 @@ fun WebSheet(suggested: String, state: UiState, actions: Actions, onRead: (Strin
         return
     }
     SheetFrame("Web page or novel") {
-        OutlinedTextField(
-            value = entry, onValueChange = { entry = it }, singleLine = true, modifier = Modifier.fillMaxWidth(),
-            placeholder = { Text("Address, or a novel's name", style = Type.body, color = quiet()) }, textStyle = Type.body,
-            shape = Corner.l,
-            leadingIcon = { Icon(Glyphs.globe, null, Modifier.size(Space.l - 3.dp), tint = t.dim) },
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = if (address) ImeAction.Go else ImeAction.Search),
-            keyboardActions = KeyboardActions(onGo = { if (address) onRead(entry.trim()) },
-                onSearch = { if (entry.isNotBlank()) actions.search(entry) }),
-            colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = t.accent, unfocusedBorderColor = t.line),
-        )
+        Field(entry, { entry = it }, "Address, or a novel's name", glyph = Glyphs.globe,
+            keyboard = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = if (address) ImeAction.Go else ImeAction.Search),
+            actions = KeyboardActions(onGo = { if (address) onRead(entry.trim()) },
+                onSearch = { if (entry.isNotBlank()) actions.search(entry) }))
         Spacer(Modifier.height(Space.m))
         if (address || entry.isBlank()) MainButton("Read", enabled = address) { onRead(entry.trim()) }
         else if (state.searching) ProgressFill(0, 1, "Finding “${entry.trim()}”…")
@@ -215,12 +209,7 @@ fun TypeSheet(onRead: (String) -> Unit) {
     val t = LocalTokens.current
     var text by rememberSaveable { mutableStateOf("") }
     SheetFrame("Type") {
-        OutlinedTextField(
-            value = text, onValueChange = { text = it }, minLines = 5, modifier = Modifier.fillMaxWidth(),
-            placeholder = { Text("What should Kokoro read?", style = Type.reading, color = quiet()) },
-            textStyle = Type.reading.copy(color = t.fg), shape = Corner.l,
-            colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = t.accent, unfocusedBorderColor = t.line),
-        )
+        Field(text, { text = it }, "Something to hear", minLines = 5, reading = true)
         Spacer(Modifier.height(Space.m))
         MainButton("Read", enabled = text.isNotBlank()) { onRead(text) }
     }

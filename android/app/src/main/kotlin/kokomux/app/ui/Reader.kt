@@ -325,7 +325,8 @@ private fun Seek(p: Playing, actions: Actions) {
                 Text(listOfNotNull("$to of $n", chapter).joinToString(" · "), style = Type.small, color = t.accent2,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
             } else {
-                Dim(if (p.at > 0) "${p.at} of $n" else "", Modifier.weight(1f), maxLines = 1)
+                // Before the first part plays, what's happening instead (an engine getting ready).
+                Dim(if (p.at > 0) "${p.at} of $n" else p.preparing, Modifier.weight(1f), maxLines = 1)
                 if (p.left > 0) Dim(timeLeftLabel(p.left), maxLines = 1)
             }
         }

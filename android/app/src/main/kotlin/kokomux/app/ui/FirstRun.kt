@@ -31,7 +31,7 @@ fun FirstRun(setup: Setup, actions: Actions) {
         Text("kokomux", style = Type.display, color = t.accent)
         Spacer(Modifier.height(Space.xl))
         when (setup) {
-            Setup.Missing -> MainButton("Download Kokoro · 354 MB", onClick = actions::download)
+            Setup.Missing -> MainButton("Download Kokoro · ${sizeLabel(kokomux.app.Pack.kokoro(java.io.File("")).total)}", onClick = actions::download)
             is Setup.Downloading -> ProgressFill(setup.done, setup.total)
             is Setup.Loading -> Dim("Loading ${setup.what}…", style = Type.body)
             is Setup.Failed -> {

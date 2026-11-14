@@ -218,7 +218,7 @@ class NavigationTest {
         val asked = Asked()
         show(Fake.state.copy(playing = null), asked)
         compose.onNodeWithText("Type").performClick()
-        compose.onNodeWithText("What should Kokoro read?").performTextInput("Hello there.")
+        compose.onNodeWithText("Something to hear").performTextInput("Hello there.")
         compose.onNodeWithText("Read").performClick()
         compose.onNodeWithText("Opening…").assertExists()                        // (the fake never opens it)
         assertEquals(listOf("typed Hello there."), asked.log)

@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
@@ -34,6 +35,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import kokomux.engine.Books
@@ -123,15 +125,22 @@ fun NewVoiceScreen(state: UiState, actions: Actions, onBack: () -> Unit) {
     }
 }
 
-/** A text to fill in: [label] inside it until something's typed. */
+/**
+ * A text to fill in, the same everywhere: [label] inside it until something's typed, an optional
+ * [glyph] before it, and the reader's face for [reading] text (something to be read aloud).
+ */
 @Composable
-fun Field(value: String, onChange: (String) -> Unit, label: String, minLines: Int = 1) {
+fun Field(value: String, onChange: (String) -> Unit, label: String, minLines: Int = 1, glyph: ImageVector? = null,
+          reading: Boolean = false, keyboard: KeyboardOptions = KeyboardOptions(imeAction = if (minLines == 1) ImeAction.Done else ImeAction.Default),
+          actions: KeyboardActions = KeyboardActions.Default) {
     val t = LocalTokens.current
+    val style = if (reading) Type.reading else Type.body
     OutlinedTextField(
         value = value, onValueChange = onChange, minLines = minLines, singleLine = minLines == 1,
         modifier = Modifier.fillMaxWidth(), shape = Corner.l,
-        placeholder = { Text(label, style = Type.body, color = quiet()) }, textStyle = Type.body.copy(color = t.fg),
-        keyboardOptions = KeyboardOptions(imeAction = if (minLines == 1) ImeAction.Done else ImeAction.Default),
+        placeholder = { Text(label, style = style, color = quiet()) }, textStyle = style.copy(color = t.fg),
+        leadingIcon = glyph?.let { { Icon(it, null, Modifier.size(Space.l - 3.dp), tint = t.dim) } },
+        keyboardOptions = keyboard, keyboardActions = actions,
         colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = t.accent, unfocusedBorderColor = t.line),
     )
 }

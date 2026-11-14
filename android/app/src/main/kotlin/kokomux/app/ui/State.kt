@@ -67,6 +67,8 @@ data class Playing(
     val left: Double = 0.0,
     /** It's a web novel: chapters arrive as it's heard. */
     val novel: Boolean = false,
+    /** The voice's engine getting ready for its first listen on this phone, in words ("" when it isn't). */
+    val preparing: String = "",
 ) {
     val chapter: Chapter? get() = chapters.lastOrNull { it.first <= at.coerceAtLeast(1) }
 }
