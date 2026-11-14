@@ -1,3 +1,4 @@
 *.wav
 __pycache__/
 .dev/
+!android/engine/src/test/resources/qwen_clip.wav
