@@ -94,7 +94,7 @@ class ListenService : MediaSessionService() {
     /** Listen to [request]'s book from its bookmark (or the start), in its voice. */
     private fun open(request: Request) {
         close()
-        val run = ++runs
+        val run = runs
         val stop = AtomicBoolean(false).also { this.stop = it }
         val engine = engine
         Listening.error = ""
@@ -190,9 +190,11 @@ class ListenService : MediaSessionService() {
         Listening.making = false
     }
 
-    /** Stop listening, keeping the bookmark. */
+    /** Stop listening, keeping the bookmark (a book still opening is let go too). */
     private fun close() {
         stop.set(true)
+        runs++
+        Listening.opening = false
         player.stop()
         player.clearMediaItems()
         Listening.now = null
