@@ -216,8 +216,10 @@ with the model, and saves the screen before and after loading
 | `engine/…/Stats.kt` | the listens kept, and what they add up to |
 | `engine/…/ming/` | Ming-3.0-tts's host side (from its Android sample, MIT: see `LICENSE` there) and its speaker |
 | `engine/…/qwen/` | Qwen3-TTS: cloning a voice, the talker and code predictor's loop, decoding; its speaker |
-| `app/src/main/kotlin/kokomux/app/ListenService.kt` | listening in the background: the playlist, the notification, the bookmark, speed, voice, the sleep timer, a novel's next chapter, the listens |
+| `app/src/main/kotlin/kokomux/app/ListenService.kt` | listening in the background: the playlist, the notification, the bookmark, speed, voice, a novel's next chapter; reading and making as jobs that cancel |
+| `app/…/SleepTimer.kt`, `ListenLog.kt` | the sleep timer and its fade; the listens kept for the stats |
 | `app/…/AppModel.kt` | the screens' state, from the service's and the settings; what each control does |
+| `app/…/VoiceStudio.kt`, `NovelLists.kt` | the model's voices (samples, engines' files, a new voice from a clip) and novels' lists (chapters, search) |
 | `app/…/Engine.kt` | what the app loads once: the engines and their files, Python, cloned voices, the bookmarks and kept parts |
 | `app/…/MingNpu.kt` | Ming's graphs on the NPU through LiteRT |
 | `app/…/Novels.kt`, `NewChapters.kt`, `Browser.kt` | web novels' chapters kept as they're fetched; the daily check for new ones; the browser for sites that ask |
