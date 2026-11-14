@@ -71,7 +71,7 @@ fun HomeScreen(
         val ready = state.setup == Setup.Ready
         ListRow(Glyphs.file, "Open a file", "An EPUB, a PDF or a text file", enabled = ready, onClick = onOpenFile)
         ListRow(Glyphs.globe, "Read a web page", "Its article, or a web novel's chapter", enabled = ready, onClick = onPage)
-        ListRow(Glyphs.paste, "Read the clipboard", "Its text, or the page a copied link goes to", enabled = ready) {
+        ListRow(Glyphs.paste, "Read the clipboard", "Its text, or a copied link's page", enabled = ready) {
             actions.readClipboard(); onReader()
         }
         ListRow(Glyphs.type, "Type something", "And hear it read", enabled = ready, onClick = onType)
