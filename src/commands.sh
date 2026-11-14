@@ -226,6 +226,34 @@ cmd_queue() {    # kokoro --queue [list|skip|clear]: play the queue in order
   exit 0
 }
 
+# ------------------------------------------------------------ the bookshelf
+# A book in progress is a bookmark, $BOOKS/ID.mark (key=value lines: part,
+# parts, title, kind, source, voice, speed, lang; a novel's also chapter,
+# number, novel), with ID.txt beside it for a text, and its made audio in
+# $CACHE/ID. A book heard to the end is a line in $FINISHED.
+
+shelf_load() {   # SHELF = the bookmarks, the one heard most recently first
+  SHELF=()
+  [ -d "$BOOKS" ] || return 0
+  mapfile -t SHELF < <(ls -t "$BOOKS"/*.mark 2>/dev/null) || true
+  return 0
+}
+
+shelf_remove() { # shelf_remove MARK: take a book off the shelf, with its kept text and audio
+  local id
+  id="$(basename "$1" .mark)"
+  [[ "$id" =~ ^[0-9a-f]+$ ]] || return 0
+  rm -rf "$1" "$BOOKS/$id.txt" "${CACHE:?}/$id"
+  return 0
+}
+
+finished_add() { # finished_add MARK: remember a book heard to the end (newest last)
+  local k vals=()
+  mkdir -p "${FINISHED%/*}"
+  for k in title kind source voice speed lang; do vals+=("$(mark_get "$1" "$k" | tr '\t' ' ')"); done
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%Y-%m-%d)" "${vals[@]}" >> "$FINISHED"
+}
+
 # ------------------------------------------------------------ bookmarks
 
 cmd_continue() { # kokoro --continue [MARK]: carry on with a bookmark (the last one), in its voice and speed

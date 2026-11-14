@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="1.1.0"
+KOKOMUX_VERSION="1.2.0"
 DISTRO=kokoro
 
 VERBOSE=0
@@ -506,7 +506,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_FILE__'
 # in theme.sh (all four loaded below).
 set -euo pipefail
 
-KOKOMUX_VERSION="1.1.0"
+KOKOMUX_VERSION="1.2.0"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -551,6 +551,7 @@ PLAYER_PID="$PREFIX/tmp/kokoro-player.pid"
 CONTROL="$PREFIX/tmp/kokoro-control"      # kokoro --pause/--next/--again leave a word here
 PLAYER_STATE="$PREFIX/tmp/kokoro-state"   # "playing" or "paused", for --pause to report
 BOOKS="$HOME/.local/share/kokomux/bookmarks"
+FINISHED="$HOME/.local/share/kokomux/finished"  # books heard to the end: date, title, kind, source, voice, speed, lang (tab-separated)
 QUEUE_DIR="$HOME/.local/share/kokomux/queue"   # shared links and files, to hear in order
 QUEUE="$QUEUE_DIR/list"                        # one per line: id, kind (url/file), source, title (tab-separated)
 QUIT_RC=0; [ "${KOKORO_QUEUE:-0}" = 1 ] && QUIT_RC=10   # stopped, not finished: the queue waits
@@ -734,7 +735,7 @@ stop_playback() {   # stop the running player, if any (returns 1 if there was no
 # ------------------------------------------------------------ keys and the frame timer
 # tick waits a moment (no process) and, on a terminal, reads one key or click
 # into KEY, by name (key_name): a printable key is itself ("q", " ", "+"), the
-# others are up down left right enter esc backspace pgup pgdn, and click (a
+# others are up down left right enter esc backspace delete pgup pgdn, and click (a
 # left click or tap, at CLICK_X, CLICK_Y). The mouse wheel is up and down.
 # A stop signal during the wait must not exit from inside `read -t`:
 # if cleanup then outlives the timer, bash's alarm jumps back into a read that's
@@ -780,6 +781,7 @@ key_name() {     # KEY, as the terminal sent it, to its name (see above); "" for
     $'\033[D'|$'\033OD') KEY=left ;;
     $'\033[5~') KEY=pgup ;;
     $'\033[6~') KEY=pgdn ;;
+    $'\033[3~') KEY=delete ;;
     $'\r'|$'\n') KEY=enter ;;
     $'\033') KEY=esc ;;
     $'\177'|$'\b') KEY=backspace ;;
@@ -1451,7 +1453,8 @@ cat > "$WORK/tui.sh" <<'__KOKOMUX_FILE__'
 #
 # Expects from kokoro: the colours, $tmpd, $KBD (a read descriptor on
 # /dev/tty), tick (sets KEY, by name; runs $TICK_BG while it waits), now_ms,
-# and for the home screen BOOKS, QUEUE, CONF, mark_get and the KOKORO_* settings.
+# and for the home screen BOOKS, QUEUE, FINISHED, CONF, mark_get, shelf_load,
+# shelf_remove (commands.sh) and the KOKORO_* settings.
 
 TUI=0; TUI_TTY=""; TUI_RESIZED=0
 TW=80; TH=24; CW=72; LM=4             # screen size; reading column width and margin
@@ -1544,6 +1547,12 @@ tui_refresh() {  # after a resize: measure again and draw everything
 
 rule() { local line; printf -v line '%*s' "$1" ''; printf '%s' "${line// /─}"; }   # rule N: a line N columns wide
 golden() { REPLY=$(( $1 * 382 / 1000 )); }   # golden N: the smaller golden part of N (N/φ²)
+fit() {          # fit TEXT WIDTH: REPLY = TEXT cut (with …) or padded to WIDTH columns (printf pads bytes, not letters)
+  local t=$1 w=$2
+  [ "$w" -ge 1 ] || { REPLY=""; return 0; }
+  [ "${#t}" -gt "$w" ] && t="${t:0:$(( w - 1 ))}…"
+  printf -v REPLY '%s%*s' "$t" $(( w - ${#t} )) ''
+}
 
 # ---------------------------------------------------------------- drawing
 
@@ -1790,10 +1799,11 @@ tui_click() {    # a click or tap at CLICK_X, CLICK_Y on a button or the progres
   fi
 }
 
-tui_chapters() { # tui_chapters CURRENT: pick a chapter over the reading area; CHOSEN = its index or ""
-  local sel=${1:-0} top=0 i y view w x0 key title
+LIST_LABEL=(); LIST_NOTE=()           # what tui_list shows: each row's label, and a quieter note on its right
+tui_list() {     # tui_list TITLE CURRENT [HELP]: pick a row of LIST_LABEL in a panel; CHOSEN = its index ("" if closed)
+  local title=$1 sel=${2:-0} help=${3:-↑↓ Enter · Esc close} top=0 i y view w x0 label note room
   CHOSEN=""
-  [ "$sel" -ge 0 ] || sel=0
+  [ "$sel" -ge 0 ] 2>/dev/null || sel=0
   local -A rowsel=()
   local dirty=1      # draw only when something changed: a key, a resize
   while :; do
@@ -1801,37 +1811,50 @@ tui_chapters() { # tui_chapters CURRENT: pick a chapter over the reading area; C
     TUI_RESIZED=0; dirty=0
     tui_size
     w=$(( CW < 60 ? CW : 60 )); x0=$(( (TW - w) / 2 )); view=$(( TH - 10 ))
-    [ "${#CH_TITLE[@]}" -lt "$view" ] && view=${#CH_TITLE[@]}          # as tall as it needs to be
+    [ "${#LIST_LABEL[@]}" -lt "$view" ] && view=${#LIST_LABEL[@]}      # as tall as it needs to be
     [ "$sel" -lt "$top" ] && top=$sel
     [ "$sel" -ge $(( top + view )) ] && top=$(( sel - view + 1 ))
     out '%s' "$SYNC_ON"
-    out '\033[3;%dH%s%*s\033[3;%dH %sChapters%s%s' "$x0" "$SURF" "$w" "" "$x0" "$B" "$R" "$SURF"
+    out '\033[3;%dH%s%*s\033[3;%dH %s%s%s%s' "$x0" "$SURF" "$w" "" "$x0" "$B" "$title" "$R" "$SURF"
     rowsel=()
     for (( i = top, y = 4; y < 4 + view; i++, y++ )); do
       out '\033[%d;%dH%s%*s' "$y" "$x0" "$SURF" "$w" ""
-      [ "$i" -lt "${#CH_TITLE[@]}" ] || continue
-      title=${CH_TITLE[i]}; [ "${#title}" -gt $(( w - 12 )) ] && title="${title:0:$(( w - 13 ))}…"
+      [ "$i" -lt "${#LIST_LABEL[@]}" ] || continue
+      label=${LIST_LABEL[i]} note=${LIST_NOTE[i]:-}
+      room=$(( w - 4 - ${#note} )); [ "$room" -ge 8 ] || { note=""; room=$(( w - 3 )); }
+      fit "$label" "$room"; label=$REPLY
       if [ "$i" = "$sel" ]; then
-        out '\033[%d;%dH%s%*s\033[%d;%dH%s%s▎%s%s %-*s %spart %s%s' "$y" "$x0" "$PSEL" "$w" "" "$y" "$x0" \
-          "$PSEL" "$ACC" "$R" "$PSEL" $(( w - 12 )) "$title" "$D" "${CH_START[i]}" "$R"
+        out '\033[%d;%dH%s%*s\033[%d;%dH%s%s▎%s%s %s %s%s%s' "$y" "$x0" "$PSEL" "$w" "" "$y" "$x0" \
+          "$PSEL" "$ACC" "$R" "$PSEL" "$label" "$D" "$note" "$R"
       else
-        out '\033[%d;%dH%s  %-*s %spart %s%s' "$y" "$x0" "$SURF" $(( w - 12 )) "$title" "$D" "${CH_START[i]}" "$R"
+        out '\033[%d;%dH%s  %s %s%s%s' "$y" "$x0" "$SURF" "$label" "$D" "$note" "$R"
       fi
       rowsel[$y]=$i
     done
-    out '\033[%d;%dH%s%*s\033[%d;%dH %s↑↓ Enter jump · Esc close%s' $(( 4 + view )) "$x0" "$SURF" "$w" "" $(( 4 + view )) "$x0" "$D" "$R"
+    out '\033[%d;%dH%s%*s\033[%d;%dH %s%s%s' $(( 4 + view )) "$x0" "$SURF" "$w" "" $(( 4 + view )) "$x0" "$D" "$help" "$R"
     out '%s' "$SYNC_OFF"
     fi
     KEY=""; tick 0.5; [ -n "$KEY" ] || { continue; }
     dirty=1
     case "$KEY" in
       up|k) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
-      down|j) [ "$sel" -lt $(( ${#CH_TITLE[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
+      down|j) [ "$sel" -lt $(( ${#LIST_LABEL[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
+      pgup) sel=$(( sel > view ? sel - view : 0 )) ;;
+      pgdn) sel=$(( sel + view < ${#LIST_LABEL[@]} ? sel + view : ${#LIST_LABEL[@]} - 1 )) ;;
       enter) CHOSEN=$sel; break ;;
       click) i=${rowsel[$CLICK_Y]:-}; [ -z "$i" ] || { CHOSEN=$i; break; } ;;
-      esc|q|c) break ;;
+      esc|q) break ;;
+      *) [ -n "${LIST_KEYS:-}" ] && [[ "$KEY" == ["$LIST_KEYS"] ]] && break ;;   # the key that opened it closes it too
     esac
   done
+  return 0
+}
+
+tui_chapters() { # tui_chapters CURRENT: pick a chapter over the reading area; CHOSEN = its index or ""
+  local i
+  LIST_LABEL=("${CH_TITLE[@]}"); LIST_NOTE=()
+  for i in "${!CH_START[@]}"; do LIST_NOTE[i]="part ${CH_START[i]}"; done
+  LIST_KEYS=c tui_list "Chapters" "${1:-0}" "↑↓ Enter jump · Esc close"
   tui_draw
 }
 
@@ -1894,13 +1917,67 @@ tui_prompt() {   # tui_prompt LABEL [DEFAULT]: ask on the bottom line (with Tab 
   ANSWER=$ans
 }
 
-tui_home() {     # runs until something is chosen; prints the chosen kokoro arguments
-  local sel=0 marks=() key r i m title part parts pct bw bar row y h free n
+home_book() {    # home_book Y MARK NUM SELECTED: one book on the shelf: its number, title, progress bar, how far, and ✕ (remove)
+  local y=$1 m=$2 title part parts pct bw=12 bar rest row="" mk=" "
+  title="$(mark_get "$m" title)"; part="$(mark_get "$m" part)"; parts="$(mark_get "$m" parts)"
+  [ "${parts:-0}" -gt 0 ] 2>/dev/null || parts=1
+  [ "${part:-0}" -gt 0 ] 2>/dev/null || part=1
+  pct=$(( 100 * (part - 1) / parts ))
+  if [ "$(mark_get "$m" kind)" = novel ]; then            # a web novel: the chapter it's at, and how far in
+    title="$title · Ch $(mark_get "$m" number)"
+    [ "$(mark_get "$m" "done")" = 1 ] && pct=100
+  fi
+  printf -v bar '%*s' $(( pct * bw / 100 )) ''; bar="$ACC${bar// /━}$R"
+  printf -v rest '%*s' $(( bw - pct * bw / 100 )) ''; bar+="$LINE${rest// /─}$R"
+  fit "$title" $(( CW - 26 )); title=$REPLY
+  local x=$GHOST
+  if [ "$4" = 1 ]; then row=$SEL; mk="$ACC▎"; x=$D; fi
+  bar="${bar//$R/$R$row}"            # keep the selected row's background across the bar
+  out '\033[%d;%dH%s%s%s%s%2d%s  %s %s %s%3d%%%s %s✕%s' "$y" "$LM" "$row" "$mk" "$R$row" \
+    "$ACC2" "$3" "$R$row" "$title" "$bar$row" "$D" "$pct" "$R$row" "$x" "$R"
+  HOME_X=$(( LM + CW - 2 ))          # the ✕'s column, for a tap
+}
+
+tui_confirm() {  # tui_confirm QUESTION: ask on the bottom line; true if the answer is y
+  local q=$1 room=$(( TW - LM - 7 ))
+  [ "${#q}" -gt "$room" ] && q="${q:0:$(( room - 1 ))}…"
+  out '%s\033[%d;1H\033[2K\033[%d;%dH%s %s(y/n)%s' "$R" "$TH" "$TH" "$LM" "$q" "$D" "$R"
+  KEY=""
+  while [ -z "$KEY" ]; do tick 1; done
+  [ "$KEY" = y ] || [ "$KEY" = Y ]
+}
+
+finished_list() { # the books heard to the end, newest first: pick one to hear again (HOME_CHOICE)
+  local lines=() k date title kind src voice speed lang
+  [ -s "$FINISHED" ] || return 0
+  mapfile -t lines < <(tac "$FINISHED")
+  LIST_LABEL=(); LIST_NOTE=()
+  for k in "${!lines[@]}"; do
+    IFS=$'\t' read -r date title _ <<< "${lines[k]}"
+    LIST_LABEL+=("$title"); LIST_NOTE+=("$date")
+  done
+  out '\033[2J'                                  # (the panel alone, over a clear screen)
+  LIST_KEYS=h tui_list "Finished" 0 "Enter hear it again · Esc close"
+  [ -n "$CHOSEN" ] || return 0
+  IFS=$'\t' read -r date title kind src voice speed lang <<< "${lines[CHOSEN]}"
+  case "$kind" in
+    url) HOME_CHOICE=(-p --restart -v "$voice" -s "$speed" -l "$lang" -u "$src") ;;
+    file) if [ -f "$src" ]; then HOME_CHOICE=(-p --restart -v "$voice" -s "$speed" -l "$lang" -f "$src")
+          else tui_confirm "\"$title\" isn't at $(tilde "$src") any more. OK" || true; fi ;;
+    *) tui_confirm "That was a text, and it isn't kept. OK" || true ;;
+  esac
+  return 0
+}
+
+tui_home() {     # runs until something is chosen; leaves the chosen kokoro arguments in HOME_CHOICE
+  local sel=0 top=0 view=1 r i m y h free n key spec cmd finished=0
+  HOME_X=0
   local -A rowact=()
   tui_enter
-  mapfile -t marks < <(ls -t "$BOOKS"/*.mark 2>/dev/null | head -n 6)
+  shelf_load
   local queue=() qn=0
   if [ -s "$QUEUE" ]; then mapfile -t queue < <(cut -f4 "$QUEUE"); qn=${#queue[@]}; fi
+  [ -s "$FINISHED" ] && finished="$(wc -l < "$FINISHED")"
   HOME_CHOICE=()
   while IFS= read -rsn1 -t 0.05 -u "$KBD" _; do :; done   # drop keys typed before it opened
   local api=0
@@ -1913,13 +1990,20 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
     out '%s%s\033[2J' "$SYNC_ON" "$R"
     # The content as one block, its free space split 1 : φ above and below:
     # the optical centre, where a block looks centred rather than low.
-    n=${#marks[@]}; [ "$n" -gt 0 ] || n=1
-    if [ "$TH" -ge 22 ]; then h=6; else h=2; fi
-    h=$(( h + 1 + n + 1 + 1 + 6 ))
+    n=${#SHELF[@]}; [ "$n" -gt 0 ] || n=1
+    local logo=0; [ "$TH" -ge 22 ] && logo=1
+    h=$(( (logo ? 6 : 2) + 1 + 1 + 1 + 7 ))       # the title, the shelf's heading and gap, "Start something new"
+    [ "$finished" -gt 0 ] && h=$(( h + 1 ))
     [ "$qn" -gt 0 ] && h=$(( h + 2 + (qn < 3 ? qn : 3) + 1 ))     # Up next
-    free=$(( TH - 2 - h )); [ "$free" -gt 0 ] || free=0
+    view=$(( TH - 2 - h ))                        # the shelf takes the room that's left, and scrolls
+    if [ "$view" -lt 3 ] && [ "$logo" = 1 ]; then logo=0; h=$(( h - 4 )); view=$(( view + 4 )); fi
+    [ "$view" -ge 1 ] || view=1
+    [ "$n" -lt "$view" ] && view=$n
+    [ "$sel" -lt "$top" ] && top=$sel
+    [ "$sel" -ge $(( top + view )) ] && top=$(( sel - view + 1 ))
+    free=$(( TH - 2 - h - view )); [ "$free" -gt 0 ] || free=0
     golden "$free"; y=$(( 1 + REPLY ))
-    if [ "$TH" -ge 22 ]; then                     # the logo, when there's room for it
+    if [ "$logo" = 1 ]; then                      # the logo, when there's room for it
       local l=0 line
       theme_grad 3 2>/dev/null || GRAD=("$ACC" "$ACC" "$ACC2")
       for line in '░█░█░█▀█░█░█░█▀█░█▄█░█░█░█░█' '░█▀▄░█░█░█▀▄░█░█░█░█░█░█░▄▀▄' '░▀░▀░▀▀▀░▀░▀░▀▀▀░▀░▀░▀▀▀░▀░▀'; do
@@ -1933,76 +2017,79 @@ tui_home() {     # runs until something is chosen; prints the chosen kokoro argu
       out '\033[%d;%dH%skokomux%s  %sKokoro text-to-speech%s' "$y" "$LM" "$ACC" "$R" "$D" "$R"
       y=$(( y + 2 ))
     fi
-    local x0=$LM
-    out '\033[%d;%dH%sBookshelf%s' "$y" "$x0" "$B" "$R"; y=$(( y + 1 ))
-    if [ "${#marks[@]}" = 0 ]; then
+    r=""
+    if [ "${#SHELF[@]}" -gt "$view" ]; then r="  ${D}$(( top + 1 ))–$(( top + view )) of ${#SHELF[@]}${R}"; fi
+    out '\033[%d;%dH%sBookshelf%s%s' "$y" "$LM" "$B" "$R" "$r"; y=$(( y + 1 ))
+    if [ "${#SHELF[@]}" = 0 ]; then
       r="Nothing in progress yet. Long texts and books are remembered here."
       [ "${#r}" -gt "$CW" ] && r="Nothing in progress yet."
-      out '\033[%d;%dH%s%s%s' "$y" "$x0" "$D" "$r" "$R"
+      out '\033[%d;%dH%s%s%s' "$y" "$LM" "$D" "$r" "$R"
       y=$(( y + 1 ))
     fi
-    for i in "${!marks[@]}"; do
-      m=${marks[i]}; title="$(mark_get "$m" title)"; part="$(mark_get "$m" part)"; parts="$(mark_get "$m" parts)"
-      [ "${parts:-0}" -gt 0 ] 2>/dev/null || parts=1
-      pct=$(( 100 * (part - 1) / parts )); bw=12
-      if [ "$(mark_get "$m" kind)" = novel ]; then            # a web novel: the chapter it's at, and how far in
-        title="$title · Ch $(mark_get "$m" number)"
-        [ "$(mark_get "$m" "done")" = 1 ] && pct=100
-      fi
-      printf -v bar '%*s' $(( pct * bw / 100 )) ''; bar="$ACC${bar// /━}$R"
-      local rest; printf -v rest '%*s' $(( bw - pct * bw / 100 )) ''; bar+="$LINE${rest// /─}$R"
-      local room=$(( CW - 23 )); [ "${#title}" -gt "$room" ] && title="${title:0:$(( room - 1 ))}…"
-      local mk=" "; row=""
-      if [ "$i" = "$sel" ]; then row=$SEL; mk="$ACC▎"; fi
-      bar="${bar//$R/$R$row}"            # keep the selected row's background across the bar
-      out '\033[%d;%dH%s%s%s%s%d%s  %-*s %s %s%3d%%%s %s' "$y" "$x0" "$row" "$mk" "$R$row" \
-        "$ACC2" $(( i + 1 )) "$R$row" "$room" "$title" "$bar$row" "$D" "$pct" "$R$row" "$R"
+    for (( i = top; i < top + view && i < ${#SHELF[@]}; i++ )); do
+      home_book "$y" "${SHELF[i]}" $(( i + 1 )) $(( i == sel ))
       rowact[$y]="mark:$i"; y=$(( y + 1 ))
     done
     y=$(( y + 1 ))
     if [ "$qn" -gt 0 ]; then                      # shared links and files, waiting their turn
-      out '\033[%d;%dH%sUp next%s  %s%d in the queue%s' "$y" "$x0" "$B" "$R" "$D" "$qn" "$R"; y=$(( y + 1 ))
+      out '\033[%d;%dH%sUp next%s  %s%d in the queue%s' "$y" "$LM" "$B" "$R" "$D" "$qn" "$R"; y=$(( y + 1 ))
       for (( i = 0; i < qn && i < 3; i++ )); do
-        title=${queue[i]}; [ "${#title}" -gt $(( CW - 6 )) ] && title="${title:0:$(( CW - 7 ))}…"
-        out '\033[%d;%dH   %s%s%s' "$y" "$x0" "$D" "$title" "$R"; rowact[$y]=queue; y=$(( y + 1 ))
+        r=${queue[i]}; [ "${#r}" -gt $(( CW - 6 )) ] && r="${r:0:$(( CW - 7 ))}…"
+        out '\033[%d;%dH   %s%s%s' "$y" "$LM" "$D" "$r" "$R"; rowact[$y]=queue; y=$(( y + 1 ))
       done
-      out '\033[%d;%dH %sp%s  Play the queue' "$y" "$x0" "$ACC2" "$R"; rowact[$y]=queue; y=$(( y + 2 ))
+      out '\033[%d;%dH %sp%s  Play the queue' "$y" "$LM" "$ACC2" "$R"; rowact[$y]=queue; y=$(( y + 2 ))
     fi
     local clip_note=""; [ "$api" = 1 ] || clip_note="  ${D}needs the Termux:API app${R}"
-    out '\033[%d;%dH%sStart something new%s' "$y" "$x0" "$B" "$R"; y=$(( y + 1 ))
-    for spec in "c|Read the clipboard$clip_note|clip" "f|Open a file  ${D}text, EPUB or PDF${R}|file" \
-                "u|Read a web page|url" "t|Type something to hear|text" \
-                "v|Voice  ${D}$(voice_label "$(voice_mix)") · ${KOKORO_SPEED}×${R}|voice" "s|Settings  ${D}speed, colours, highlighting…${R}|settings"; do
+    out '\033[%d;%dH%sStart something new%s' "$y" "$LM" "$B" "$R"; y=$(( y + 1 ))
+    local specs=("c|Read the clipboard$clip_note|clip" "f|Open a file  ${D}text, EPUB or PDF${R}|file"
+                 "u|Read a web page|url" "t|Type something to hear|text"
+                 "v|Voice  ${D}$(voice_label "$(voice_mix)") · ${KOKORO_SPEED}×${R}|voice" "s|Settings  ${D}speed, colours, highlighting…${R}|settings")
+    [ "$finished" -gt 0 ] && specs+=("h|Finished  ${D}$finished heard to the end${R}|finished")
+    for spec in "${specs[@]}"; do
       IFS='|' read -r key r cmd <<< "$spec"
-      out '\033[%d;%dH %s%s%s  %s' "$y" "$x0" "$ACC2" "$key" "$R" "$r"
+      out '\033[%d;%dH %s%s%s  %s' "$y" "$LM" "$ACC2" "$key" "$R" "$r"
       rowact[$y]=$cmd; y=$(( y + 1 ))
     done
     local go=""                                   # a web novel can start from another chapter
-    if [ "${#marks[@]}" -gt 0 ] && [ "$(mark_get "${marks[sel]}" kind)" = novel ]; then go=" · g go to chapter"; fi
-    if [ "$TW" -ge 64 ]; then r="↑↓ choose · Enter play$go · click or tap anything · q quit"
-    else r="↑↓ · Enter play${go/go to /} · tap · q quit"; fi
+    if [ "${#SHELF[@]}" -gt 0 ] && [ "$(mark_get "${SHELF[sel]}" kind)" = novel ]; then go=" · g chapter"; fi
+    if [ "${#SHELF[@]}" = 0 ]; then r="click or tap anything · q quit"
+    elif [ "$TW" -ge 72 ]; then r="↑↓ choose · Enter play$go · x remove · click or tap anything · q quit"
+    else r="↑↓ · Enter play$go · x remove · q quit"; fi
     out '\033[%d;%dH%s%s%s' "$TH" "$LM" "$D" "$r" "$R"
     out '%s' "$SYNC_OFF"
-
     fi
     KEY=""; tick 1; [ -n "$KEY" ] || { continue; }
     dirty=1
     cmd=""
     case "$KEY" in
-      [1-6]) [ "$(( KEY - 1 ))" -lt "${#marks[@]}" ] && cmd="mark:$(( KEY - 1 ))" ;;
-      enter) [ "${#marks[@]}" -gt 0 ] && cmd="mark:$sel" ;;
+      [1-9]) [ "$(( KEY - 1 ))" -lt "${#SHELF[@]}" ] && cmd="mark:$(( KEY - 1 ))" ;;
+      enter) [ "${#SHELF[@]}" -gt 0 ] && cmd="mark:$sel" ;;
       up|k) [ "$sel" -gt 0 ] && sel=$(( sel - 1 )) ;;
-      down|j) [ "$sel" -lt $(( ${#marks[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
+      down|j) [ "$sel" -lt $(( ${#SHELF[@]} - 1 )) ] && sel=$(( sel + 1 )) ;;
+      pgup) sel=$(( sel > view ? sel - view : 0 )) ;;
+      pgdn) [ "${#SHELF[@]}" -gt 0 ] && sel=$(( sel + view < ${#SHELF[@]} ? sel + view : ${#SHELF[@]} - 1 )) ;;
+      x|X|delete|backspace) [ "${#SHELF[@]}" -gt 0 ] && cmd=remove ;;
       c) cmd="clip" ;; f) cmd="file" ;; u) cmd="url" ;; t) cmd="text" ;; v) cmd="voice" ;; s|o|,) cmd="settings" ;;
+      h) [ "$finished" -gt 0 ] && cmd=finished ;;
       p) [ "$qn" -gt 0 ] && cmd="queue" ;;
-      g) [ "${#marks[@]}" -gt 0 ] && [ "$(mark_get "${marks[sel]}" kind)" = novel ] && cmd="chapter" ;;
+      g) [ "${#SHELF[@]}" -gt 0 ] && [ "$(mark_get "${SHELF[sel]}" kind)" = novel ] && cmd="chapter" ;;
       q|Q|esc) break ;;
-      click) cmd="${rowact[$CLICK_Y]:-}" ;;
+      click) cmd="${rowact[$CLICK_Y]:-}"
+             # a tap on a book plays it; on its ✕, takes it off the shelf
+             if [[ "$cmd" == mark:* ]] && [ "$CLICK_X" -ge $(( HOME_X - 1 )) ]; then sel=${cmd#mark:}; cmd=remove; fi ;;
     esac
     case "$cmd" in
-      mark:*)  HOME_CHOICE=(--continue "${marks[${cmd#mark:}]}"); break ;;
+      mark:*)  HOME_CHOICE=(--continue "${SHELF[${cmd#mark:}]}"); break ;;
+      remove)
+        m=${SHELF[sel]}
+        r="$(mark_get "$m" title)"; [ "${#r}" -gt $(( TW - LM - 32 )) ] && r="${r:0:$(( TW - LM - 33 > 4 ? TW - LM - 33 : 4 ))}…"
+        if tui_confirm "Take \"$r\" off the shelf?"; then
+          shelf_remove "$m"; shelf_load
+          [ "$sel" -lt "${#SHELF[@]}" ] || sel=$(( ${#SHELF[@]} > 0 ? ${#SHELF[@]} - 1 : 0 ))
+        fi ;;
+      finished) finished_list; [ "${#HOME_CHOICE[@]}" -gt 0 ] && break ;;
       chapter)                                  # a web novel, from another chapter
-        m=${marks[sel]}
+        m=${SHELF[sel]}
         tui_prompt "Go to chapter:" "$(mark_get "$m" number)"
         if [[ "$ANSWER" =~ ^[0-9]+$ ]] && chapter_url "$(mark_get "$m" source)" "$ANSWER"; then
           HOME_CHOICE=(-p -v "$(mark_get "$m" voice)" -s "$(mark_get "$m" speed)" -l "$(mark_get "$m" lang)" -u "$CHURL")
@@ -2544,7 +2631,9 @@ bookmark_done() {  # read to the end: the bookmark and the book's kept audio go
     printf '  %skokoro --continue carries on once the next one is out.%s\n' "$D" "$R" >&2
     return 0
   fi
-  [ -n "$book_id" ] && rm -rf "$BOOKS/$book_id.mark" "$BOOKS/$book_id.txt" "${CACHE:?}/${book_id:?}"
+  [ -n "$book_id" ] || return 0
+  [ -f "$BOOKS/$book_id.mark" ] && finished_add "$BOOKS/$book_id.mark"
+  shelf_remove "$BOOKS/$book_id.mark"
   return 0
 }
 
@@ -3225,6 +3314,34 @@ cmd_queue() {    # kokoro --queue [list|skip|clear]: play the queue in order
     queue_drop "$id" "$kind" "$src"
   done
   exit 0
+}
+
+# ------------------------------------------------------------ the bookshelf
+# A book in progress is a bookmark, $BOOKS/ID.mark (key=value lines: part,
+# parts, title, kind, source, voice, speed, lang; a novel's also chapter,
+# number, novel), with ID.txt beside it for a text, and its made audio in
+# $CACHE/ID. A book heard to the end is a line in $FINISHED.
+
+shelf_load() {   # SHELF = the bookmarks, the one heard most recently first
+  SHELF=()
+  [ -d "$BOOKS" ] || return 0
+  mapfile -t SHELF < <(ls -t "$BOOKS"/*.mark 2>/dev/null) || true
+  return 0
+}
+
+shelf_remove() { # shelf_remove MARK: take a book off the shelf, with its kept text and audio
+  local id
+  id="$(basename "$1" .mark)"
+  [[ "$id" =~ ^[0-9a-f]+$ ]] || return 0
+  rm -rf "$1" "$BOOKS/$id.txt" "${CACHE:?}/$id"
+  return 0
+}
+
+finished_add() { # finished_add MARK: remember a book heard to the end (newest last)
+  local k vals=()
+  mkdir -p "${FINISHED%/*}"
+  for k in title kind source voice speed lang; do vals+=("$(mark_get "$1" "$k" | tr '\t' ' ')"); done
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%Y-%m-%d)" "${vals[@]}" >> "$FINISHED"
 }
 
 # ------------------------------------------------------------ bookmarks

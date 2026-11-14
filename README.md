@@ -122,7 +122,7 @@ The sleep timer fades the voice out over its last 13 seconds, then stops, keepin
 
 With a keyboard and mouse (DeX, a tablet, or a Bluetooth keyboard), the keys and clicks both work. On a phone, tap the buttons. When you stop, kokoro says where you stopped and how to carry on.
 
-Run `kokoro` on its own to open the **home screen**. Its **bookshelf** lists the books, web novels and long texts you're partway through, with progress bars: choose one with ↑↓ and Enter, its number, or a click. It also has one-key actions:
+Run `kokoro` on its own to open the **home screen**. Its **bookshelf** lists every book, web novel and long text you're partway through, the most recent first, with progress bars; it scrolls when there are more than fit. Choose one with ↑↓ and Enter, its number, or a tap. **x** (or a tap on a book's faint **✕**) takes it off the shelf, with its saved audio, after asking. Books you've heard to the end go on the **Finished** list (**h**), with the date; Enter on one hears it again from the start. It also has one-key actions:
 
 | Key | Does |
 |---|---|
@@ -132,6 +132,8 @@ Run `kokoro` on its own to open the **home screen**. Its **bookshelf** lists the
 | t | type something to hear |
 | v | choose a voice (type to filter, Space to hear it) |
 | s | settings |
+| h | the books you've finished |
+| x | take the chosen book off the shelf |
 
 <p>
   <img src="docs/home.png" width="49%" alt="The home screen on a dark terminal: books in progress with progress bars, and one-key actions">

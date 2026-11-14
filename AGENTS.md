@@ -58,8 +58,8 @@ $PREFIX/tmp  ═════════════ shared ══════�
 4. **The screens** (`src/tui.sh`): home, reader, menu, chapters, settings,
    voice picker. Colours from `src/theme.sh`, made from the terminal's own
    background (OSC 10/11 queries).
-5. **Web novels**: when a URL is a novel's chapter (`novel_chapter` in the
-   engine), the job reads on from chapter to chapter, one chapter ahead of
+5. **Web novels**: when a URL is a novel's chapter (`novel_chapter` in
+   sources.py), the job reads on from chapter to chapter, one chapter ahead of
    the player (which writes the part it's on into `at`). Parts are numbered
    across the whole listen; `serial` maps them to chapter addresses, and a
    restart mid-listen (a jump, a new speed) passes `base=`. The bookmark is
@@ -109,6 +109,8 @@ find your way; it's made from the code, so it's always current.
 | an admin command (`--queue`, `--status`…) | `admin_cmd` and its `cmd_*` function in src/commands.sh |
 | a command-line option for a run (`-p`, `-f`…) | the options loop in src/kokoro |
 | bookmarks, the sleep timer, chapters, web novels mid-listen | src/player.sh, section "listening" |
+| the bookshelf and the Finished list (files, removing a book) | src/commands.sh, section "the bookshelf"; the home screen is `tui_home` |
+| a list to pick from in a panel (chapters, finished books) | `tui_list` in src/tui.sh (fill LIST_LABEL and LIST_NOTE) |
 | how text is tidied or split | src/text.py: `normalise`, `split_text` |
 | how a book or page is read | src/sources.py: `read_epub`, `read_pdf`, `page_text`, `novel_chapter` |
 | what the engine writes for the player | the docstring at the top of src/engine.py, and `run_job` |
@@ -184,6 +186,8 @@ being run (e.g. in `Phone`), run it, and read the end of /tmp/trace.
 - `$(( ))` is arithmetic only: text in it (`${rows[y]:0:1} == "#"`) is a
   syntax error that ends the script. Compare text with `[ ]`.
 - `read` clears its variables at end of file and returns 1: `read -r a b < f || …`.
+- `printf '%-20s'` pads by bytes, not letters, so "·" or "…" in a title
+  shifts the columns after it: use `fit TEXT WIDTH` (src/tui.sh).
 - Don't name a variable `done` (a keyword), and quote values that look like
   commands (`kind="file"`) or shellcheck warns (SC2209).
 - The mpv socket path must be ≤ 107 bytes; it's built from `realpath $PREFIX/tmp`.
@@ -191,7 +195,7 @@ being run (e.g. in `Phone`), run it, and read the end of /tmp/trace.
   refuses others); use `mktemp -d "$PREFIX/tmp/kokoro.XXXXXX"`.
 - Keys reach the screens by name, from `tick`: a printable key is itself
   (`q`, `" "`, `+`); the rest are `up down left right enter esc backspace
-  pgup pgdn` and `click` (at `CLICK_X`, `CLICK_Y`). The mouse wheel is
+  delete pgup pgdn` and `click` (at `CLICK_X`, `CLICK_Y`). The mouse wheel is
   `up`/`down`. Match these in `case "$KEY"`, never raw escape codes.
 - Settings are saved with `conf_set NAME VALUE` (src/tui.sh), which also sets
   the variable; on the settings screen use `tui_save` (it shows "✓ Saved").

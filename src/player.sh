@@ -161,7 +161,9 @@ bookmark_done() {  # read to the end: the bookmark and the book's kept audio go
     printf '  %skokoro --continue carries on once the next one is out.%s\n' "$D" "$R" >&2
     return 0
   fi
-  [ -n "$book_id" ] && rm -rf "$BOOKS/$book_id.mark" "$BOOKS/$book_id.txt" "${CACHE:?}/${book_id:?}"
+  [ -n "$book_id" ] || return 0
+  [ -f "$BOOKS/$book_id.mark" ] && finished_add "$BOOKS/$book_id.mark"
+  shelf_remove "$BOOKS/$book_id.mark"
   return 0
 }
 

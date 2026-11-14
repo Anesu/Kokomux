@@ -34,6 +34,7 @@ STORY = ("The road left the village at first light. It climbed into the hills, w
          "On the fourth morning a cart came over the ridge.\n\nThe driver offered her a ride as far as the river, "
          "and after a moment's thought she accepted. They crossed the bridge at dusk.\n")
 UP, DOWN, RIGHT, LEFT, ESC, ENTER = "\033[A", "\033[B", "\033[C", "\033[D", "\033", "\r"
+PGUP, PGDN = "\033[5~", "\033[6~"
 
 
 class Phone:
@@ -263,6 +264,71 @@ def test_home_lists_a_bookmark():
         p.close()
 
 
+def shelf(p, n):
+    """N books in progress, the first heard most recently; returns their bookmark files."""
+    marks = []
+    for k in range(n):
+        m = p.write(f"home/.local/share/kokomux/bookmarks/{k + 1:016x}.mark",
+                    f"part={k + 2}\nparts=20\ntitle=Book {k + 1}\nkind=file\nsource=/nowhere\n"
+                    "voice=af_heart\nspeed=1.0\nlang=en-us\n")
+        os.utime(m, (time.time() - k * 60, time.time() - k * 60))
+        marks.append(m)
+    return marks
+
+
+def test_home_shelf_scrolls_to_every_book():
+    p = Phone()
+    try:
+        shelf(p, 12)
+        status, out = p.run([], keys=[PGDN] * 4 + ["q"], rows=22, cols=50)   # (three fit at once)
+        ended_cleanly(status, out)
+        assert "Book 1 " in plain(out) and "Book 12" in plain(out)   # (only some fit at once)
+        assert "of 12" in plain(out)
+    finally:
+        p.close()
+
+
+def test_home_removes_a_book_after_asking():
+    p = Phone()
+    try:
+        marks = shelf(p, 3)
+        cache = p.write("prefix/tmp/kokomux-cache/0000000000000002/x/0001.wav", "")
+        status, out = p.run([], keys=[DOWN, "x", "n", "x", "y", "q"])
+        ended_cleanly(status, out)
+        assert "off the shelf?" in plain(out)
+        assert [os.path.exists(m) for m in marks] == [True, False, True]   # asked twice, removed once
+        assert not os.path.exists(os.path.dirname(os.path.dirname(cache)))  # with its kept audio
+    finally:
+        p.close()
+
+
+def test_home_removes_a_book_with_a_tap_on_its_cross():
+    p = Phone()
+    try:
+        marks = shelf(p, 2)
+        status, out = p.run([], keys=["q"])
+        y = int(re.search(r"\033\[(\d+);\d+H(?:(?!\033\[\d+;\d+H).)*?Book 2", out).group(1))   # Book 2's row
+        status, out = p.run([], keys=[click(55, y), "y", "q"])                # its ✕: the column before the edge
+        ended_cleanly(status, out)
+        assert [os.path.exists(m) for m in marks] == [True, False]
+    finally:
+        p.close()
+
+
+def test_home_finished_books():
+    p = Phone()
+    try:
+        p.write("home/.local/share/kokomux/finished",
+                "2026-11-02\tWar and Peace\tfile\t/nowhere\taf_heart\t1.0\ten-us\n"
+                "2026-11-10\tThe Hobbit\turl\thttps://example.org/hobbit\tbf_emma\t1.2\ten-gb\n")
+        status, out = p.run([], keys=["h", ESC, "q"])
+        ended_cleanly(status, out)
+        assert "2 heard to the end" in plain(out)
+        assert "War and Peace" in plain(out) and "2026-11-10" in plain(out)
+    finally:
+        p.close()
+
+
 # ---------------------------------------------------------------- the reader (needs dev/rig.sh)
 
 def needs_rig(fn):
@@ -286,6 +352,9 @@ def test_reader_plays_to_the_end():
         ended_cleanly(status, out)
         assert "Done" in plain(out)
         assert p.bookmarks() == {}                                   # heard to the end: nothing to come back to
+        with open(os.path.join(p.home, ".local", "share", "kokomux", "finished"), encoding="utf-8") as f:
+            done = f.read().split("\t")                               # and it's on the Finished list
+        assert done[1:4] == ["story.txt", "file", story], done
     finally:
         p.close()
 

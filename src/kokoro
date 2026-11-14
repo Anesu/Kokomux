@@ -59,6 +59,7 @@ PLAYER_PID="$PREFIX/tmp/kokoro-player.pid"
 CONTROL="$PREFIX/tmp/kokoro-control"      # kokoro --pause/--next/--again leave a word here
 PLAYER_STATE="$PREFIX/tmp/kokoro-state"   # "playing" or "paused", for --pause to report
 BOOKS="$HOME/.local/share/kokomux/bookmarks"
+FINISHED="$HOME/.local/share/kokomux/finished"  # books heard to the end: date, title, kind, source, voice, speed, lang (tab-separated)
 QUEUE_DIR="$HOME/.local/share/kokomux/queue"   # shared links and files, to hear in order
 QUEUE="$QUEUE_DIR/list"                        # one per line: id, kind (url/file), source, title (tab-separated)
 QUIT_RC=0; [ "${KOKORO_QUEUE:-0}" = 1 ] && QUIT_RC=10   # stopped, not finished: the queue waits
@@ -242,7 +243,7 @@ stop_playback() {   # stop the running player, if any (returns 1 if there was no
 # ------------------------------------------------------------ keys and the frame timer
 # tick waits a moment (no process) and, on a terminal, reads one key or click
 # into KEY, by name (key_name): a printable key is itself ("q", " ", "+"), the
-# others are up down left right enter esc backspace pgup pgdn, and click (a
+# others are up down left right enter esc backspace delete pgup pgdn, and click (a
 # left click or tap, at CLICK_X, CLICK_Y). The mouse wheel is up and down.
 # A stop signal during the wait must not exit from inside `read -t`:
 # if cleanup then outlives the timer, bash's alarm jumps back into a read that's
@@ -288,6 +289,7 @@ key_name() {     # KEY, as the terminal sent it, to its name (see above); "" for
     $'\033[D'|$'\033OD') KEY=left ;;
     $'\033[5~') KEY=pgup ;;
     $'\033[6~') KEY=pgdn ;;
+    $'\033[3~') KEY=delete ;;
     $'\r'|$'\n') KEY=enter ;;
     $'\033') KEY=esc ;;
     $'\177'|$'\b') KEY=backspace ;;
