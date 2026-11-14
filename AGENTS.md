@@ -1,13 +1,14 @@
 # Working on kokomux
 
 Notes for coding agents (and people) changing this repository. The user-facing
-guide is README.md.
+guide is README.md: a Termux command (`src/`, version in `VERSION`) and a
+sideloaded app (`android/`, `versionName` in `android/app/build.gradle.kts`).
 
 ## Who it's for
 
-kokomux is a **personal** app: Kokoro text-to-speech in Termux on one phone, a
-Samsung S26 Ultra with 1 TB of storage (sometimes in DeX with a keyboard and
-mouse). Build for that phone, not for every device:
+kokomux is a **personal** app for one phone, a Samsung S26 Ultra with 1 TB of
+storage (sometimes in DeX with a keyboard and mouse): the `kokoro` command in
+Termux, and the app in `android/`. Build for that phone, not for every device:
 
 - Kokoro: always full precision (the fp32 model) and misaki pronunciation.
   Don't add quality options, smaller models or fallbacks for weaker hardware.
@@ -122,7 +123,7 @@ any change in `src/` (check.sh rebuilds it).
 To run the app for real, with the Kokoro model, on this machine:
 
 ```
-dev/rig.sh                   # once: .dev/ with the container's venv, the models (~340 MB),
+dev/rig.sh                   # once: .dev/ with the container's venv, Kokoro's model and voices,
                              # a fake $PREFIX/$HOME and a proot-distro stand-in
 dev/kokoro -p -f story.txt   # kokoro from src/, sound to nowhere (mpv --ao=null)
 echo "Hello." | dev/kokoro -o /tmp/t.wav

@@ -1,10 +1,33 @@
-# kokomux: Kokoro TTS on Termux
+# kokomux
 
-Natural-sounding offline text-to-speech on your Android phone. kokomux installs [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) in Termux and gives you a `kokoro` command that can read text, files, your clipboard and web pages, either out loud or into an audio file.
+Offline text-to-speech for one Android phone. Kokoro 82M runs at full precision, with misaki for English pronunciation. There are two variants in this repository:
+
+- **Termux** (version 0.18.2, `VERSION`): a `kokoro` command. Kokoro runs in a small Debian container inside Termux.
+- **The app** (version 1.0.0, `android/`): a sideloaded APK, `kokomux.app`. The same Kokoro, plus Ming 3.0 on the phone's NPU and Qwen3-TTS for a voice cloned from a clip. No Termux.
 
 ```sh
 kokoro -p "Hello from my phone"
 ```
+
+## The two variants
+
+| | Termux | The app |
+|---|---|---|
+| What you run | `kokoro` in a Termux terminal | The kokomux app |
+| Speech | Kokoro only, fp32, on the CPU inside the container | Kokoro fp32 on the CPU; Ming 3.0 fp16 on the NPU; Qwen3-TTS 0.6B Base at 4-bit on the CPU |
+| Plays | Text, a pipe, the clipboard, a text file, an EPUB, a PDF, a web page, a web novel | A file, a web page, the clipboard, typed text, or something shared or opened from another app. Web novels too |
+| Saves | `.wav`, `.mp3`, `.ogg`, `.flac`, or an `.m4b` with chapter marks | One `.m4a` (this chapter, from here, or the book loaded so far). No chapter marks |
+| Voices | The 54 Kokoro voices. A blend of up to four. Language is its own setting | Those 54, eight Ming voices, and Qwen voices you record. No blend. The language follows the voice |
+| While it plays | One mpv, gapless, about ten minutes ahead. A Termux:API notification. A queue | One ExoPlayer playlist, gapless, about ten minutes ahead. The playback notification. No queue |
+| Shelf and extras | The six most recent bookmarks. A queue for things shared to Termux | Covers and progress, saved passages, listening stats, a home-screen widget, a daily check for new novel chapters |
+| Settings | `~/.config/kokoro/config` | The app's own settings (a subset of the same names) |
+| Needs | Termux, then `install.sh` | Android 16 (minSdk 36), arm64. A debug APK you sideload |
+
+The Termux guide is below. The app's screens, engines and build are in [android/README.md](android/README.md), with a short account of how to build and use it after the Termux guide.
+
+## Termux
+
+A `kokoro` command that reads text, files, the clipboard and web pages, out loud or into an audio file.
 
 <p>
   <img src="docs/install-progress.png" width="32%" alt="The installer downloading the voice model">
@@ -18,24 +41,31 @@ While it reads aloud, kokomux shows the text and lights up each word as it's spo
 
 ## Install
 
-You need **Termux from F-Droid or GitHub** (the Play Store version is outdated) and about **1.2 GB** of free space. Then run this in Termux:
+Run `install.sh` in Termux. `./build.sh` makes that file from `src/`. `kokoro --update` downloads it from `https://raw.githubusercontent.com/Anesu/kokomux/<branch>/install.sh`, and the branch defaults to `main`. `kokoro --update BRANCH` uses another branch.
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/Anesu/kokomux/main/install.sh && bash install.sh
+curl -fsSL -o install.sh https://raw.githubusercontent.com/Anesu/kokomux/main/install.sh && bash install.sh
 ```
 
-It works through seven steps with live progress and keeps the phone awake until it's done, about 10–20 minutes. At the end it says hello out loud. Running it again skips what's already done and updates the rest; `--verbose` shows everything it runs.
+`bash install.sh --help` prints the usage. `--verbose` shows every command it runs.
+
+Seven steps, with live progress: Termux packages, the Debian container, Python, Kokoro, the model download, the `kokoro` command, and a voice test. The phone stays awake (`termux-wake-lock`) until it's done. The voice test says hello out loud. Running it again skips what's already done and updates the rest.
+
+The Termux packages it installs are `proot-distro`, `curl`, `mpv`, `socat`, `ffmpeg` and `termux-api`. Inside the container it installs `python3`, `python3-venv`, `ca-certificates` and `curl`, then the Python packages in `src/setup-container.sh` (`kokoro-onnx`, `soundfile`, `pypdf`, `trafilatura`, `misaki`, `num2words`, `spacy`, and spaCy's small English model).
+
+The download is Kokoro's full-precision timestamped model, `kokoro-v1.0-timestamped.fp32.onnx`, and `voices-v1.0.bin`. The app pins those same two files at 325,532,171 and 28,214,398 bytes. A download that stops picks up where it left off.
 
 If a step fails, the installer shows the error and what to do ([example](docs/install-error.png)); the full log is at `~/.cache/kokomux/install.log`. After Ctrl+C, run it again and it carries on.
 
-**Optional extras:**
-- **Termux:API app** (from the same place you got Termux) plus `pkg install termux-api`, for reading the clipboard.
-- **Termux:Widget app**, for home-screen buttons.
+**The Termux:API app and Termux:Widget** are separate apps, not packages the installer can fetch.
+
+- The installer does install the `termux-api` package, and it checks whether the Termux:API app answers. The clipboard and the playback notification need that app. Without it, `-c` can't read the clipboard and the notification stays off.
+- Termux:Widget runs the shortcuts the installer writes under `~/.shortcuts/tasks/`: **Kokoro read clipboard**, **Kokoro play queue**, **Kokoro pause**, **Kokoro next**, **Kokoro continue** and **Kokoro stop**.
 
 ## Use
 
 ```sh
-kokoro -p "Say this out loud"             # speak (starts after the first sentence)
+kokoro -p "Say this out loud"             # speak (the first part is short, so it starts quickly)
 kokoro "Save this"                        # save to kokoro.wav
 kokoro -o note.mp3 "Smaller file"         # .wav .mp3 .ogg or .flac
 kokoro -f book.epub -o book.m4b           # an audiobook, with chapters
@@ -53,7 +83,7 @@ kokoro --stop                             # stop playback
 | `-o FILE` | Save to FILE. The ending picks the format: `.wav`, `.mp3`, `.ogg`, `.flac`, or `.m4b` for an audiobook with chapters. |
 | `-v NAME` | Voice, e.g. `af_heart`, `am_adam`, `bf_emma`, `bm_george`, or a blend: `af_heart:70+bf_emma:30` |
 | `-s N` | Speed, 0.5–2.0 |
-| `-l CODE` | Language: `en-us`, `en-gb`, `es`, `fr-fr`, `it`, `pt-br`, `hi`. Use a voice for that language too. |
+| `-l CODE` | Language: `en-us`, `en-gb`, `es`, `fr-fr`, `it`, `pt-br`, `hi`, `ja`, `cmn`. Choosing a voice sets the matching one. |
 | `-f FILE` | Read a text file, an EPUB or a PDF |
 | `-c` | Read the clipboard. A copied link reads that web page. |
 | `-u URL` | Read a web page: just the article (found by trafilatura), up to where the links start. |
@@ -62,17 +92,8 @@ kokoro --stop                             # stop playback
 
 ## How it sounds this good
 
-- **Full precision.** kokomux runs Kokoro's full-precision model (326 MB), not the 8-bit version, which can sound faintly buzzy.
-- **English pronunciation.** English (American and British) is turned into sounds by misaki, the dictionary-based tool Kokoro was trained with, rather than espeak, which gets some words wrong. misaki picks the right reading from the sentence:
-
-  | | espeak | misaki |
-  |---|---|---|
-  | "I **read** the book yesterday" | "reed" | "red" |
-  | "please **record** the record" | "REC-ord" both times | "re-CORD", then "REC-ord" |
-  | "**wind** the clock" | "wind", as in breeze | "wynd" |
-  | "$42.50" | "dollar forty-two point five zero" | "forty-two dollars and fifty cents" |
-
-  It uses spaCy's small English model to tell a noun from a verb. Words misaki doesn't know, and other languages, go to espeak.
+- **Full precision.** Kokoro is the timestamped fp32 model (`kokoro-v1.0-timestamped.fp32.onnx`), pinned to one commit of the onnx-community export. The timings on that export are what light up each word.
+- **English pronunciation.** American and British English go through misaki, with spaCy's small English model to tell a noun from a verb. A word misaki doesn't know, a sentence it can't parse, and every other language go to espeak.
 - **Blend voices.** Mix two (or up to four) voices into one of your own: `-v af_heart:70+bf_emma:30` is 70% `af_heart` and 30% `bf_emma`, and `af_heart+af_bella` is half and half. In the settings, **Blend with** picks the second voice and **Blend amount** sets how much of it you hear (10% to 90%). Press Space on either to hear the mix. `af_heart` and `af_bella` are Kokoro's strongest voices, so they make a good base.
 - **Smooth joins.** A long text is read in parts of a few whole sentences each (up to 360 characters), never across a paragraph. Each part ends with a pause that fits where it is: 0.25 s after a sentence, as Kokoro pauses inside a part, then longer after a paragraph (0.65 s) and a chapter (1.06 s). Those are golden-ratio steps. The edges of each part are softened by a few milliseconds, so they can't click. Saved files get the same pauses.
 - **Text made speakable.** Before reading, kokomux tidies what's meant for the eye:
@@ -112,6 +133,8 @@ On a terminal, `kokoro -p` opens a full-screen reader. Across the top are the ti
 | q or Esc | Menu → **Stop** | stop, keeping your place |
 | | the progress bar | click or tap it to jump to that point |
 
+`p` and `k` pause too, `n` and `l` skip, and `b` and `h` hear the part again. Those match the keys `key_cmd` accepts while a book is playing.
+
 Above the bar, a line says what's happening (playing, paused, how much of the book is made) and where you are (chapter, part). Playback carries on while the menu or settings are open; a new voice or language starts again at the part you're on.
 
 **A new speed is heard at once.** The part you're on carries on at the new speed, with its pitch kept, while the rest is made again at that speed behind it. From the next part on you hear Kokoro speaking at the new speed itself, which sounds more natural than a sped-up recording.
@@ -122,16 +145,19 @@ The sleep timer fades the voice out over its last 13 seconds, then stops, keepin
 
 With a keyboard and mouse (DeX, a tablet, or a Bluetooth keyboard), the keys and clicks both work. On a phone, tap the buttons. When you stop, kokoro says where you stopped and how to carry on.
 
-Run `kokoro` on its own to open the **home screen**. Its **bookshelf** lists the books, web novels and long texts you're partway through, with progress bars: choose one with ↑↓ and Enter, its number, or a click. It also has one-key actions:
+Run `kokoro` on its own to open the **home screen**. Its **bookshelf** is the six most recent bookmarks, each with a progress bar: choose one with ↑↓ and Enter, its number (1–6), or a tap. A web novel is shown with the chapter you're on (*Title · Ch 12*). **g**, when a novel is selected, asks for a chapter number and starts there. When the queue has something in it, the screen lists up to three waiting items and **p** plays the queue. The other keys:
 
 | Key | Does |
 |---|---|
-| c | read the clipboard |
+| c | read the clipboard (the row says so when the Termux:API app isn't there) |
 | f | open a file (text, EPUB or PDF), with Tab completion |
 | u | read a web page |
 | t | type something to hear |
 | v | choose a voice (type to filter, Space to hear it) |
-| s | settings |
+| s | settings (`o` and `,` open it too) |
+| p | play the queue, when it isn't empty |
+| g | go to a chapter of the selected web novel |
+| q or Esc | leave |
 
 <p>
   <img src="docs/home.png" width="49%" alt="The home screen on a dark terminal: books in progress with progress bars, and one-key actions">
@@ -252,8 +278,8 @@ It works in every language Kokoro speaks, offline, and needs no extra download. 
   - **Voice:** a picker for all 54 voices. Type to filter (`bf` shows the British female voices), press Space to hear one say a line in its own language, and Enter to choose it. Choosing a voice also sets the matching language.
   - **Blend with** and **Blend amount:** a second voice mixed into yours, from 10% to 90%. Space hears the mix; ← on **Blend with** turns it off.
   - **Speed:** a slider from 0.5× to 2×.
-  - **Language:** cycle through Kokoro's nine languages.
-  - **Save files as:** the default file name.
+  - **Language:** the nine codes (`en-us`, `en-gb`, `es`, `fr-fr`, `it`, `pt-br`, `hi`, `ja`, `cmn`). Choosing a voice sets the matching one.
+  - **Save files as:** the default file name, ending in `.wav`, `.mp3`, `.ogg` or `.flac`. An audiobook (`.m4b`) is only via `-o`, not this setting.
 - **Reading:**
   - **Full-screen reader:** on or off.
   - **Colours:** Auto, Dark or Light (see [Colours](#colours-dark-and-light)).
@@ -261,7 +287,7 @@ It works in every language Kokoro speaks, offline, and needs no extra download. 
   - **Light up words:** on or off.
   - **Highlight timing:** in steps of 20 ms, for when the highlight runs ahead of or behind the voice.
 - **While listening:** notification controls on or off.
-- **Background server:** keep Kokoro loaded, how long until it unloads (5 minutes to 2 hours, or never), and the port.
+- **Background server:** keep Kokoro loaded, how long until it unloads, and the port. Unload after is 5, 10, 15, 30, 60 or 120 minutes, or never. The default is never (`KOKORO_IDLE_MINUTES=0`).
 - **Reset to defaults**, and **Edit the settings file** (opens it in your editor).
 
 `kokoro --config` opens the settings file (`~/.config/kokoro/config`). There you can set your default voice, speed, language, file name, and how the background server behaves. For a single command, environment variables override the file:
@@ -272,7 +298,7 @@ KOKORO_VOICE=bm_george kokoro -p "Just this once"
 
 ## Speed: the background server
 
-Starting Kokoro takes a few seconds: it has to start the Debian container and load the model. To avoid paying that every time, the first `kokoro` command starts a **background server** that keeps the model loaded. After that, each command starts almost instantly. It stays loaded until you stop it (`kokoro --stop-server`); to have it unload after a while without use, set **Unload after** in `kokoro --settings`.
+Starting Kokoro takes a few seconds: it has to start the Debian container and load the model. To avoid paying that every time, the first `kokoro` command starts a **background server** that keeps the model loaded (`KOKORO_AUTOSERVE=1`). After that, each command starts almost instantly. It stays loaded until you stop it (`kokoro --stop-server`). **Unload after** is how long it waits with nothing to do; the default is never.
 
 ```sh
 kokoro --status        # is it running? what are my settings?
@@ -305,7 +331,7 @@ Kokoro's Python packages (`onnxruntime`, `espeakng-loader`, `soundfile`) only sh
 - **`words.py`** (inside Debian): turns Kokoro's per-sound timings into word timings, for the highlight.
 - **Sharing files:** the two sides exchange text and audio through `$PREFIX/tmp`, which the container sees as `/tmp`.
 
-The installer only keeps what's needed in the container. It skips documentation and man pages, and clears the apt and pip download caches after installing. The model is the full-precision timestamped export from onnx-community (326 MB, pinned to one version), plus about 28 MB of voices.
+The installer only keeps what's needed in the container. It skips documentation and man pages, and clears the apt and pip download caches after installing. The model is the full-precision timestamped export from onnx-community, pinned to commit `dd4401a9add81ac692d20e240d22ec9dda82cc29`, and the voices file from the kokoro-onnx v1.0 release. The app pins those downloads at 325,532,171 and 28,214,398 bytes.
 
 **Why not run natively in Termux?** Termux now packages onnxruntime, numpy, espeak and libsndfile, but kokoro-onnx's own dependencies still can't be installed there. `espeakng-loader` ships only glibc builds. `phonemizer` needs `segments`, which needs the `regex` C extension, and `soundfile` needs `cffi`; Termux packages neither, so both would have to be compiled on the phone. Until that's simpler, and can be tested on a real device, the container stays.
 
@@ -318,6 +344,64 @@ The installer only keeps what's needed in the container. It skips documentation 
 - **The keyboard won't come up:** in kokoro's screens a tap is a click on the screen, so it doesn't open the keyboard. Swipe in from the left edge and tap **KEYBOARD**.
 - **"Process completed (signal 9)", or the server keeps disappearing:** Android 12+ kills background processes it considers excessive. Search for "Termux phantom process killer" for the one-time fix.
 - **Server problems:** `kokoro --stop-server` and try again. Its log is in `$PREFIX/tmp/kokoro-server/log`.
+
+## The Android app
+
+A standalone app for the same phone. `applicationId` is `kokomux.app`, `versionName` is `1.0.0`, `minSdk` and `targetSdk` are 36 (Android 16), and the APK is arm64 only. It is sideloaded: the build has a debug APK and no release signing. Screens, engines and the file list are in [android/README.md](android/README.md). This is how you get it onto the phone and what it does differently.
+
+### Build and install
+
+On the build machine: JDK 21, Android SDK platform 37, NDK `30.0.16248370`, CMake 3.31.6, and Python 3.10 (`python3.10`, or `KOKOMUX_BUILD_PYTHON`). The Gradle wrapper is 9.9.1.
+
+```sh
+cd android
+./gradlew :app:assembleDebug
+```
+
+The APK is `android/app/build/outputs/apk/debug/app-debug.apk`. Open it on the phone to install it.
+
+GitHub Actions (`.github/workflows/android.yml`, the **Android** workflow) builds that APK when a push touches `android/`, `src/engine.py`, `src/words.py` or the workflow, and uploads it as **kokomux-debug-apk**. The same job runs `:engine:test` and `:app:testDebugUnitTest` and uploads the drawn screens as **screens**. A second job installs the app on an emulator and runs `:app:connectedDebugAndroidTest`; that job is `continue-on-error`, so a failure there does not fail the workflow. It uploads **emulator-screen**.
+
+The first launch downloads Kokoro before anything can be read (the two files above, 353,746,569 bytes together). Ming and Qwen download the first time you pick one of their voices: the pinned files come to 2,839,549,649 bytes for Ming and 1,689,175,579 for Qwen. Ming's graphs are compiled for the phone's NPU the first time they load.
+
+### Use
+
+Home has the voice new things are read in, settings, what's playing, and **File**, **Web page**, **Clipboard** and **Type**. Below that, today's listening, saved passages, and the bookshelf. Share a page, some text, an EPUB or a PDF to kokomux, or open one of those files with it. The home-screen widget shows what's playing, with play and pause. It needs the notification, microphone (for a new voice), internet, and a foreground media service; those are the permissions in the manifest.
+
+The reader is the book in a column, the part being read on the golden line, the spoken word lit. Tap a part to hear it. Under the bar: previous, play, next, then speed, the sleep timer, chapters, **Save** (the sentence just heard) and the voice. ⌄ leaves the reader while it keeps playing. ⋮ is saved passages, listening stats, **Save as audiobook**, settings and stop. With a keyboard: Space, ←, →, `[`, `]`, −, +, `t`, `c`, `s`, `v`, `q`. There is no `m` menu.
+
+The voice picker has a tab each for **Kokoro**, **Ming 3.0** and **Qwen3-TTS**. Ming's eight voices are `US_Emma`, `US_James`, `US_Stella`, `UK_George`, `UK_Charlotte`, `灵小萌`, `灵岩` and `灵小雅`. **New voice** records a clip or takes one from the phone, plays it back, and Qwen makes a voice from it. The languages a cloned voice can read are `en-us`, `en-gb`, `es`, `fr-fr`, `it`, `pt-br`, `ja` and `cmn`.
+
+A web novel is read on from chapter to chapter. Three chapters are kept ahead of the one being heard. **Web page** takes an address or a novel's name; **Find** searches, then lists chapters to start from. New chapters are checked daily, and a notification says when some are out. A site that asks for a browser check is loaded in the app's own WebView.
+
+**Save as audiobook** writes one `.m4a` (AAC) of this chapter, from here to the end, or the chapters loaded, to a place you choose. It does not write chapter marks.
+
+Listening stats are today's time, the streak, this week, all time, the last seven days, the month, the pace, and each listen.
+
+### Configuration
+
+Settings are stored under Termux's names, in the app's `settings` preferences:
+
+| Key | Default | What you can set |
+|---|---|---|
+| `KOKORO_VOICE` | `af_heart` | the voice, from the picker |
+| `KOKORO_SPEED` | `1` | 0.5× to 2×, in tenths |
+| `KOKORO_THEME` | `auto` | Auto, Dark or Light |
+| `KOKORO_FOCUS` | on | the focus effect |
+| `KOKORO_WORDS` | on | light up each word |
+| `KOKORO_WORDS_OFFSET_MS` | `0` | the highlight, in steps of 20 ms, from −987 to 987 |
+| `KOKORO_THREADS` | `0` | Auto, or 2, 4, 6 or 8. `0` is Auto |
+| `KOKORO_BLOCK` | `0` | off, or 4 (`block 4`) |
+
+Kokoro's threads and block are the same two numbers `kokoro --benchmark` writes on Termux. The app has no benchmark command; you pick them in settings. The sample at the top of Reading follows the colour, focus and highlight settings as you change them.
+
+Kept audio can be cleared (bookmarks stay). Ming's and Qwen's files can be removed; Kokoro's stay. The part cache is capped at 50×10⁹ bytes. On Termux the same idea is `KOKORO_CACHE_GB`, default 50, counted with `du -sm` against `50 × 1024` MiB.
+
+### What the app does not do
+
+These are in the Termux command and not in the app: a shell, pipes, voice blends, a language setting separate from the voice, choosing an output file name, `.wav` / `.mp3` / `.ogg` / `.flac` / `.m4b`, a queue, `kokoro --update`, a background Kokoro server (`engine.py serve`, port 8880), and the inline terminal view. Hindi is a Kokoro voice language; it is not one of the languages a Qwen clone can be made in.
+
+These are in the app and not in the Termux command: Ming, Qwen, a voice cloned from a clip, saved passages, listening stats, the home-screen widget, sharing straight into the app, an in-app browser for a site that asks for a check, and keeping three novel chapters ahead (Termux fetches one chapter ahead). A new speed is heard at once for Kokoro, which makes the speech at that speed. Ming and Qwen are made at 1× and played faster.
 
 ## Development
 
@@ -341,7 +425,8 @@ python3 dev/screen.py --out reader.png -- dev/kokoro -p -f story.txt   # a pictu
 | `src/words.py` | word timings from Kokoro's per-sound timings (container side) |
 | `src/setup-container.sh` | installs everything inside the container |
 | `src/install.sh` | installer template (UI and steps) |
-| `VERSION` | the version stamped into both by `build.sh` |
+| `VERSION` | the Termux version, stamped into `install.sh` by `build.sh` (the app's version is `versionName` in `android/app/build.gradle.kts`) |
+| `.github/workflows/android.yml` | builds the debug APK and runs the app's tests |
 | `tests/test_words.py` | word timings, on recorded Kokoro output |
 | `tests/test_books.py` | reading EPUB, PDF and text |
 | `tests/test_text.py` | tidying text and splitting it into parts |
@@ -361,4 +446,4 @@ python3 dev/screen.py --out reader.png -- dev/kokoro -p -f story.txt   # a pictu
 
 Each test file runs on its own (`python3 tests/test_text.py`) or with pytest.
 
-**The Android app** is in `android/`: Kokoro and misaki in an app of their own, with engine.py's text side packaged in as it is, and two more engines (Ming 3.0 on the phone's NPU, and Qwen3-TTS for voices cloned from a clip), web novels heard chapter after chapter, listening stats, saved passages, audiobooks and a widget. See [android/README.md](android/README.md); GitHub Actions builds its debug APK.
+The app's own map of files, engines and checks is [android/README.md](android/README.md). `src/engine.py` and `src/words.py` are packaged into it as they are, so a change there reaches both variants.

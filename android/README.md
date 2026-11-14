@@ -25,7 +25,7 @@ plain wording. The Termux version in `src/` stays as it is.
 - **Three engines, one voice picker.** A tab each for **Kokoro** (fp32, on
   the CPU), **Ming 3.0** (on the NPU, eight built-in voices, 44.1 kHz) and
   **Qwen3-TTS** (your own voices). Ming and Qwen download when first chosen,
-  the button filling as they come (2.8 and 1.7 GB); Ming gets ready for the
+  the button filling as they come (2,839,549,649 and 1,689,175,579 bytes); Ming gets ready for the
   phone on its first listen, about a minute, once.
 - **Your own voice**: **New voice** shows a passage to read aloud (or pick a
   clip from the phone), plays it back, and makes a voice of it named as you
@@ -44,8 +44,9 @@ plain wording. The Termux version in `src/` stays as it is.
   novel: when it'll be up to date); and every listen, from where to where.
 - **Share to kokomux** from any app (a page, some text, an EPUB or PDF), or
   open a book with it. **A home-screen widget** shows what's playing with
-  play and pause. **Save as audiobook**: this chapter, from here, or the whole
-  book, as one .m4a where you choose.
+  play and pause. **Save as audiobook**: this chapter, from here to the end,
+  or the whole book (a novel: the chapters loaded), as one .m4a where you
+  choose. No chapter marks.
 - **A new speed is heard at once**: Kokoro's part playing carries on at it,
   pitch kept, while the rest is made again at it; Ming and Qwen are made at 1×
   and just played faster. **A new voice** starts again at the part you're on.
@@ -55,11 +56,32 @@ plain wording. The Termux version in `src/` stays as it is.
   after an hour).
 - **In the background**, with the notification's and the lock screen's
   controls: one gapless playlist, made about ten minutes ahead.
-- **Settings**, as Termux's: voice, speed, colours (auto, dark, light), the
-  focus effect, word highlighting and its timing, shown on a few lines of the
-  reader that follow every change; then how Kokoro runs (`kokoro --benchmark`'s
-  choices), how fast the voice in use makes speech here, the pronunciation
-  check, the kept audio and each engine's files (with Remove).
+- **Settings**: the voice and the speed; colours (Auto, Dark, Light), the
+  focus effect, and word highlighting with its timing (steps of 20 ms, from
+  −987 ms to +987 ms), shown on a few lines of the reader that follow every
+  change. Then how Kokoro runs: threads (Auto, 2, 4, 6 or 8) and block 4, the
+  same two values `kokoro --benchmark` stores on Termux, chosen here by hand.
+  Then how fast the voice in use makes speech, the pronunciation check, the
+  kept audio (Clear; bookmarks stay) and each engine's files (Remove for Ming
+  and Qwen; Kokoro's stay). Blend, a language row, an output file name and the
+  background server are Termux settings; this screen doesn't have them.
+
+## Beside the Termux command
+
+The app is `kokomux.app`, version 1.0.0, minSdk 36, arm64, sideloaded from the
+debug APK. The comparison in the repository README is the short version. In
+the app, and not in `kokoro`: Ming, Qwen, a voice cloned from a clip, saved
+passages, listening stats, the home-screen widget, share and open intents, an
+in-app browser when a site asks for a check, and three novel chapters kept
+ahead (Termux fetches one). In `kokoro`, and not in the app: the shell, pipes,
+voice blends, a language setting of its own, `.wav` `.mp3` `.ogg` `.flac` and
+chaptered `.m4b`, the queue, `kokoro --update`, and the background server on
+port 8880. A cloned voice's languages are `en-us`, `en-gb`, `es`, `fr-fr`,
+`it`, `pt-br`, `ja` and `cmn` (not Hindi). Kokoro voices still include Hindi,
+from the voice's first letter.
+
+The part cache stops at 50×10⁹ bytes. Termux's `KOKORO_CACHE_GB` defaults to
+50 and is measured with `du -sm` against `50 × 1024` MiB.
 
 ## Design
 
@@ -150,8 +172,8 @@ Screen ──OPEN──► ListenService (MediaSession, ExoPlayer: one gapless p
   `tools/wheels.py`. **espeak-ng** 1.52.0 is built with the NDK
   (`app/src/main/cpp`), with the data from the espeakng-loader 0.2.4 wheel.
 - **Each engine's files download** into the app's storage from addresses
-  pinned to a commit (`Models.kt`): Kokoro on first run (354 MB), Ming and
-  Qwen when one of their voices is first wanted.
+  pinned to a commit (`Models.kt`): Kokoro on first run (353,746,569 bytes),
+  Ming and Qwen when one of their voices is first wanted.
 
 ## Building
 
@@ -168,17 +190,20 @@ cd android
 ```
 
 `:engine:test` finds Kokoro's model and voices in `../.dev/app/models`
-(dev/rig.sh) or `KOKOMUX_MODELS`; Ming's host files (its tokenizer's tables
-and small tensors, 15 MB) in `../.dev/app/ming` or `KOKOMUX_MING`; and Qwen's
-files, as the app downloads them, in `../.dev/app/qwen/app` or `KOKOMUX_QWEN`
-(the Android workflow shows where each comes from). A test whose files aren't
-there is skipped.
+(`dev/rig.sh` downloads those, or `KOKOMUX_MODELS`); Ming's host files (its
+tokenizer's tables and small tensors, 15 MB) in `../.dev/app/ming` or
+`KOKOMUX_MING`; and Qwen's files, as the app downloads them, in
+`../.dev/app/qwen/app` or `KOKOMUX_QWEN`. `dev/rig.sh` does not fetch Ming or
+Qwen; the Android workflow shows where each comes from. A test whose files
+aren't there is skipped.
 
-GitHub Actions builds the APK on every push that touches the app (the
-**Android** workflow); download **kokomux-debug-apk** from the run and open
-it on the phone to install it. Its emulator job runs the instrumented tests
-with the model, and saves the screen before and after loading
-(**emulator-screen**).
+There is no release build. GitHub Actions builds the debug APK on every push
+that touches `android/`, `src/engine.py`, `src/words.py` or the workflow (the
+**Android** workflow); download **kokomux-debug-apk** from the run and open it
+on the phone. The same job uploads the drawn screens (**screens**). Its
+emulator job runs the instrumented tests with the model and saves the screen
+before and after loading (**emulator-screen**). That job is
+`continue-on-error`, so a failure there does not fail the workflow.
 
 ## Checking it
 
