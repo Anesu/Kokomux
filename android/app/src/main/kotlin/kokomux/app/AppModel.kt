@@ -20,6 +20,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionToken
+import java.io.File
 import kokomux.app.ui.Actions
 import kokomux.app.ui.Checked
 import kokomux.app.ui.Making
@@ -33,12 +34,12 @@ import kokomux.app.ui.Voices
 import kokomux.app.ui.WordSpan
 import kokomux.app.ui.wordSpans
 import kokomux.engine.Audio
+import kokomux.engine.Book
 import kokomux.engine.Books
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import java.io.File
 
 /**
  * What the screens show and what they can do: the screen's state made from
@@ -103,6 +104,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
                     at = Listening.at, playing = playing, madeTo = made.maxOfOrNull { it.index } ?: 0, making = Listening.making,
                     voice = n.request.voice, speed = n.request.speed, sleep = Listening.sleep,
                     words = if (words.first == Listening.at) words.second else emptyList(),
+                    left = left(n.book, Listening.at, n.request.speed),
                 )
             },
             voices = voices,
@@ -111,6 +113,20 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
             checked = checked, checking = checking, loaded = loaded, kept = kept,
             error = error.ifEmpty { Listening.error }, hearing = hearing, version = version,
         )
+    }
+
+    /** Letters in the book from each part to the end (for the time left), worked out once a book. */
+    private var lettersFrom: Pair<Book?, LongArray> = null to LongArray(0)
+
+    /** Seconds of listening from part [at] to the end, at [speed], at the pace the parts made so far were said. */
+    private fun left(book: Book, at: Int, speed: Float): Double {
+        if (Listening.perLetter <= 0 || at < 1) return 0.0
+        if (lettersFrom.first !== book) {
+            val from = LongArray(book.parts.size + 1)
+            for (i in book.parts.indices.reversed()) from[i] = from[i + 1] + book.parts[i].text.length
+            lettersFrom = book to from
+        }
+        return lettersFrom.second[(at - 1).coerceAtMost(book.parts.size)] * Listening.perLetter / speed
     }
 
     /** How far into the part playing the player is, in ms (for lighting the word being said). */
@@ -224,6 +240,10 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
     // ------------------------------------------------------------ listening
 
     override fun playPause() = withController { if (it.isPlaying) it.pause() else it.play() }
+    override fun previous() = withController {
+        val at = Listening.at
+        if (it.currentPosition < 3000 && at > 1) jump(at - 1) else it.seekTo(0)
+    }
     override fun again() = withController { it.seekTo(0) }
     override fun next() = withController { it.seekToNextMediaItem() }
     override fun stop() = command(ListenService.STOP)

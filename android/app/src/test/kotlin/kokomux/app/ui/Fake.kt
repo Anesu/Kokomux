@@ -31,7 +31,7 @@ object Fake {
     fun playing(at: Int = 4, playing: Boolean = true, sleep: Sleep? = null) = Playing(
         id = "0123456789abcdef", title = "The Long Road", parts = story, chapters = chapters, at = at,
         playing = playing, madeTo = 9, making = true, voice = "bf_emma", speed = 1.1f, sleep = sleep,
-        words = words(story[at - 1]),
+        words = if (at > 0) words(story[at - 1]) else emptyList(), left = if (at > 0) 8040.0 else 0.0,
     )
 
     val shelf = listOf(
@@ -59,6 +59,7 @@ object Fake {
         override fun resume(id: String) {}
         override fun remove(id: String) {}
         override fun playPause() {}
+        override fun previous() {}
         override fun again() {}
         override fun next() {}
         override fun stop() {}

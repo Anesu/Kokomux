@@ -39,17 +39,20 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 
-/** A sheet's frame: its name, a line saying what it's for, then its content, in the reading column. */
+/** A sheet's frame: its name (with its state on the right, if it has one), then its content, in the reading column. */
 @Composable
-fun SheetFrame(title: String, about: String = "", content: @Composable ColumnScope.() -> Unit) {
+fun SheetFrame(title: String, aside: String = "", content: @Composable ColumnScope.() -> Unit) {
     val t = LocalTokens.current
     Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
         Column(Modifier.widthIn(max = Space.column).fillMaxWidth().padding(horizontal = Space.l).padding(bottom = Space.xl)) {
-            Text(title, style = Type.title, color = t.fg)
-            if (about.isNotEmpty()) Dim(about, Modifier.padding(top = Space.xs))
+            Row(verticalAlignment = Alignment.Bottom) {
+                Text(title, style = Type.title, color = t.fg, modifier = Modifier.weight(1f))
+                if (aside.isNotEmpty()) Text(aside, style = Type.small, color = t.accent2)
+            }
             Spacer(Modifier.height(Space.m))
             content()
         }
@@ -74,30 +77,40 @@ fun Choice(title: String, caption: String = "", chosen: Boolean = false, onClick
     }
 }
 
-/** The book's chapters (tui_chapters): the one playing marked; pick one to go there. */
+/** The book's chapters (tui_chapters), numbered: those heard quieter, the one playing marked; pick one to go there. */
 @Composable
 fun ChaptersSheet(p: Playing, onPick: (Int) -> Unit) {
+    val t = LocalTokens.current
     val current = p.chapter
-    val list = rememberLazyListState(initialFirstVisibleItemIndex = (p.chapters.indexOf(current) - 2).coerceAtLeast(0))
-    SheetFrame("Chapters", "${p.chapters.size} in ${p.title}") {
+    val here = p.chapters.indexOf(current)
+    val list = rememberLazyListState(initialFirstVisibleItemIndex = (here - 2).coerceAtLeast(0))
+    SheetFrame("Chapters", if (here >= 0) "${here + 1} of ${p.chapters.size}" else "") {
         LazyColumn(Modifier.heightIn(max = 480.dp), state = list, contentPadding = PaddingValues(bottom = Space.s)) {
             itemsIndexed(p.chapters) { i, c ->
-                val last = (p.chapters.getOrNull(i + 1)?.first ?: (p.parts.size + 1)) - 1
-                Choice(c.title, "Parts ${c.first} to $last", chosen = c == current) { onPick(c.first) }
+                val chosen = c == current
+                Row(
+                    Modifier.fillMaxWidth().heightIn(min = Space.touch).clip(Corner.m)
+                        .background(if (chosen) t.sel else t.bg.copy(alpha = 0f))
+                        .clickable(role = Role.Button) { onPick(c.first) }.padding(end = Space.m),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(Modifier.width(3.dp).height(Space.l).clip(CircleShape).background(if (chosen) t.accent else t.bg.copy(alpha = 0f)))
+                    Text("${i + 1}", style = Type.small, color = if (chosen) t.accent else t.dim,
+                        textAlign = TextAlign.End, modifier = Modifier.width(Space.xl).padding(end = Space.m))
+                    Text(c.title, style = Type.label, color = if (i < here) t.dim else t.fg, maxLines = 2,
+                        overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(vertical = Space.s))
+                }
             }
         }
     }
 }
 
-/** The sleep timer: 15, 30 or 60 minutes, the end of the chapter, or off. */
+/** The sleep timer: 15, 30 or 60 minutes, the end of the chapter, or off; the time left on the right. */
 @Composable
 fun SleepSheet(p: Playing, onPick: (Sleep?) -> Unit) {
-    SheetFrame("Sleep timer", "The voice fades out over its last 13 seconds, then stops and keeps your place. " +
-        "Time spent paused doesn't count.") {
-        val now = p.sleep
-        for (m in listOf(15, 30, 60)) Choice("$m minutes", chosen = now is Sleep.Minutes && sleepLabel(now) == "$m min") {
-            onPick(Sleep.Minutes(m * 60_000L))
-        }
+    val now = p.sleep
+    SheetFrame("Sleep timer", if (now is Sleep.Minutes) "${sleepLabel(now)} left" else "") {
+        for (m in listOf(15, 30, 60)) Choice("$m min") { onPick(Sleep.Minutes(m * 60_000L)) }
         if (p.chapters.size > 1) Choice("End of chapter", p.chapter?.title ?: "", chosen = now == Sleep.EndOfChapter) {
             onPick(Sleep.EndOfChapter)
         }
@@ -105,16 +118,32 @@ fun SleepSheet(p: Playing, onPick: (Sleep?) -> Unit) {
     }
 }
 
-/** The reader's menu (tui_menu): the voice, settings, the sleep timer, home, and stop. */
+/** The speed, heard at once: slower and faster a tenth at a time, and the usual ones a tap away. */
 @Composable
-fun MenuSheet(p: Playing, onVoices: () -> Unit, onSettings: () -> Unit, onSleep: () -> Unit, onHome: () -> Unit,
-              onStop: () -> Unit) {
-    SheetFrame("Menu") {
-        ListRow(Glyphs.hear, "Voice", "${Voices.name(p.voice)} · ${Voices.describe(p.voice)}", onClick = onVoices)
-        ListRow(Glyphs.settings, "Settings", "Speed, colours, focus, highlighting", onClick = onSettings)
-        ListRow(Glyphs.moon, "Sleep timer", p.sleep?.let { sleepLabel(it) } ?: "Off", onClick = onSleep)
-        ListRow(Glyphs.back, "Home screen", "The bookshelf; this keeps playing", onClick = onHome)
-        ListRow(Glyphs.stop, "Stop", "Keeps your place on the bookshelf", onClick = onStop)
+fun SpeedSheet(speed: Float, onPick: (Float) -> Unit) {
+    val t = LocalTokens.current
+    SheetFrame("Speed") {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
+            RoundButton(Glyphs.minus, "Slower", Space.xxl, enabled = speed > 0.55f) {
+                onPick(((speed * 10 + 0.5f).toInt() - 1).coerceAtLeast(5) / 10f)
+            }
+            Text(speedLabel(speed), style = Type.display, color = t.accent2, textAlign = TextAlign.Center,
+                modifier = Modifier.width(Space.xxxl + Space.xl))
+            RoundButton(Glyphs.plus, "Faster", Space.xxl, enabled = speed < 1.95f) {
+                onPick(((speed * 10 + 0.5f).toInt() + 1).coerceAtMost(20) / 10f)
+            }
+        }
+        Spacer(Modifier.height(Space.l))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(Space.s)) {
+            for (v in listOf(0.8f, 1f, 1.2f, 1.5f, 2f)) {
+                val on = Math.round(speed * 100) == Math.round(v * 100)
+                Box(
+                    Modifier.weight(1f).heightIn(min = 48.dp).clip(CircleShape).background(if (on) t.psel else t.surf)
+                        .clickable(role = Role.Button) { onPick(v) },
+                    contentAlignment = Alignment.Center,
+                ) { Text(speedLabel(v), style = Type.label, color = if (on) t.accent else t.fg) }
+            }
+        }
     }
 }
 
@@ -124,7 +153,7 @@ fun PageSheet(suggested: String, onRead: (String) -> Unit) {
     val t = LocalTokens.current
     var address by rememberSaveable { mutableStateOf(suggested) }
     val ok = address.trim().matches(Regex("^https?://\\S+$"))
-    SheetFrame("Read a web page", "Its article, up to where the links start; a web novel's chapter is read as a chapter.") {
+    SheetFrame("Web page") {
         OutlinedTextField(
             value = address, onValueChange = { address = it }, singleLine = true, modifier = Modifier.fillMaxWidth(),
             placeholder = { Text("https://…", style = Type.body, color = t.line) }, textStyle = Type.body, shape = Corner.l,
@@ -134,7 +163,7 @@ fun PageSheet(suggested: String, onRead: (String) -> Unit) {
             colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = t.accent, unfocusedBorderColor = t.line),
         )
         Spacer(Modifier.height(Space.m))
-        MainButton("Read it", enabled = ok) { onRead(address.trim()) }
+        MainButton("Read", enabled = ok) { onRead(address.trim()) }
     }
 }
 
@@ -143,7 +172,7 @@ fun PageSheet(suggested: String, onRead: (String) -> Unit) {
 fun TypeSheet(onRead: (String) -> Unit) {
     val t = LocalTokens.current
     var text by rememberSaveable { mutableStateOf("") }
-    SheetFrame("Type something", "It's kept on the bookshelf until you've heard it to the end.") {
+    SheetFrame("Type") {
         OutlinedTextField(
             value = text, onValueChange = { text = it }, minLines = 5, modifier = Modifier.fillMaxWidth(),
             placeholder = { Text("What should Kokoro read?", style = Type.reading, color = t.line) },
@@ -151,7 +180,7 @@ fun TypeSheet(onRead: (String) -> Unit) {
             colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = t.accent, unfocusedBorderColor = t.line),
         )
         Spacer(Modifier.height(Space.m))
-        MainButton("Read it", enabled = text.isNotBlank()) { onRead(text) }
+        MainButton("Read", enabled = text.isNotBlank()) { onRead(text) }
     }
 }
 

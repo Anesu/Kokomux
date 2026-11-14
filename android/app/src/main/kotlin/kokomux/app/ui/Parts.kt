@@ -1,5 +1,10 @@
 package kokomux.app.ui
 
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -21,6 +26,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -42,7 +48,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.max
+import kotlin.math.sin
 
 /**
  * A screen's content in the reading column (610 dp at most, centred), placed
@@ -68,17 +78,14 @@ fun GoldenColumn(modifier: Modifier = Modifier, content: @Composable ColumnScope
     }
 }
 
-/** A section's name, quiet, with what's in it on the right. */
+/** A section's name. */
 @Composable
-fun SectionTitle(text: String, aside: String = "") {
+fun SectionTitle(text: String) {
     val t = LocalTokens.current
-    Row(Modifier.fillMaxWidth().padding(top = Space.l, bottom = Space.s), verticalAlignment = Alignment.Bottom) {
-        Text(text, style = Type.label, color = t.fg, modifier = Modifier.weight(1f))
-        if (aside.isNotEmpty()) Text(aside, style = Type.small, color = t.dim)
-    }
+    Text(text, style = Type.label, color = t.fg, modifier = Modifier.fillMaxWidth().padding(top = Space.l, bottom = Space.s))
 }
 
-/** One thing to choose: a glyph, what it is, and a line saying more; the whole row is the target. */
+/** One thing to choose: a glyph, what it is, and its value or state; the whole row is the target. */
 @Composable
 fun ListRow(
     glyph: ImageVector?, title: String, caption: String = "", trailing: @Composable (RowScope.() -> Unit)? = null,
@@ -131,34 +138,79 @@ fun Track(progress: Float, modifier: Modifier = Modifier, made: Float = 0f, mark
     }
 }
 
-/** A round transport button; the main one (play or pause) is φ times the others. */
+/** A round transport button; the main one (play or pause) is φ times the others. [busy] spins in place of its glyph. */
 @Composable
 fun RoundButton(glyph: ImageVector, label: String, size: Dp, primary: Boolean = false, enabled: Boolean = true,
-                onClick: () -> Unit) {
+                busy: Boolean = false, onClick: () -> Unit) {
     val t = LocalTokens.current
+    val ink = if (primary) t.bg else if (enabled) t.fg else t.line
     Box(
         Modifier.size(size).clip(CircleShape).background(if (primary) t.accent else t.surf)
             .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
             .semantics { contentDescription = label },
         contentAlignment = Alignment.Center,
     ) {
-        Icon(glyph, null, Modifier.size(size * Phi.inv(2f) + 3.dp), tint = if (primary) t.bg else if (enabled) t.fg else t.line)
+        if (busy) CircularProgressIndicator(Modifier.size(size * Phi.inv(2f)), color = ink, strokeWidth = 3.dp,
+            trackColor = Color.Transparent)
+        else Icon(glyph, null, Modifier.size(size * Phi.inv(2f) + 3.dp), tint = ink)
     }
 }
 
-/** A glyph above a word: the reader's quieter controls. */
+/** An icon every phone uses (back, settings, more), alone, on a thumb-sized target. */
 @Composable
-fun QuietButton(glyph: ImageVector, label: String, on: Boolean = false, enabled: Boolean = true, onClick: () -> Unit) {
+fun GlyphButton(glyph: ImageVector, label: String, tint: Color = LocalTokens.current.dim, onClick: () -> Unit) {
+    Box(
+        Modifier.size(48.dp).clip(CircleShape).clickable(role = Role.Button, onClick = onClick)
+            .semantics { contentDescription = label },
+        contentAlignment = Alignment.Center,
+    ) { Icon(glyph, null, Modifier.size(Space.l + 3.dp), tint = tint) }
+}
+
+/** A glyph above a word or a value: the reader's quieter controls. [on] lights it in the second accent. */
+@Composable
+fun QuietButton(glyph: ImageVector, label: String, on: Boolean = false, enabled: Boolean = true,
+                description: String = label, onClick: () -> Unit) {
     val t = LocalTokens.current
     val colour = if (!enabled) t.line else if (on) t.accent2 else t.dim
     Column(
         Modifier.widthIn(min = Space.touch).heightIn(min = Space.touch).clip(Corner.m)
-            .clickable(enabled = enabled, role = Role.Button, onClick = onClick).padding(Space.xs),
+            .clickable(enabled = enabled, role = Role.Button, onClick = onClick).padding(Space.xs)
+            .semantics(mergeDescendants = true) { contentDescription = description },
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
         Icon(glyph, null, Modifier.size(Space.l), tint = colour)
         Text(label, style = Type.tiny, color = colour, textAlign = TextAlign.Center, maxLines = 1)
+    }
+}
+
+/** A way in: its glyph over its name, on a surface; a row of them shares the width. */
+@Composable
+fun Tile(glyph: ImageVector, label: String, modifier: Modifier = Modifier, enabled: Boolean = true, onClick: () -> Unit) {
+    val t = LocalTokens.current
+    Column(
+        modifier.clip(Corner.l).background(t.surf).clickable(enabled = enabled, role = Role.Button, onClick = onClick)
+            .padding(vertical = Space.m, horizontal = Space.xs),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(Space.xs),
+    ) {
+        Icon(glyph, null, Modifier.size(Space.l + 3.dp), tint = if (enabled) t.accent else t.line)
+        Text(label, style = Type.small, color = if (enabled) t.fg else t.line, textAlign = TextAlign.Center, maxLines = 1,
+            overflow = TextOverflow.Ellipsis)
+    }
+}
+
+/** A setting that shows its value: a glyph and the value, on a pill; tap to change it. */
+@Composable
+fun Pill(glyph: ImageVector, value: String, description: String = value, onClick: () -> Unit) {
+    val t = LocalTokens.current
+    Row(
+        Modifier.heightIn(min = 48.dp).clip(CircleShape).background(t.psel).clickable(role = Role.Button, onClick = onClick)
+            .padding(horizontal = Space.m).semantics(mergeDescendants = true) { contentDescription = description },
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.s),
+    ) {
+        Icon(glyph, null, Modifier.size(Space.l - 3.dp), tint = t.accent)
+        Text(value, style = Type.label, color = t.fg, maxLines = 1)
     }
 }
 
@@ -181,16 +233,24 @@ fun Cover(title: String, width: Dp = Space.xl) {
     }
 }
 
-/** kokomux's mark: five bars in golden steps (13, 21, 34, 21, 13), violet to cyan, as the icon. */
+/**
+ * kokomux's mark: five bars in golden steps (13, 21, 34, 21, 13), violet to
+ * cyan, as the icon. [live] sets them moving like a voice: something is
+ * loading, being opened, or speaking.
+ */
 @Composable
-fun Logo(height: Dp = Space.xl) {
+fun Logo(height: Dp = Space.xl, live: Boolean = false) {
     val t = LocalTokens.current
+    val phase = if (live) rememberInfiniteTransition(label = "logo")
+        .animateFloat(0f, 1f, infiniteRepeatable(tween(1597, easing = LinearEasing)), label = "phase").value else -1f
     Canvas(Modifier.size(width = height * 1.4f, height = height)) {
         val heights = listOf(13f, 21f, 34f, 21f, 13f)
         val bar = size.width / 9f
         heights.forEachIndexed { i, h ->
+            val swing = if (phase < 0f) 1f
+                else Phi.inv(1f) + (1f - Phi.inv(1f)) * abs(sin((phase + i * Phi.inv(2f)) * PI.toFloat() * 2f))
             val x = bar * (2 * i) + bar / 2
-            val hh = size.height * h / 34f
+            val hh = max(bar, size.height * h / 34f * swing)
             drawLine(Tokens.mix(t.accent, t.cyan, i / 4f), Offset(x, (size.height - hh) / 2), Offset(x, (size.height + hh) / 2),
                 bar, StrokeCap.Round)
         }
@@ -213,6 +273,16 @@ fun ErrorLine(text: String, onDismiss: () -> Unit) {
     ) {
         Text(text, style = Type.small, color = t.fg, modifier = Modifier.weight(1f))
         Icon(Glyphs.close, "Dismiss", Modifier.size(Space.m + 3.dp), tint = t.dim)
+    }
+}
+
+/** "2 h 14 min left", "9 min left". */
+fun timeLeftLabel(seconds: Double): String {
+    val minutes = ceil(seconds / 60).toInt().coerceAtLeast(1)
+    return when {
+        minutes < 60 -> "$minutes min left"
+        minutes % 60 == 0 -> "${minutes / 60} h left"
+        else -> "${minutes / 60} h ${minutes % 60} min left"
     }
 }
 

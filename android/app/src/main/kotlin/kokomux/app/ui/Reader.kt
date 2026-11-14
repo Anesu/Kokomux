@@ -13,7 +13,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
@@ -23,12 +22,15 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameMillis
@@ -36,10 +38,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -49,20 +48,20 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.isActive
 
 /**
- * The reader (tui.sh's tui_open): a header, the reading column with the part
- * being read on the golden line, and the footer: what's happening and where,
- * the progress (tap it to jump), Again / Play / Next, and the quieter speed,
- * sleep, chapters and menu. [position] is how far into the part the player
- * is, in ms, for lighting the word being said.
+ * The reader (tui.sh's tui_open): the title and chapter, the reading column
+ * with the part being read on the golden line, and the footer: where you are
+ * (tap the bar to jump) and the time left, previous / play / next, and the
+ * speed, sleep timer, chapters and voice, each showing its value. [position]
+ * is how far into the part the player is, in ms, for lighting the word being
+ * said.
  */
 @Composable
 fun ReaderScreen(
-    p: Playing, prefs: Prefs, position: () -> Long, actions: Actions,
-    onBack: () -> Unit, onChapters: () -> Unit, onSleep: () -> Unit, onMenu: () -> Unit,
+    p: Playing, prefs: Prefs, position: () -> Long, actions: Actions, to: ReaderTo,
 ) {
     val t = LocalTokens.current
     Column(Modifier.fillMaxSize().background(t.bg).safeDrawingPadding(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Header(p, onBack)
+        Header(p, actions, to)
         Box(Modifier.weight(1f).widthIn(max = Space.column).fillMaxWidth()) {
             ReadingColumn(p, prefs, position, actions)
             // The text dissolves into the background at the column's ends instead of being cut.
@@ -71,25 +70,35 @@ fun ReaderScreen(
             Box(Modifier.fillMaxWidth().height(Space.xxl).align(Alignment.BottomCenter)
                 .background(Brush.verticalGradient(listOf(t.bg.copy(alpha = 0f), t.bg))))
         }
-        Footer(p, actions, onChapters, onSleep, onMenu)
+        Footer(p, actions, to)
     }
 }
 
+/** Where the reader's controls lead: home, and the sheets and screens they open. */
+class ReaderTo(
+    val home: () -> Unit = {}, val speed: () -> Unit = {}, val sleep: () -> Unit = {}, val chapters: () -> Unit = {},
+    val voices: () -> Unit = {}, val settings: () -> Unit = {},
+)
+
+/** ⌄ folds the reader away (it keeps playing); the title and chapter; ⋮ for settings and stopping. */
 @Composable
-private fun Header(p: Playing, onBack: () -> Unit) {
-    val t = LocalTokens.current
-    Row(Modifier.widthIn(max = Space.column + Space.touch).fillMaxWidth().height(Space.touch).padding(end = Space.l),
+private fun Header(p: Playing, actions: Actions, to: ReaderTo) {
+    Row(Modifier.widthIn(max = Space.column + Space.touch).fillMaxWidth().height(Space.touch).padding(horizontal = Space.xs),
         verticalAlignment = Alignment.CenterVertically) {
-        Box(
-            Modifier.size(Space.touch).clip(CircleShape).clickable(role = Role.Button, onClick = onBack)
-                .semantics { contentDescription = "Home" },
-            contentAlignment = Alignment.Center,
-        ) { Icon(Glyphs.back, null, Modifier.size(Space.l), tint = t.dim) }
-        Column(Modifier.weight(1f)) {
-            Text(p.title, style = Type.label, color = t.fg, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            // Where you are, if the book has chapters; otherwise who's reading.
-            Dim(p.chapter?.title?.takeIf { p.chapters.size > 1 } ?: "${Voices.name(p.voice)} · ${Voices.describe(p.voice)}",
-                maxLines = 1)
+        GlyphButton(Glyphs.down, "Home", onClick = to.home)
+        Column(Modifier.weight(1f).padding(horizontal = Space.xs)) {
+            Text(p.title, style = Type.label, color = LocalTokens.current.fg, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            p.chapter?.title?.takeIf { p.chapters.size > 1 }?.let { Dim(it, maxLines = 1) }
+        }
+        var more by remember { mutableStateOf(false) }
+        Box {
+            GlyphButton(Glyphs.more, "More") { more = true }
+            DropdownMenu(expanded = more, onDismissRequest = { more = false }) {
+                DropdownMenuItem(text = { Text("Settings", style = Type.body) }, onClick = { more = false; to.settings() },
+                    leadingIcon = { Icon(Glyphs.settings, null, Modifier.size(Space.l)) })
+                DropdownMenuItem(text = { Text("Stop", style = Type.body) }, onClick = { more = false; actions.stop(); to.home() },
+                    leadingIcon = { Icon(Glyphs.stop, null, Modifier.size(Space.l)) })
+            }
         }
     }
 }
@@ -184,73 +193,48 @@ private fun tone(t: Tokens, k: Int, lit: Int, from: Int, words: List<WordSpan>, 
     }
 }
 
-/** The footer, as tui.sh draws it: what's happening, the bar, the transport, the quiet controls. */
+/**
+ * The footer: the bar (where you are, how far ahead parts are made, where
+ * chapters start; tap it to jump), the part and the time left, previous /
+ * play / next (play spins while the first part is made), then the speed, the
+ * sleep timer, the chapters and the voice, each showing its value.
+ */
 @Composable
-private fun Footer(p: Playing, actions: Actions, onChapters: () -> Unit, onSleep: () -> Unit, onMenu: () -> Unit) {
-    val t = LocalTokens.current
+private fun Footer(p: Playing, actions: Actions, to: ReaderTo) {
     val n = p.parts.size
     Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
         Column(
             Modifier.widthIn(max = Space.column).fillMaxWidth().padding(horizontal = Space.l).padding(bottom = Space.s),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                val (symbol, state) = when {
-                    p.at == 0 -> "·" to "Getting ready"
-                    p.playing -> "▶" to "Playing"
-                    else -> "‖" to "Paused"
-                }
-                val extra = listOfNotNull(
-                    p.sleep?.let { sleepLabel(it) },
-                    if (p.making && p.madeTo < n) "made to ${p.madeTo}" else null,
-                ).joinToString(" · ")
-                Text("$symbol ", style = Type.small, color = t.accent)
-                Dim(state + if (extra.isNotEmpty()) " · $extra" else "", Modifier.weight(1f), maxLines = 1)
-                if (n > 1 && p.at > 0) Dim("${p.at} of $n", maxLines = 1)
-            }
             Track(
                 progress = if (n > 1 && p.at > 0) (p.at - 1f) / (n - 1) else 0f,
                 made = if (n > 1) (p.madeTo - 1f).coerceAtLeast(0f) / (n - 1) else 0f,
                 marks = if (p.chapters.size > 1 && n > 1) p.chapters.drop(1).map { (it.first - 1f) / (n - 1) } else emptyList(),
                 onSeek = { f -> actions.jump(1 + Math.round(f * (n - 1))) },
             )
-            Spacer(Modifier.height(Space.s))
+            Row(Modifier.fillMaxWidth().height(Space.l)) {
+                Dim(if (p.at > 0) "${p.at} of $n" else "", Modifier.weight(1f), maxLines = 1)
+                if (p.left > 0) Dim(timeLeftLabel(p.left), maxLines = 1)
+            }
+            Spacer(Modifier.height(Space.xs))
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.l)) {
-                RoundButton(Glyphs.again, "Again", Space.xxl, onClick = actions::again)
+                RoundButton(Glyphs.previous, "Previous", Space.xxl, enabled = p.at > 0, onClick = actions::previous)
                 RoundButton(if (p.playing) Glyphs.pause else Glyphs.play, if (p.playing) "Pause" else "Play", Space.xxxl,
-                    primary = true, onClick = actions::playPause)
-                RoundButton(Glyphs.next, "Next", Space.xxl, enabled = p.at < n, onClick = actions::next)
+                    primary = true, busy = p.at == 0, onClick = actions::playPause)
+                RoundButton(Glyphs.next, "Next", Space.xxl, enabled = p.at in 1 until n, onClick = actions::next)
             }
             Spacer(Modifier.height(Space.m))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
-                SpeedControl(p.speed, actions)
-                QuietButton(Glyphs.moon, if (p.sleep != null) sleepLabel(p.sleep) else "Sleep", on = p.sleep != null, onClick = onSleep)
-                if (p.chapters.size > 1) QuietButton(Glyphs.chapters, "Chapters", onClick = onChapters)
-                QuietButton(Glyphs.menu, "Menu", onClick = onMenu)
+                QuietButton(Glyphs.speed, speedLabel(p.speed), on = p.speed != 1f, description = "Speed ${speedLabel(p.speed)}",
+                    onClick = to.speed)
+                QuietButton(Glyphs.moon, p.sleep?.let { sleepLabel(it) } ?: "Sleep", on = p.sleep != null,
+                    description = "Sleep timer", onClick = to.sleep)
+                if (p.chapters.size > 1) QuietButton(Glyphs.chapters, "Chapters", onClick = to.chapters)
+                QuietButton(Glyphs.hear, Voices.name(p.voice), description = "Voice ${Voices.name(p.voice)}", onClick = to.voices)
             }
         }
     }
-}
-
-/** − 1.0× +: the speed, a tenth at a time, from 0.5× to 2×; heard at once. */
-@Composable
-private fun SpeedControl(speed: Float, actions: Actions) {
-    val t = LocalTokens.current
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        SmallGlyph(Glyphs.minus, "Slower", enabled = speed > 0.55f) { actions.speed(((speed * 10).toInt() - 1).coerceAtLeast(5) / 10f) }
-        Text(speedLabel(speed), style = Type.small, color = t.accent2, modifier = Modifier.widthIn(min = Space.xl))
-        SmallGlyph(Glyphs.plus, "Faster", enabled = speed < 1.95f) { actions.speed(((speed * 10 + 0.5f).toInt() + 1).coerceAtMost(20) / 10f) }
-    }
-}
-
-@Composable
-private fun SmallGlyph(glyph: androidx.compose.ui.graphics.vector.ImageVector, label: String, enabled: Boolean, onClick: () -> Unit) {
-    val t = LocalTokens.current
-    Box(
-        Modifier.size(48.dp).clip(CircleShape)
-            .clickable(enabled = enabled, role = Role.Button, onClick = onClick).semantics { contentDescription = label },
-        contentAlignment = Alignment.Center,
-    ) { Icon(glyph, null, Modifier.size(Space.l - 3.dp), tint = if (enabled) t.accent2 else t.line) }
 }
 
 /** "12 min" or "end of chapter". */

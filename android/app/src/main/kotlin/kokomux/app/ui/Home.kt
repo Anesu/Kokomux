@@ -13,7 +13,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -27,15 +26,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.dp
 
 /**
- * The home screen (tui.sh's tui_home): what's playing, the bookshelf of books
- * in progress, ways to start something new, and the voice. On the optical
- * centre when there's room.
+ * The home screen (tui.sh's tui_home): the voice new things are read in, and
+ * settings; what's playing; four ways to start something new; the bookshelf
+ * of books in progress. On the optical centre when there's room.
  */
 @Composable
 fun HomeScreen(
@@ -45,13 +41,11 @@ fun HomeScreen(
 ) {
     val t = LocalTokens.current
     GoldenColumn(Modifier.fillMaxSize().background(t.bg).safeDrawingPadding()) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.m)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.s)) {
             Logo(Space.xl)
-            Column(Modifier.weight(1f)) {
-                Text("kokomux", style = Type.headline, color = t.accent)
-                Dim("Kokoro text-to-speech")
-            }
-            QuietButton(Glyphs.settings, "Settings", onClick = onSettings)
+            Text("kokomux", style = Type.title, color = t.accent, modifier = Modifier.weight(1f), maxLines = 1)
+            Pill(Glyphs.hear, Voices.name(state.prefs.voice), "Voice ${Voices.name(state.prefs.voice)}", onClick = onVoices)
+            GlyphButton(Glyphs.settings, "Settings", onClick = onSettings)
         }
         Spacer(Modifier.height(Space.l))
         if (state.error.isNotEmpty()) {
@@ -60,30 +54,26 @@ fun HomeScreen(
         }
         if (state.opening) NowCard(null, actions, onReader)
         else state.playing?.let { NowCard(it, actions, onReader) }
+        if (state.opening || state.playing != null) Spacer(Modifier.height(Space.l))
+
+        val ready = state.setup == Setup.Ready
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(Space.s)) {
+            Tile(Glyphs.file, "File", Modifier.weight(1f), enabled = ready, onClick = onOpenFile)
+            Tile(Glyphs.globe, "Web page", Modifier.weight(1f), enabled = ready, onClick = onPage)
+            Tile(Glyphs.paste, "Clipboard", Modifier.weight(1f), enabled = ready) { actions.readClipboard(); onReader() }
+            Tile(Glyphs.type, "Type", Modifier.weight(1f), enabled = ready, onClick = onType)
+        }
 
         val shelf = state.shelf.filter { it.id != state.playing?.id }
         if (shelf.isNotEmpty()) {
-            SectionTitle("Bookshelf", if (shelf.size == 1) "1 book" else "${shelf.size} books")
+            Spacer(Modifier.height(Space.s))
+            SectionTitle("Bookshelf")
             for (b in shelf) ShelfRow(b, onClick = { actions.resume(b.id); onReader() }, onRemove = { actions.remove(b.id) })
         }
-
-        SectionTitle("Start something new")
-        val ready = state.setup == Setup.Ready
-        ListRow(Glyphs.file, "Open a file", "An EPUB, a PDF or a text file", enabled = ready, onClick = onOpenFile)
-        ListRow(Glyphs.globe, "Read a web page", "Its article, or a web novel's chapter", enabled = ready, onClick = onPage)
-        ListRow(Glyphs.paste, "Read the clipboard", "Its text, or a copied link's page", enabled = ready) {
-            actions.readClipboard(); onReader()
-        }
-        ListRow(Glyphs.type, "Type something", "And hear it read", enabled = ready, onClick = onType)
-
-        SectionTitle("Voice")
-        ListRow(Glyphs.hear, Voices.name(state.prefs.voice),
-            "${Voices.describe(state.prefs.voice)} · ${speedLabel(state.prefs.speed)}", accent = true,
-            trailing = { Icon(Glyphs.forward, null, Modifier.size(Space.l - 3.dp), tint = t.dim) }, onClick = onVoices)
     }
 }
 
-/** What's playing (or opening): its cover, where it is, play or pause; tap it for the reader. */
+/** What's playing (or opening): its cover, its chapter or part, play or pause; tap it for the reader. */
 @Composable
 private fun NowCard(p: Playing?, actions: Actions, onReader: () -> Unit) {
     val t = LocalTokens.current
@@ -93,25 +83,22 @@ private fun NowCard(p: Playing?, actions: Actions, onReader: () -> Unit) {
         verticalArrangement = Arrangement.spacedBy(Space.s),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.m)) {
-            Cover(p?.title ?: "·")
+            if (p == null) Box(Modifier.size(Space.xl, Space.xl * Phi.PHI), contentAlignment = Alignment.Center) { Logo(Space.l, live = true) }
+            else Cover(p.title)
             Column(Modifier.weight(1f)) {
-                Text(if (p == null) "Opening…" else p.title, style = Type.label, color = t.fg, maxLines = 2,
-                    overflow = TextOverflow.Ellipsis)
-                if (p != null) {
-                    val n = p.parts.size
-                    Dim(listOfNotNull(if (p.at > 0) "Part ${p.at} of $n" else "Getting ready",
-                        p.chapter?.title?.takeIf { p.chapters.size > 1 }).joinToString(" · "), maxLines = 1)
-                }
+                Text(p?.title ?: "Opening…", style = Type.label, color = t.fg, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                if (p != null && p.at > 0) Dim(p.chapter?.title?.takeIf { p.chapters.size > 1 } ?: "${p.at} of ${p.parts.size}",
+                    maxLines = 1)
             }
             if (p != null) RoundButton(if (p.playing) Glyphs.pause else Glyphs.play, if (p.playing) "Pause" else "Play",
-                Space.xxl, primary = true, onClick = actions::playPause)
+                Space.xxl, primary = true, busy = p.at == 0, onClick = actions::playPause)
         }
         if (p != null && p.parts.size > 1) Track((p.at - 1f).coerceAtLeast(0f) / (p.parts.size - 1),
             made = (p.madeTo - 1f).coerceAtLeast(0f) / (p.parts.size - 1))
     }
 }
 
-/** A book on the shelf: its cover, title, how far through and in which voice; tap to carry on. */
+/** A book on the shelf: its cover, title and how far through; tap to carry on, ⋮ to remove it. */
 @Composable
 private fun ShelfRow(b: ShelfBook, onClick: () -> Unit, onRemove: () -> Unit) {
     val t = LocalTokens.current
@@ -123,18 +110,16 @@ private fun ShelfRow(b: ShelfBook, onClick: () -> Unit, onRemove: () -> Unit) {
         Cover(b.title)
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(Space.xs)) {
             Text(b.title, style = Type.label, color = t.fg, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            Track(b.progress)
-            Dim("Part ${b.part} of ${b.parts} · ${(b.progress * 100).toInt()}% · ${Voices.name(b.voice)}", maxLines = 1)
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.s)) {
+                Track(b.progress, Modifier.weight(1f))
+                Dim("${(b.progress * 100).toInt()}%", maxLines = 1)
+            }
         }
         Box {
-            Box(
-                Modifier.size(48.dp).clip(CircleShape).clickable(role = Role.Button) { menu = true }
-                    .semantics { contentDescription = "More for ${b.title}" },
-                contentAlignment = Alignment.Center,
-            ) { Icon(Glyphs.more, null, Modifier.size(Space.l - 3.dp), tint = t.dim) }
+            GlyphButton(Glyphs.more, "More for ${b.title}") { menu = true }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                DropdownMenuItem(text = { Text("Take off the shelf", style = Type.body) },
-                    onClick = { menu = false; onRemove() })
+                DropdownMenuItem(text = { Text("Remove", style = Type.body) }, onClick = { menu = false; onRemove() },
+                    leadingIcon = { Icon(Glyphs.close, null, Modifier.size(Space.l)) })
             }
         }
     }

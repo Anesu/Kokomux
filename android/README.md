@@ -4,19 +4,19 @@ kokomux as an Android app, for the same phone (a Samsung S26 Ultra), with
 the same rules: always the fp32 model and misaki, golden-ratio design, short
 plain wording. The Termux version in `src/` stays as it is.
 
-## What it does now (v0.3)
+## What it does now (v0.4)
 
-- **Home**: what's playing, the bookshelf (books in progress, each with its
-  cover and how far through), and ways to start something new: open a file
-  (EPUB, PDF or text), read a web page (its article, or one chapter of a web
-  novel), read the clipboard (a copied link reads that page), or type
-  something. Below them, the voice.
+- **Home**: the voice new things are read in (tap it to choose another) and
+  settings; what's playing; **File**, **Web page**, **Clipboard** and
+  **Type**; the bookshelf, each book with its cover and how far through.
 - **The reader**: the whole book in a reading column, the part being read on
   the golden line with the spoken word lit, the text fading with its distance
-  from it (the focus effect); tap any part to hear it. Below: what's happening
-  and where, the progress bar (tap it to jump; it shows how far ahead parts are
-  made, and where chapters start), **Again**, **Play/Pause** and **Next**, and
-  the quieter **− speed +**, **Sleep**, **Chapters** and **Menu**.
+  from it (the focus effect); tap any part to hear it. Below: the bar (tap it
+  to jump; it shows how far ahead parts are made, and where chapters start),
+  the part and the time left, ⏮ ▶ ⏭ (⏮ goes back to the part before in its
+  first three seconds), then the speed, the sleep timer, the chapters and the
+  voice, each showing its value. ⌄ folds the reader away, still playing; ⋮ has
+  settings and stop.
 - **A new speed is heard at once**: the part playing carries on at it, pitch
   kept, while the rest is made again at that speed. **A new voice** starts
   again at the part you're on.
@@ -27,35 +27,38 @@ plain wording. The Termux version in `src/` stays as it is.
 - **In the background**, with the notification's and the lock screen's
   controls: one gapless playlist, made about ten minutes ahead.
 - **Settings**, as Termux's: voice, speed, colours (auto, dark, light), the
-  focus effect, word highlighting and its timing; then how Kokoro runs
-  (`kokoro --benchmark`'s choices), how fast it makes speech here, the
-  pronunciation check, and the kept audio.
-- **The voice picker**: type to filter (`bf` is British and female), the
-  voices by language, the speaker to hear one say a line in its own language.
+  focus effect, word highlighting and its timing, shown on a few lines of the
+  reader that follow every change; then how Kokoro runs (`kokoro --benchmark`'s
+  choices), how fast it makes speech here, the pronunciation check, and the
+  kept audio.
+- **The voice picker**: a chip for each language, the voices grouped by
+  language, ▶ to hear one say a line in its own language.
 
 ## Design
 
 The Termux screens' rules (src/theme.sh, src/tui.sh), on a touch screen
 (`app/src/main/kotlin/kokomux/app/ui/Theme.kt`):
 
+- **The form says what it does, so no words explain it.** A control shows
+  its value (1.1×, 12 min, Emma, 4 of 12, 2 h 14 min left); settings show
+  their effect on a sample of the reader; play spins while the first part is
+  made, and the mark's bars move while something loads, opens or speaks; the
+  download button fills as it downloads.
 - **The golden ratio throughout.** Spacing in Fibonacci dp (3, 5, 8, 13, 21,
   34, 55, 89); type in √φ steps (10, 13, 16, 20, 26, 33 sp), the reading face
   20 sp on 32 sp lines (φ); the part being read φ⁻² of the way down the reading
   area; a screen's free space split 1 : φ above and below (the optical centre);
-  the play button φ times Again and Next (89 : 55 dp); covers as golden
-  rectangles; motion in Fibonacci milliseconds (144, 233, 377).
+  the play button φ times ⏮ and ⏭ (89 : 55 dp); covers as golden rectangles;
+  motion in Fibonacci milliseconds (144, 233, 377, 1597).
 - **Termux's palette.** Its dark and light colours, with greys in golden steps
   (φ⁻¹ secondary text, ½ what's been heard, φ⁻² rules, φ⁻⁴ surfaces), and the
   focus effect's fade a quarter golden step at a time, never below φ⁻⁴.
 - **Within reach.** The controls you use while listening are at the bottom,
   where the thumb is; every target is at least 48 dp, the transport 55 and 89.
+- **The icons every phone uses stand alone** (play, pause, ⏮ ⏭, back, ⌄,
+  settings, ⋮); the rest stand over their word or value.
 - **One thing at a time.** One main action on each screen; how Kokoro runs and
-  the checks are in settings, out of everyday use.
-- **Words with the icons**, Termux's words: Again, Next, Sleep, Chapters,
-  Menu, Bookshelf, Start something new.
-- **Saying what's happening**: the reader's status line (playing, paused,
-  getting ready, made to, the sleep timer), "✓ Saved" in settings, and what
-  went wrong in plain words.
+  the checks are low in settings, stopping is behind ⋮.
 
 `./gradlew :app:testDebugUnitTest` draws every screen (`app/build/screens/`),
 at the S26 Ultra's width and on DeX, dark and light, and taps through the

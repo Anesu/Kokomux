@@ -42,6 +42,8 @@ data class Playing(
     val sleep: Sleep? = null,
     /** The part playing's word timings, once they're read (empty: nothing to light). */
     val words: List<WordSpan> = emptyList(),
+    /** Seconds of listening left at this speed, from how long the parts made so far took to say (0: not known yet). */
+    val left: Double = 0.0,
 ) {
     val chapter: Chapter? get() = chapters.lastOrNull { it.first <= at.coerceAtLeast(1) }
 }
@@ -101,6 +103,9 @@ interface Actions {
     fun resume(id: String)
     fun remove(id: String)
     fun playPause()
+    /** Back to the start of the part, or to the one before if it has only just started (any player's ⏮). */
+    fun previous()
+    /** This part again, from its start. */
     fun again()
     fun next()
     fun stop()
@@ -126,6 +131,13 @@ object Voices {
     fun gender(voice: String) = if (voice.getOrNull(1) == 'm') "male" else "female"
     /** "bf_emma" -> "Emma". */
     fun name(voice: String) = voice.substringAfter('_').replaceFirstChar { it.uppercase() }
+    /** "American English" -> "American", "Brazilian Portuguese" -> "Portuguese": a language in a word. */
+    fun shortLanguage(name: String) = when {
+        name.endsWith(" English") -> name.substringBefore(' ')
+        ' ' in name -> name.substringAfter(' ')
+        else -> name
+    }
+
     /** "British English, female" (tui.sh's voice_desc). */
     fun describe(voice: String) = "${language(voice)}, ${gender(voice)}"
 

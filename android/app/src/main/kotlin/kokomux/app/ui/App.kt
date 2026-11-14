@@ -31,7 +31,7 @@ import androidx.compose.ui.Modifier
 enum class Screen { HOME, READER, SETTINGS, VOICES }
 
 /** What slides up over a screen. */
-enum class Sheet { CHAPTERS, SLEEP, MENU, PAGE, TYPE }
+enum class Sheet { CHAPTERS, SLEEP, SPEED, PAGE, TYPE }
 
 /**
  * The whole app: first run until Kokoro is ready, then home, the reader,
@@ -85,9 +85,9 @@ fun KokomuxApp(state: UiState, position: () -> Long, link: () -> String, actions
                 Screen.READER -> {
                     val p = state.playing
                     if (p == null) Opening(state, actions) { go(Screen.HOME) }
-                    else ReaderScreen(p, state.prefs, position, actions,
-                        onBack = { go(Screen.HOME) }, onChapters = { sheet = Sheet.CHAPTERS },
-                        onSleep = { sheet = Sheet.SLEEP }, onMenu = { sheet = Sheet.MENU })
+                    else ReaderScreen(p, state.prefs, position, actions, ReaderTo(
+                        home = { go(Screen.HOME) }, speed = { sheet = Sheet.SPEED }, sleep = { sheet = Sheet.SLEEP },
+                        chapters = { sheet = Sheet.CHAPTERS }, voices = { go(Screen.VOICES) }, settings = { go(Screen.SETTINGS) }))
                 }
                 Screen.SETTINGS -> SettingsScreen(state, actions, onBack = ::back, onVoices = { go(Screen.VOICES) })
                 Screen.VOICES -> VoicesScreen(state, actions, onBack = ::back)
@@ -103,10 +103,7 @@ fun KokomuxApp(state: UiState, position: () -> Long, link: () -> String, actions
             when (open) {
                 Sheet.CHAPTERS -> if (p != null) ChaptersSheet(p) { actions.jump(it); sheet = null }
                 Sheet.SLEEP -> if (p != null) SleepSheet(p) { actions.sleep(it); sheet = null }
-                Sheet.MENU -> if (p != null) MenuSheet(p,
-                    onVoices = { go(Screen.VOICES) }, onSettings = { go(Screen.SETTINGS) },
-                    onSleep = { sheet = Sheet.SLEEP }, onHome = { go(Screen.HOME) },
-                    onStop = { actions.stop(); go(Screen.HOME) })
+                Sheet.SPEED -> SpeedSheet(p?.speed ?: state.prefs.speed, actions::speed)
                 Sheet.PAGE -> PageSheet(link()) { actions.openPage(it); go(Screen.READER) }
                 Sheet.TYPE -> TypeSheet { actions.readTyped(it); go(Screen.READER) }
             }
@@ -114,25 +111,20 @@ fun KokomuxApp(state: UiState, position: () -> Long, link: () -> String, actions
     }
 }
 
-/** A book or page being opened (or one that couldn't be). */
+/** A book or page being opened, the mark's bars moving (or what went wrong, and back). */
 @Composable
 private fun Opening(state: UiState, actions: Actions, onHome: () -> Unit) {
     val t = LocalTokens.current
     Column(Modifier.fillMaxSize().background(t.bg).safeDrawingPadding(), horizontalAlignment = Alignment.CenterHorizontally) {
         TopBar("", onHome)
         GoldenColumn(Modifier.fillMaxSize()) {
-            Logo(Space.xl)
+            Logo(Space.xl, live = state.error.isEmpty())
             Spacer(Modifier.height(Space.l))
             if (state.error.isNotEmpty()) {
-                Text("That couldn't be read", style = Type.title, color = t.fg)
-                Spacer(Modifier.height(Space.s))
                 Text(state.error, style = Type.body, color = t.red)
                 Spacer(Modifier.height(Space.l))
-                MainButton("Back to the bookshelf") { actions.dismissError(); onHome() }
-            } else {
-                Text("Opening…", style = Type.title, color = t.fg)
-                Dim("Reading it, and making the first part.", style = Type.body)
-            }
+                MainButton("Back") { actions.dismissError(); onHome() }
+            } else Text("Opening…", style = Type.title, color = t.fg)
         }
     }
 }

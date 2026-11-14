@@ -12,13 +12,13 @@ import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onRoot
+import java.io.File
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
-import java.io.File
 
 /**
  * Every screen, drawn with made-up books, at the S26 Ultra's width (384 dp)
@@ -44,7 +44,7 @@ class ScreensTest {
     }
 
     private val reader: @Composable () -> Unit = {
-        ReaderScreen(Fake.playing(), Fake.state.prefs, { 1000L }, Fake.actions, {}, {}, {}, {})
+        ReaderScreen(Fake.playing(), Fake.state.prefs, { 1000L }, Fake.actions, ReaderTo())
     }
 
     private val home: @Composable () -> Unit = {
@@ -65,7 +65,10 @@ class ScreensTest {
     @Test @Config(qualifiers = WIDE) fun readerWide() = shot("reader-wide", ThemeMode.DARK, reader)
     @Test fun readerPaused() = shot("reader-paused", ThemeMode.DARK) {
         ReaderScreen(Fake.playing(at = 8, playing = false, sleep = Sleep.Minutes(12 * 60_000L)), Fake.state.prefs, { 0L },
-            Fake.actions, {}, {}, {}, {})
+            Fake.actions, ReaderTo())
+    }
+    @Test fun readerGettingReady() = shot("reader-getting-ready", ThemeMode.LIGHT) {
+        ReaderScreen(Fake.playing(at = 0, playing = false).copy(madeTo = 0), Fake.state.prefs, { 0L }, Fake.actions, ReaderTo())
     }
 
     @Test fun homeDark() = shot("home-dark", ThemeMode.DARK, home)
@@ -77,16 +80,20 @@ class ScreensTest {
 
     @Test fun firstRun() = shot("first-run", ThemeMode.DARK) { FirstRun(Setup.Missing, Fake.actions) }
     @Test fun firstRunDownloading() = shot("first-run-downloading", ThemeMode.LIGHT) {
-        FirstRun(Setup.Downloading("Kokoro", 120_000_000, 325_532_171), Fake.actions)
+        FirstRun(Setup.Downloading("Kokoro", 120_000_000, 354_000_000), Fake.actions)
     }
+    @Test fun firstRunLoading() = shot("first-run-loading", ThemeMode.DARK) { FirstRun(Setup.Loading("misaki"), Fake.actions) }
 
     @Test fun settings() = shot("settings", ThemeMode.DARK) { SettingsScreen(Fake.state, Fake.actions, {}, {}) }
+    @Test fun settingsPlain() = shot("settings-plain", ThemeMode.LIGHT) {
+        SettingsScreen(Fake.state.copy(prefs = Fake.state.prefs.copy(focus = false, words = false)), Fake.actions, {}, {})
+    }
     @Test fun voices() = shot("voices", ThemeMode.DARK) { VoicesScreen(Fake.state.copy(hearing = "af_heart"), Fake.actions) {} }
     @Test fun voicesLight() = shot("voices-light", ThemeMode.LIGHT) { VoicesScreen(Fake.state, Fake.actions) {} }
 
     @Test fun sheetChapters() = shot("sheet-chapters", ThemeMode.DARK, sheet { ChaptersSheet(Fake.playing()) {} })
     @Test fun sheetSleep() = shot("sheet-sleep", ThemeMode.DARK, sheet { SleepSheet(Fake.playing(sleep = Sleep.EndOfChapter)) {} })
-    @Test fun sheetMenu() = shot("sheet-menu", ThemeMode.LIGHT, sheet { MenuSheet(Fake.playing(), {}, {}, {}, {}, {}) })
+    @Test fun sheetSpeed() = shot("sheet-speed", ThemeMode.LIGHT, sheet { SpeedSheet(1.2f) {} })
     @Test fun sheetPage() = shot("sheet-page", ThemeMode.DARK, sheet { PageSheet("https://example.com/the-long-road") {} })
     @Test fun sheetType() = shot("sheet-type", ThemeMode.LIGHT, sheet { TypeSheet {} })
 }

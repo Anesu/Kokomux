@@ -11,7 +11,9 @@ import androidx.compose.ui.unit.dp
 
 /**
  * The app's icons, drawn on a 24-unit grid with one line weight so they read
- * as a family (Icon tints them). Each stands beside a word, never instead of it.
+ * as a family (Icon tints them). The ones every phone uses (play, pause,
+ * previous, next, back, settings, more) stand alone; the rest stand beside
+ * their word or value.
  */
 object Glyphs {
     private fun glyph(name: String, filled: Boolean = false, draw: PathBuilder.() -> Unit): ImageVector =
@@ -33,34 +35,40 @@ object Glyphs {
         moveTo(5f, 6f); lineTo(14.5f, 12f); lineTo(5f, 18f); close()
         moveTo(16f, 6f); lineTo(18.5f, 6f); lineTo(18.5f, 18f); lineTo(16f, 18f); close()
     }
-    /** A turn back round: hear this part again. */
-    val again = glyph("again") {
-        moveTo(5f, 12f); arcTo(7f, 7f, 0f, true, false, 12f, 5f)
-        moveTo(15f, 2f); lineTo(12f, 5f); lineTo(15f, 8f)
+    val previous = glyph("previous", filled = true) {
+        moveTo(19f, 6f); lineTo(9.5f, 12f); lineTo(19f, 18f); close()
+        moveTo(8f, 6f); lineTo(5.5f, 6f); lineTo(5.5f, 18f); lineTo(8f, 18f); close()
     }
     val stop = glyph("stop", filled = true) { moveTo(7f, 7f); lineTo(17f, 7f); lineTo(17f, 17f); lineTo(7f, 17f); close() }
     val moon = glyph("sleep", filled = true) {
         moveTo(19.5f, 14.5f); arcTo(8f, 8f, 0f, true, true, 9.5f, 4.5f)
         arcTo(6.5f, 6.5f, 0f, false, false, 19.5f, 14.5f); close()
     }
+    /** Lines with a dot before each: the chapters. */
     val chapters = glyph("chapters") {
         moveTo(9f, 7f); lineTo(20f, 7f); moveTo(9f, 12f); lineTo(20f, 12f); moveTo(9f, 17f); lineTo(20f, 17f)
         moveTo(4.5f, 7f); lineTo(4.6f, 7f); moveTo(4.5f, 12f); lineTo(4.6f, 12f); moveTo(4.5f, 17f); lineTo(4.6f, 17f)
     }
-    val menu = glyph("menu") { moveTo(4f, 7f); lineTo(20f, 7f); moveTo(4f, 12f); lineTo(20f, 12f); moveTo(4f, 17f); lineTo(20f, 17f) }
     val back = glyph("back") { moveTo(15f, 5f); lineTo(8f, 12f); lineTo(15f, 19f) }
+    /** Down: the reader folds away to the home screen, still playing. */
+    val down = glyph("down") { moveTo(5f, 9f); lineTo(12f, 16f); lineTo(19f, 9f) }
     val forward = glyph("forward") { moveTo(9f, 5f); lineTo(16f, 12f); lineTo(9f, 19f) }
     val close = glyph("close") { moveTo(6f, 6f); lineTo(18f, 18f); moveTo(18f, 6f); lineTo(6f, 18f) }
-    /** Sliders: how things are set. */
+    /** A gear: settings. */
     val settings = glyph("settings") {
-        moveTo(4f, 7f); lineTo(7f, 7f); moveTo(11f, 7f); lineTo(20f, 7f)
-        moveTo(11f, 7f); arcTo(2f, 2f, 0f, true, true, 7f, 7f); arcTo(2f, 2f, 0f, true, true, 11f, 7f)
-        moveTo(4f, 17f); lineTo(13f, 17f); moveTo(17f, 17f); lineTo(20f, 17f)
-        moveTo(17f, 17f); arcTo(2f, 2f, 0f, true, true, 13f, 17f); arcTo(2f, 2f, 0f, true, true, 17f, 17f)
+        val teeth = 8
+        for (k in 0 until teeth) {
+            val a = Math.toRadians(k * 360.0 / teeth)
+            val (c, s) = Math.cos(a).toFloat() to Math.sin(a).toFloat()
+            moveTo(12f + 6.5f * c, 12f + 6.5f * s); lineTo(12f + 9f * c, 12f + 9f * s)
+        }
+        moveTo(18.5f, 12f); arcTo(6.5f, 6.5f, 0f, true, true, 5.5f, 12f); arcTo(6.5f, 6.5f, 0f, true, true, 18.5f, 12f)
+        moveTo(15f, 12f); arcTo(3f, 3f, 0f, true, true, 9f, 12f); arcTo(3f, 3f, 0f, true, true, 15f, 12f)
     }
-    val search = glyph("search") {
-        moveTo(17f, 11f); arcTo(6f, 6f, 0f, true, true, 5f, 11f); arcTo(6f, 6f, 0f, true, true, 17f, 11f)
-        moveTo(15.5f, 15.5f); lineTo(20f, 20f)
+    /** A dial with its needle past the middle: speed. */
+    val speed = glyph("speed") {
+        moveTo(4f, 17f); arcTo(8f, 8f, 0f, true, true, 20f, 17f)
+        moveTo(12f, 15f); lineTo(16.5f, 9.5f)
     }
     /** A page with its corner folded: a book or a file. */
     val file = glyph("file") {

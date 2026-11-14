@@ -20,14 +20,14 @@ import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionResult
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
+import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import kokomux.app.ui.Sleep
 import kokomux.engine.Book
 import kokomux.engine.Bookmarks
 import kokomux.engine.Books
 import kokomux.engine.Maker
 import kokomux.engine.ReadError
-import java.io.File
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Listening, in the background: one ExoPlayer plays the whole book as a
@@ -123,6 +123,7 @@ class ListenService : MediaSessionService() {
         Listening.error = ""
         Listening.opening = true
         Listening.made.clear()
+        Listening.unpaced()
         read(request, run) { b, lang ->
             val mark = engine.bookmarks.get(request.id)
             val start = Bookmarks.startAt(mark?.part ?: 1, mark?.parts ?: 0, b.parts.size)
@@ -209,6 +210,7 @@ class ListenService : MediaSessionService() {
     /** Append a made part to the playlist (made at [speed]), and start playing with the first. */
     private fun queue(b: Book, made: Maker.Made, speed: Float) {
         Listening.made += made
+        Listening.paced(b.parts[made.index - 1].text.length, made.speechSecs * speed)
         val chapter = b.chapterOf(made.index)?.title?.takeIf { b.chapters.size > 1 }
         player.addMediaItem(
             MediaItem.Builder()
@@ -272,6 +274,7 @@ class ListenService : MediaSessionService() {
         if (voice == r.voice) return
         val next = r.copy(voice = voice)
         val from = at.coerceAtLeast(1)
+        Listening.unpaced()
         if (Books.langOf(voice) == lang) {
             request = next
             Listening.now = Listening.now?.let { Listening.Now(next, it.book, it.first, it.lang) }

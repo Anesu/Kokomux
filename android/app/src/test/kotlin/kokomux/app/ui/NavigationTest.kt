@@ -1,6 +1,8 @@
 package kokomux.app.ui
 
 import androidx.activity.ComponentActivity
+import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isSelectable
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
@@ -28,6 +30,8 @@ class NavigationTest {
         override fun openPage(address: String) { log += "page $address" }
         override fun voice(voice: String) { log += "voice $voice" }
         override fun resume(id: String) { log += "resume $id" }
+        override fun speed(speed: Float) { log += "speed $speed" }
+        override fun stop() { log += "stop" }
     }
 
     private fun show(state: UiState, asked: Asked) =
@@ -39,34 +43,43 @@ class NavigationTest {
     fun settingsThenVoiceThenBackTwiceIsHome() {
         val asked = Asked()
         show(Fake.state.copy(playing = null), asked)
-        compose.onNodeWithText("Start something new").assertExists()
-        compose.onNodeWithText("Settings").performClick()
-        compose.onNodeWithText("Voice and speech").assertExists()
-        compose.onNodeWithText("Voice").performClick()
-        compose.onNodeWithText("Filter: bf is British and female").assertExists()
+        compose.onNodeWithText("Bookshelf").assertExists()
+        compose.onNodeWithContentDescription("Settings").performClick()
+        compose.onNodeWithText("Reading").assertExists()
+        compose.onNodeWithText("Emma").performClick()                         // settings' voice row
+        compose.onNodeWithText("All").assertExists()
         back()
-        compose.onNodeWithText("Voice and speech").assertExists()
+        compose.onNodeWithText("Reading").assertExists()
         back()
-        compose.onNodeWithText("Start something new").assertExists()
+        compose.onNodeWithText("Bookshelf").assertExists()
     }
 
     @Test
     fun choosingAVoiceGoesBackAndKeepsIt() {
         val asked = Asked()
         show(Fake.state.copy(playing = null), asked)
-        compose.onNodeWithText("Emma").performClick()                         // the home screen's voice row
+        compose.onNodeWithContentDescription("Voice Emma").performClick()     // the home screen's voice
         compose.onNodeWithText("George").performClick()
         assertEquals(listOf("voice bm_george"), asked.log)
-        compose.onNodeWithText("Start something new").assertExists()
+        compose.onNodeWithText("Bookshelf").assertExists()
+    }
+
+    @Test
+    fun aLanguageShowsOnlyItsVoices() {
+        show(Fake.state.copy(playing = null), Asked())
+        compose.onNodeWithContentDescription("Voice Emma").performClick()
+        compose.onNode(hasText("Spanish") and isSelectable()).performClick()
+        compose.onNodeWithText("Dora").assertExists()
+        compose.onNodeWithText("George").assertDoesNotExist()
     }
 
     @Test
     fun aWebPageIsTypedAndRead() {
         val asked = Asked()
         show(Fake.state.copy(playing = null), asked)
-        compose.onNodeWithText("Read a web page").performClick()
+        compose.onNodeWithText("Web page").performClick()
         compose.onNodeWithText("https://…").performTextInput("https://example.com/a")
-        compose.onNodeWithText("Read it").performClick()
+        compose.onNodeWithText("Read").performClick()
         assertEquals(listOf("page https://example.com/a"), asked.log)
     }
 
@@ -75,9 +88,29 @@ class NavigationTest {
         val asked = Asked()
         show(Fake.state.copy(playing = Fake.playing(playing = false)), asked)  // (opens on the reader: a book is playing)
         compose.onNodeWithContentDescription("Play").assertExists()
-        compose.onNodeWithText("Chapters").performClick()
+        compose.onNodeWithContentDescription("Chapters").performClick()
         compose.onNodeWithText("Chapter Two: The Harbour").performClick()
         assertEquals(listOf("jump 7"), asked.log)
+    }
+
+    @Test
+    fun theReadersSpeedShowsItAndChangesIt() {
+        val asked = Asked()
+        show(Fake.state.copy(playing = Fake.playing(playing = false)), asked)
+        compose.onNodeWithContentDescription("Speed 1.1×").performClick()
+        compose.onNodeWithText("1.5×").performClick()
+        compose.onNodeWithContentDescription("Faster").performClick()
+        assertEquals(listOf("speed 1.5", "speed 1.2"), asked.log)               // (the fake keeps 1.1×: one more is 1.2×)
+    }
+
+    @Test
+    fun stoppingFromTheReaderGoesHome() {
+        val asked = Asked()
+        show(Fake.state.copy(playing = Fake.playing(playing = false)), asked)
+        compose.onNodeWithContentDescription("More").performClick()
+        compose.onNodeWithText("Stop").performClick()
+        assertEquals(listOf("stop"), asked.log)
+        compose.onNodeWithText("Bookshelf").assertExists()
     }
 
     @Test

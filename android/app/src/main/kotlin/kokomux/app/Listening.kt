@@ -45,4 +45,22 @@ object Listening {
     var madeWith by mutableStateOf("")
     /** The sleep timer, if it's set. */
     var sleep by mutableStateOf<Sleep?>(null)
+    /** Seconds of speech per letter at 1×, from the parts made this listen: for the time left. */
+    var perLetter by mutableStateOf(0.0)
+    private var letters = 0L
+    private var seconds = 0.0
+
+    /** A part made: [letters] long, taking [secondsAtOne] to say at 1×. */
+    fun paced(letters: Int, secondsAtOne: Double) {
+        this.letters += letters
+        seconds += secondsAtOne
+        if (this.letters > 0) perLetter = seconds / this.letters
+    }
+
+    /** A new listen (or voice): the pace is measured again. */
+    fun unpaced() {
+        letters = 0
+        seconds = 0.0
+        perLetter = 0.0
+    }
 }
