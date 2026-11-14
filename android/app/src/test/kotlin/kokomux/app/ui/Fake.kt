@@ -137,6 +137,8 @@ object Fake {
         override fun prefs(prefs: Prefs) {}
         override fun check() {}
         override fun clearKept() {}
+        override fun saveBackup(uri: Uri) {}
+        override fun restoreBackup(uri: Uri) {}
         override fun dismissError() {}
     }
 }

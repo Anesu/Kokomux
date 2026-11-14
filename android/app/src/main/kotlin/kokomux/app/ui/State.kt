@@ -206,6 +206,9 @@ interface Actions {
     fun prefs(prefs: Prefs)
     fun check()
     fun clearKept()
+    /** A backup of the bookshelf, the listens, the saved passages, the voices made and the settings, saved to [uri]; one added to what's here. */
+    fun saveBackup(uri: android.net.Uri)
+    fun restoreBackup(uri: android.net.Uri)
     fun dismissError()
 }
 

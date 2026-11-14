@@ -33,6 +33,7 @@ import kokomux.app.ui.UiState
 import kokomux.app.ui.Voices
 import kokomux.app.ui.WordSpan
 import kokomux.app.ui.wordSpans
+import kokomux.engine.Backup
 import kokomux.engine.Book
 import kokomux.engine.Books
 import kokomux.engine.VoiceId
@@ -418,6 +419,41 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
         viewModelScope.launch(Dispatchers.IO) {
             engine.cache.listFiles()?.forEach { it.deleteRecursively() }
             refreshShelf()
+        }
+    }
+
+    // ------------------------------------------------------------ backups
+
+    override fun saveBackup(uri: Uri) {
+        val app = getApplication<Application>()
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                Backup.save(app.filesDir, store.values(), version, app.contentResolver.openOutputStream(uri)!!)
+                Listening.note = "Backup saved"
+            } catch (e: Exception) {
+                error = "Couldn't save the backup (${e.plain()})"
+            }
+        }
+    }
+
+    /** Add a backup to what's here; its settings are taken on a phone whose own haven't been changed. */
+    override fun restoreBackup(uri: Uri) {
+        val app = getApplication<Application>()
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val got = Backup.restore(app.filesDir, app.contentResolver.openInputStream(uri)!!)
+                if (store.fresh && got.settings.isNotEmpty()) {
+                    store.take(got.settings)
+                    withContext(Dispatchers.Main) { prefs(store.load()) }
+                }
+                studio.loadVoices()
+                refreshPassages()
+                refreshShelf()
+                loadStats()
+                Listening.note = "Restored: ${got.inWords()}"
+            } catch (e: Exception) {
+                error = "Couldn't restore that (${e.plain()})"
+            }
         }
     }
 

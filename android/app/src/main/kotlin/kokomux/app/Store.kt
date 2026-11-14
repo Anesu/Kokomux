@@ -27,4 +27,25 @@ class Store(context: Context) {
             .putInt("KOKORO_THREADS", p.threads).putInt("KOKORO_BLOCK", p.block)
             .apply()
     }
+
+    /** No setting has been changed on this phone yet. */
+    val fresh get() = prefs.all.isEmpty()
+
+    /** The settings as they're kept, each as text (for a backup). */
+    fun values(): Map<String, String> = prefs.all.mapValues { it.value.toString() }
+
+    /** Keep the settings a backup had ([values]'s), any it lacks left as they come. */
+    fun take(values: Map<String, String>) {
+        val d = Prefs()
+        save(Prefs(
+            voice = values["KOKORO_VOICE"] ?: d.voice,
+            speed = values["KOKORO_SPEED"]?.toFloatOrNull()?.coerceIn(0.5f, 2f) ?: d.speed,
+            theme = runCatching { ThemeMode.valueOf(values["KOKORO_THEME"]!!.uppercase()) }.getOrDefault(d.theme),
+            focus = values["KOKORO_FOCUS"]?.toBooleanStrictOrNull() ?: d.focus,
+            words = values["KOKORO_WORDS"]?.toBooleanStrictOrNull() ?: d.words,
+            offsetMs = values["KOKORO_WORDS_OFFSET_MS"]?.toIntOrNull() ?: d.offsetMs,
+            threads = values["KOKORO_THREADS"]?.toIntOrNull() ?: d.threads,
+            block = values["KOKORO_BLOCK"]?.toIntOrNull() ?: d.block,
+        ))
+    }
 }

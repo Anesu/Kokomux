@@ -1,5 +1,7 @@
 package kokomux.app.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -61,8 +63,8 @@ import androidx.compose.ui.unit.dp
 /**
  * Settings (tui.sh's tui_settings): the voice and speed; how reading looks,
  * shown in a sample of the reader that follows every change; how Kokoro runs
- * on this phone and how fast the voice is making speech; the engines' files
- * and the kept audio; the versions. A change is kept as it's made.
+ * on this phone and how fast the voice is making speech; the engines' files,
+ * the kept audio and a backup; the versions. A change is kept as it's made.
  */
 @Composable
 fun SettingsScreen(state: UiState, actions: Actions, onBack: () -> Unit, onVoices: () -> Unit) {
@@ -111,6 +113,7 @@ fun SettingsScreen(state: UiState, actions: Actions, onBack: () -> Unit, onVoice
             SectionTitle("Storage")
             KeptAudio(state, actions)
             for (e in state.engines) EngineStorage(e, actions, onVoices)
+            BackupRow(actions)
 
             SectionTitle("About")
             Dim("kokomux ${state.version}\nKokoro 82M v1.0, fp32 · misaki 0.7.4 · spaCy 3.8.7 · espeak-ng 1.52.0\n" +
@@ -318,6 +321,26 @@ private fun KeptAudio(state: UiState, actions: Actions) {
         title = { Text("Clear ${sizeLabel(state.kept)}?", style = Type.title) },
         text = { Text("Bookmarks stay.", style = Type.body) },
     )
+}
+
+/**
+ * A backup: the bookshelf, the listens, the saved passages, the voices made and the settings in
+ * one file, saved where you choose; restoring one adds it to what's here.
+ */
+@Composable
+private fun BackupRow(actions: Actions) {
+    val save = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        if (uri != null) actions.saveBackup(uri)
+    }
+    val restore = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) actions.restoreBackup(uri)
+    }
+    Line("Backup") {
+        TextButton(onClick = { save.launch("kokomux-${java.time.LocalDate.now()}.zip") }) { Text("Save", style = Type.label) }
+        TextButton(onClick = { restore.launch(arrayOf("application/zip", "application/octet-stream")) }) {
+            Text("Restore", style = Type.label)
+        }
+    }
 }
 
 /** "1.2 GB", "340 MB", "None". */

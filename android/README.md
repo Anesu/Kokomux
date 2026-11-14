@@ -60,6 +60,11 @@ plain wording. The Termux version in `src/` stays as it is.
   reader that follow every change; then how Kokoro runs (`kokoro --benchmark`'s
   choices), how fast the voice in use makes speech here, the pronunciation
   check, the kept audio and each engine's files (with Remove).
+- **A backup** (Settings, **Backup**): **Save** writes one file where you
+  choose, with the bookshelf and the books' own copies, the listens, the saved
+  passages, the voices you made and the settings. **Restore** adds a backup to
+  what's on the phone: a book in both keeps the bookmark that's further on,
+  and the settings are taken on a phone whose own haven't been changed.
 
 ## Design
 
@@ -216,6 +221,7 @@ with the model, and saves the screen before and after loading
 | `engine/…/Bookmarks.kt` | where each book was left, as Termux's `.mark` files |
 | `engine/…/Stats.kt` | the listens kept, and what they add up to |
 | `engine/…/Plain.kt` | what went wrong, in a few plain words to show |
+| `engine/…/Backup.kt` | a backup: what's in the file, and how one is added to what's on the phone |
 | `engine/…/ming/` | Ming-3.0-tts's host side (from its Android sample, MIT: see `LICENSE` there) and its speaker |
 | `engine/…/qwen/` | Qwen3-TTS: cloning a voice, the talker and code predictor's loop, decoding; its speaker |
 | `app/src/main/kotlin/kokomux/app/ListenService.kt` | listening in the background: the playlist, the notification, the bookmark, speed, voice, a novel's next chapter; reading and making as jobs that cancel |
