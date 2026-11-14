@@ -15,11 +15,10 @@ ROOT="$PWD"
 DEV="$ROOT/.dev"
 mkdir -p "$DEV"/{app,bin,home,prefix/bin,prefix/share/kokomux}
 
-# .dev/app is the container's /opt/kokoro: engine.py and words.py linked from
-# src/ (so edits show at once), venv/ and models/.
-ln -sfn "$ROOT/src/engine.py" "$DEV/app/engine.py"
-ln -sfn "$ROOT/src/words.py" "$DEV/app/words.py"
-for f in theme.sh tui.sh player.sh; do ln -sfn "$ROOT/src/$f" "$DEV/prefix/share/kokomux/$f"; done
+# .dev/app is the container's /opt/kokoro: the Python files linked from src/
+# (so edits show at once), venv/ and models/.
+for f in "$ROOT"/src/*.py; do ln -sfn "$f" "$DEV/app/${f##*/}"; done
+for f in theme.sh tui.sh player.sh commands.sh; do ln -sfn "$ROOT/src/$f" "$DEV/prefix/share/kokomux/$f"; done
 ln -sfn /tmp "$DEV/prefix/tmp"        # proot-distro --shared-tmp: both sides see the same /tmp
 
 # The same packages as setup-container.sh's pip phase.

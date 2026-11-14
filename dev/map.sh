@@ -11,7 +11,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 check=0; [ "${1:-}" = --check ] && { check=1; shift; }
-files=("$@"); [ "${#files[@]}" -gt 0 ] || files=(src/kokoro src/player.sh src/tui.sh src/theme.sh src/engine.py src/words.py)
+files=("$@"); [ "${#files[@]}" -gt 0 ] || files=(src/kokoro src/commands.sh src/player.sh src/tui.sh src/theme.sh src/engine.py src/text.py src/sources.py src/words.py)
 if [ "$check" = 1 ]; then
   # a function with no comment: no "# ..." on its line, nor the line above
   missing="$(awk '/^[a-z_][a-z_0-9]*\(\) *\{/ && !/#/ && prev !~ /^#/ { print FILENAME ":" FNR ": " $1 } { prev = $0 }' \

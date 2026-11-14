@@ -51,7 +51,7 @@ class Phone:
             os.symlink("/tmp", os.path.join(self.prefix, "tmp"))
         else:
             os.makedirs(os.path.join(self.prefix, "tmp"))
-        for f in ("theme.sh", "tui.sh", "player.sh"):
+        for f in ("theme.sh", "tui.sh", "player.sh", "commands.sh"):
             shutil.copy(os.path.join(SRC, f), share)
         with open(os.path.join(SRC, "kokoro"), encoding="utf-8") as f:
             body = f.read().split("\n", 1)[1]

@@ -1,4 +1,4 @@
-"""Tests for reading web pages (src/engine.py page_text, with trafilatura).
+"""Tests for reading web pages (src/sources.py page_text, with trafilatura).
 
 Run with:  python3 tests/test_web.py   (or pytest). Needs trafilatura; skipped
 without it. Pages are made up here, so no network is needed.
@@ -8,7 +8,7 @@ import sys
 
 HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(HERE, "..", "src"))
-import engine  # noqa: E402
+import sources  # noqa: E402
 
 try:
     import trafilatura  # noqa: F401
@@ -40,7 +40,7 @@ def needs_trafilatura(fn):
 
 @needs_trafilatura
 def test_the_article_and_nothing_around_it():
-    title, text = engine.page_text(PAGE, "https://example.com/long-road")
+    title, text = sources.page_text(PAGE, "https://example.com/long-road")
     lines = text.split("\n")
     assert title == "The Long Road"                         # (trafilatura picks the article's own title)
     assert lines[0] == "The Long Road."                     # the heading, with a pause
@@ -56,15 +56,15 @@ def test_old_pages_laid_out_with_line_breaks():
     paras = [f"Paragraph {n} says something worth hearing about the long road ahead." * 3 for n in range(5)]
     page = "<html><head><title>Essay</title></head><body><table><tr><td><font>" + \
         "<br><br>".join(paras) + "</font></td></tr></table></body></html>"
-    title, text = engine.page_text(page, "https://example.com/essay")
+    title, text = sources.page_text(page, "https://example.com/essay")
     assert [p for p in paras if p in text.split("\n")] == paras   # each its own paragraph
 
 
 @needs_trafilatura
 def test_a_page_with_nothing_to_read():
     try:
-        engine.page_text("<html><body><nav><a href='/'>Home</a></nav></body></html>", "https://example.com/")
-    except engine.JobError:
+        sources.page_text("<html><body><nav><a href='/'>Home</a></nav></body></html>", "https://example.com/")
+    except sources.JobError:
         return
     raise AssertionError("an empty page was accepted")
 

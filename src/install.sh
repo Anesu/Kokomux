@@ -269,33 +269,17 @@ fi
 
 rm -rf "$WORK"; mkdir -p "$WORK"
 
-cat > "$WORK/engine.py" <<'__KOKOMUX_ENGINE__'
-#@EMBED engine.py
-__KOKOMUX_ENGINE__
-
-cat > "$WORK/words.py" <<'__KOKOMUX_WORDS__'
-#@EMBED words.py
-__KOKOMUX_WORDS__
-
-cat > "$WORK/tui.sh" <<'__KOKOMUX_TUI__'
-#@EMBED tui.sh
-__KOKOMUX_TUI__
-
-cat > "$WORK/player.sh" <<'__KOKOMUX_PLAYER__'
-#@EMBED player.sh
-__KOKOMUX_PLAYER__
-
-cat > "$WORK/theme.sh" <<'__KOKOMUX_THEME__'
-#@EMBED theme.sh
-__KOKOMUX_THEME__
-
-cat > "$WORK/setup.sh" <<'__KOKOMUX_SETUP__'
-#@EMBED setup-container.sh
-__KOKOMUX_SETUP__
-
-cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
-#@EMBED kokoro
-__KOKOMUX_WRAPPER__
+# Every file kokomux is made of, unpacked into $WORK (build.sh fills these in).
+#@FILE kokoro
+#@FILE theme.sh
+#@FILE tui.sh
+#@FILE player.sh
+#@FILE commands.sh
+#@FILE setup-container.sh
+#@FILE engine.py
+#@FILE text.py
+#@FILE sources.py
+#@FILE words.py
 
 # ================================================================ the work
 
@@ -320,7 +304,7 @@ debian_container() {
   proot-distro install --override-alias "$DISTRO" debian
 }
 
-in_container() { proot-distro login "$DISTRO" --shared-tmp -- bash /tmp/kokoro-setup/setup.sh "$@"; }
+in_container() { proot-distro login "$DISTRO" --shared-tmp -- bash /tmp/kokoro-setup/setup-container.sh "$@"; }
 
 stop_old_server() {
   local tok="$PREFIX/tmp/kokoro-server/token"
@@ -349,9 +333,8 @@ kokoro_command() {
   { printf '#!%s/bin/bash\n' "$PREFIX"; tail -n +2 "$WORK/kokoro"; } > "$PREFIX/bin/kokoro"
   chmod +x "$PREFIX/bin/kokoro"
   mkdir -p "$PREFIX/share/kokomux"
-  cp "$WORK/tui.sh" "$PREFIX/share/kokomux/tui.sh"         # the full-screen screens
-  cp "$WORK/player.sh" "$PREFIX/share/kokomux/player.sh"   # playing a text
-  cp "$WORK/theme.sh" "$PREFIX/share/kokomux/theme.sh"     # the colours
+  # the colours, the screens, playing a text, the admin commands
+  cp "$WORK"/{theme,tui,player,commands}.sh "$PREFIX/share/kokomux/"
 
   local conf="$HOME/.config/kokoro/config"
   if [ ! -f "$conf" ]; then

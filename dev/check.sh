@@ -18,7 +18,7 @@ done
 
 step shellcheck
 # (src/install.sh is a template: its #@EMBED lines only make sense once built into install.sh)
-shellcheck -x -S warning install.sh src/kokoro src/tui.sh src/player.sh src/theme.sh \
+shellcheck -x -S warning install.sh src/kokoro src/tui.sh src/player.sh src/theme.sh src/commands.sh \
   src/setup-container.sh build.sh dev/*.sh dev/kokoro || fail=1
 
 step "bash traps"

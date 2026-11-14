@@ -353,6 +353,25 @@ def test_saving_a_file_does_not_wait():
         engine.AHEAD = old_ahead
 
 
+
+@needs_audio
+def test_the_plan_lists_every_part_and_the_rate_follows_the_voice():
+    text = "One short line.\n" + " ".join(f"Sentence number {n} goes on for a while." for n in range(20))
+    jobdir, _ = run(text, start="3")
+    try:
+        with open(os.path.join(jobdir, "plan"), encoding="utf-8") as f:
+            plan = [line.rstrip("\n").split("\t", 1) for line in f]
+        parts = engine.split_text(engine.normalise(text))
+        assert [t for _, t in plan] == [t for t, _ in parts]                   # every part, made or not
+        assert int(plan[-1][0]) == sum(len(t) + 1 for t, _ in parts)        # characters up to each part's end
+        assert all(int(a[0]) < int(b[0]) for a, b in zip(plan, plan[1:]))
+        with open(os.path.join(jobdir, "rate")) as f:
+            rate = float(f.read())
+        # FakeKokoro speaks 100 characters a second, and each part has a pause after it
+        assert 60 < rate < 100, rate
+    finally:
+        shutil.rmtree(jobdir)
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

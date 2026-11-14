@@ -300,7 +300,7 @@ Kokoro's Python packages (`onnxruntime`, `espeakng-loader`, `soundfile`) only sh
 
 - **`kokoro`** (Termux side): reads your text, starts or uses the server, and hands each run to the player.
 - **`player.sh`, `tui.sh` and `theme.sh`** (Termux side): play the audio through one mpv (gapless, controlled over its IPC socket with socat), and draw the reader, home screen and settings in colours made from the terminal's own. ffmpeg makes the audiobooks.
-- **`engine.py`** (inside Debian): splits the text into sentences and runs Kokoro. With `-p` it hands back audio one chunk at a time, so playback starts after the first sentence.
+- **`engine.py`**, with **`text.py`** and **`sources.py`** (inside Debian): reads the page or book, splits the text into sentences and runs Kokoro. With `-p` it hands back audio one chunk at a time, so playback starts after the first sentence.
 - **misaki** (inside Debian): turns English into sounds the way Kokoro was trained, using spaCy to tell a noun from a verb.
 - **`words.py`** (inside Debian): turns Kokoro's per-sound timings into word timings, for the highlight.
 - **Sharing files:** the two sides exchange text and audio through `$PREFIX/tmp`, which the container sees as `/tmp`.
@@ -334,10 +334,13 @@ python3 dev/screen.py --out reader.png -- dev/kokoro -p -f story.txt   # a pictu
 | File | What it is |
 |---|---|
 | `src/kokoro` | the `kokoro` command (Termux side) |
+| `src/commands.sh` | the admin commands: status, the queue, continue, update… (Termux side) |
 | `src/player.sh` | playing a text: mpv, highlights, controls, bookmarks, chapters, sleep timer (Termux side) |
 | `src/tui.sh` | the full-screen reader, menu, home screen and settings (Termux side) |
 | `src/theme.sh` | the colours: dark and light palettes built from the terminal's background (Termux side and installer) |
-| `src/engine.py` | Kokoro engine, server, web-page reader and model downloader (container side) |
+| `src/engine.py` | Kokoro engine, jobs, server and model downloader (container side) |
+| `src/text.py` | tidying text and splitting it into parts (container side) |
+| `src/sources.py` | reading web pages, web novels, EPUBs and PDFs (container side) |
 | `src/words.py` | word timings from Kokoro's per-sound timings (container side) |
 | `src/setup-container.sh` | installs everything inside the container |
 | `src/install.sh` | installer template (UI and steps) |

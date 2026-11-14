@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # kokomux: runs inside the "kokoro" Debian container (as root), one phase
-# per call, from install.sh:  bash setup.sh apt|pip|models|tidy
+# per call, from install.sh:  bash setup-container.sh apt|pip|models|tidy
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 export PIP_PROGRESS_BAR=off
@@ -33,7 +33,7 @@ CFG
       "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" \
       | tee /tmp/kokoro-setup/.pip
     grep -q '^Successfully installed' /tmp/kokoro-setup/.pip || printf 'up to date' > "$SRC/.note"
-    cp "$SRC/engine.py" "$SRC/words.py" "$APP/"
+    cp "$SRC"/*.py "$APP/"                  # engine.py and its modules
     ;;
   models)
     if [ -s "$APP/models/kokoro-v1.0-timestamped.fp32.onnx" ] && [ -s "$APP/models/voices-v1.0.bin" ]; then
@@ -47,5 +47,5 @@ CFG
     find /usr/share/doc -mindepth 2 ! -name copyright -delete 2>/dev/null || true
     ;;
   *)
-    echo "usage: setup.sh apt|pip|models|tidy" >&2; exit 2 ;;
+    echo "usage: setup-container.sh apt|pip|models|tidy" >&2; exit 2 ;;
 esac

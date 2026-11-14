@@ -24,9 +24,11 @@ mouse). Build for that phone, not for every device:
 Termux (bash)                                Debian container "kokoro" (proot-distro)
 ─────────────                                ────────────────────────────────────────
 $PREFIX/bin/kokoro         ← src/kokoro      /opt/kokoro/engine.py   ← src/engine.py
-$PREFIX/share/kokomux/     ← src/theme.sh    /opt/kokoro/words.py    ← src/words.py
-                             src/tui.sh      /opt/kokoro/venv        (kokoro-onnx, misaki, spaCy,
-                             src/player.sh                            trafilatura, pypdf, soundfile)
+$PREFIX/share/kokomux/     ← src/theme.sh    /opt/kokoro/text.py     ← src/text.py
+                             src/tui.sh      /opt/kokoro/sources.py  ← src/sources.py
+                             src/player.sh   /opt/kokoro/words.py    ← src/words.py
+                             src/commands.sh /opt/kokoro/venv        (kokoro-onnx, misaki, spaCy,
+                                                                      trafilatura, pypdf, soundfile)
                                              /opt/kokoro/models      (fp32 timestamped model, voices)
 $PREFIX/tmp  ═════════════ shared ═══════════ /tmp
 ```
@@ -39,10 +41,12 @@ $PREFIX/tmp  ═════════════ shared ══════�
    `proot-distro login kokoro -- python engine.py job …`. The job protocol
    (keys and the files written back) is documented at the top of
    `src/engine.py`; keep that docstring in step with the code.
-2. **The engine** reads the source (text, EPUB, PDF or a web page), tidies it
-   (`normalise`), splits it into parts with golden-ratio pauses
-   (`split_text`), and writes each part to `stream/NNNN.{txt,words,wav}` (the
-   `.wav` last, so its presence means the part is ready), then `stream/end`.
+2. **The engine** reads the source (text, EPUB, PDF or a web page:
+   `sources.py`), tidies it (`normalise`), splits it into parts with
+   golden-ratio pauses (`split_text`, both in `text.py`), writes the `plan`
+   (every part's text) and then each part to `stream/NNNN.{txt,words,wav}`
+   (the `.wav` last, so its presence means the part is ready), then
+   `stream/end`. `run_job` drives it; `Listen` holds what's being read.
    Parts are kept in `/tmp/kokomux-cache/<book>/<settings hash>/` and the
    stream files are relative links into it; a part is reused when its text
    matches. The cache is deleted when a book is finished and trimmed to
@@ -65,7 +69,8 @@ $PREFIX/tmp  ═════════════ shared ══════�
    with. `tests/test_novel.py` serves a made-up novel locally.
 
 `install.sh` is what the phone downloads: `src/install.sh` with the other
-files inlined by `./build.sh`. It sets up Termux packages, the container
+files inlined by `./build.sh` (a `#@FILE name` line unpacks src/name into
+the installer's work folder). It sets up Termux packages, the container
 (`src/setup-container.sh`, one phase per call: apt, pip, models, tidy), the
 share handlers and the widgets. `kokoro --update [BRANCH]` re-runs it.
 
@@ -73,11 +78,14 @@ share handlers and the widgets. `kokoro --update [BRANCH]` re-runs it.
 
 | File | What it is |
 |---|---|
-| `src/kokoro` | the `kokoro` command: settings (KOKORO_DEFAULTS), server, keys and the frame timer (`tick`), admin commands, options, the job folder, audiobooks, the run |
+| `src/kokoro` | the `kokoro` command: settings (KOKORO_DEFAULTS), server, keys and the frame timer (`tick`), options, the job folder, audiobooks, the run |
+| `src/commands.sh` | the admin commands (`admin_cmd`: `--status`, `--queue`, `--continue`, `--update`…), each a `cmd_*` function that exits |
 | `src/player.sh` | playing: the inline view, bookmarks, chapters, sleep timer, commands (`listen_cmd`), mpv, `play_line` |
 | `src/tui.sh` | the full-screen screens; its header lists the drawing rules |
 | `src/theme.sh` | colour maths, asking the terminal, the palette (`theme_apply`, `theme_off`) |
-| `src/engine.py` | model, text, books, jobs, server, benchmark and download, voices |
+| `src/engine.py` | model, pronunciation, jobs (`Listen`, `run_job`), server, benchmark and download, voices |
+| `src/text.py` | tidying text (`normalise`) and splitting it into parts (`split_text`) |
+| `src/sources.py` | what a job reads: web pages, web novels' chapters, EPUB, PDF (`read_source`, `read_page`) |
 | `src/words.py` | word timings from Kokoro's per-sound durations |
 | `src/setup-container.sh` | installs everything inside the container |
 | `src/install.sh` | installer template (`#@EMBED file` lines are filled by build.sh) |
@@ -98,9 +106,11 @@ find your way; it's made from the code, so it's always current.
 | what a key or tap does while listening | `key_cmd` (src/kokoro), then `listen_cmd` / `play_line` (src/player.sh) |
 | a key's name (arrows, Enter, clicks) | `key_name` (src/kokoro): screens match names, never escape codes |
 | a setting | the four places in "A new setting" below |
-| a command-line option or admin command (`--queue`, `--status`…) | the `case "${1:-}"` and the options loop in src/kokoro |
+| an admin command (`--queue`, `--status`…) | `admin_cmd` and its `cmd_*` function in src/commands.sh |
+| a command-line option for a run (`-p`, `-f`…) | the options loop in src/kokoro |
 | bookmarks, the sleep timer, chapters, web novels mid-listen | src/player.sh, section "listening" |
-| how text is tidied, split or read from a book or page | src/engine.py: `normalise`, `split_text`, `read_epub`, `read_pdf`, `page_text`, `novel_chapter` |
+| how text is tidied or split | src/text.py: `normalise`, `split_text` |
+| how a book or page is read | src/sources.py: `read_epub`, `read_pdf`, `page_text`, `novel_chapter` |
 | what the engine writes for the player | the docstring at the top of src/engine.py, and `run_job` |
 | colours | src/theme.sh (`theme_apply`) |
 | the installer's steps and screens | src/install.sh (then `./build.sh`) |
@@ -196,9 +206,11 @@ being run (e.g. in `Phone`), run it, and read the end of /tmp/trace.
 `KOKORO_DEFAULTS` in src/kokoro, `TUI_SETTINGS`, `setting_value` and
 `setting_change` in src/tui.sh, and `EXPECTED` in tests/test_settings.py.
 
-**Python (src/engine.py)** must stay importable without numpy, onnxruntime,
-misaki or trafilatura (tests import it bare); import those inside the
-functions that use them.
+**Python (src/engine.py, text.py, sources.py, words.py)** must stay
+importable without numpy, onnxruntime, misaki or trafilatura (tests import
+them bare); import those inside the functions that use them. A new .py file
+in src/ needs a `#@FILE` line in src/install.sh (setup-container.sh copies
+every .py into /opt/kokoro, and dev/rig.sh links them).
 
 **Design**: proportions and timings follow the golden ratio (φ): pauses,
 greys, the reading line at φ⁻² down the screen, the focus fade. Keep new

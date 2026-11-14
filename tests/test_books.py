@@ -1,4 +1,4 @@
-"""Tests for reading books: EPUB, PDF and plain text (src/engine.py).
+"""Tests for reading books: EPUB, PDF and plain text (src/sources.py).
 
 Run with:  python3 tests/test_books.py   (or pytest). The PDF test needs pypdf.
 """
@@ -9,7 +9,7 @@ import zipfile
 
 HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(HERE, "..", "src"))
-import engine  # noqa: E402
+import sources  # noqa: E402
 
 CONTAINER = """<?xml version="1.0"?>
 <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
@@ -53,9 +53,9 @@ def test_epub_author_and_cover_for_audiobooks():
                 "<dc:title>The Long Road</dc:title><dc:creator> A. Walker </dc:creator><meta name=\"cover\" content=\"cov\"/>").replace(
                 "<manifest>", '<manifest><item id="cov" href="images/front%20cover.jpg" media-type="image/jpeg"/>'))
             z.writestr("OEBPS/images/front cover.jpg", b"\xff\xd8jpeg")
-        assert engine.epub_meta(path) == ("A. Walker", b"\xff\xd8jpeg", "jpg")
+        assert sources.epub_meta(path) == ("A. Walker", b"\xff\xd8jpeg", "jpg")
         make_epub(path)                                               # no author, no cover
-        assert engine.epub_meta(path) == ("", b"", "")
+        assert sources.epub_meta(path) == ("", b"", "")
 
 
 def job_with(filename, data):
@@ -69,7 +69,7 @@ def test_epub_chapters_in_spine_order():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "book.epub")
         make_epub(path)
-        title, chapters = engine.read_epub(path, "book.epub")
+        title, chapters = sources.read_epub(path, "book.epub")
     assert title == "The Long Road"
     assert [h for h, _ in chapters] == ["Chapter One", "Chapter Two"]   # titled by their headings
     assert "The road began" in chapters[0][1]
@@ -82,9 +82,9 @@ def test_drm_epub_is_refused():
         path = os.path.join(d, "book.epub")
         make_epub(path, encrypted=True)
         try:
-            engine.read_epub(path, "book.epub")
+            sources.read_epub(path, "book.epub")
             raise AssertionError("expected a JobError")
-        except engine.JobError as e:
+        except sources.JobError as e:
             assert "DRM" in str(e)
 
 
@@ -93,7 +93,7 @@ def test_pdf_title_and_joined_lines():
     if importlib.util.find_spec("pypdf") is None:
         print("  (pypdf not installed: skipped)")
         return
-    title, chapters = engine.read_pdf(os.path.join(HERE, "fixtures", "caravan.pdf"), "caravan.pdf")
+    title, chapters = sources.read_pdf(os.path.join(HERE, "fixtures", "caravan.pdf"), "caravan.pdf")
     text = chapters[0][1]
     assert title == "The Caravan" and len(chapters) == 1
     assert "every traveller kept one eye on the" in text      # a wrapped line, rejoined
@@ -106,26 +106,26 @@ def test_read_source_detects_the_kind_of_file():
         epub = os.path.join(d, "b.epub")
         make_epub(epub)
         data = open(epub, "rb").read()
-    title, chapters = engine.read_source(job_with("in.bin", data), {"file": "in.bin", "name": "b.epub"})
+    title, chapters = sources.read_source(job_with("in.bin", data), {"file": "in.bin", "name": "b.epub"})
     assert title == "The Long Road" and len(chapters) == 2 and "road began" in chapters[0][1]
-    title, chapters = engine.read_source(job_with("in.txt", "Plain words.".encode()), {"name": "notes.txt"})
+    title, chapters = sources.read_source(job_with("in.txt", "Plain words.".encode()), {"name": "notes.txt"})
     assert (title, chapters) == ("notes.txt", [("notes.txt", "Plain words.")])
 
 
 def test_binary_junk_is_refused():
     jobdir = job_with("in.txt", bytes(range(256)) * 20)
     try:
-        engine.read_source(jobdir, {})
+        sources.read_source(jobdir, {})
         raise AssertionError("expected a JobError")
-    except engine.JobError as e:
+    except sources.JobError as e:
         assert "doesn't look like text" in str(e)
 
 
 def test_input_file_name_cannot_escape_the_job_folder():
     try:
-        engine.read_source(tempfile.mkdtemp(), {"file": "../etc/passwd"})
+        sources.read_source(tempfile.mkdtemp(), {"file": "../etc/passwd"})
         raise AssertionError("expected a JobError")
-    except engine.JobError:
+    except sources.JobError:
         pass
 
 

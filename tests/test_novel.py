@@ -1,4 +1,4 @@
-"""Tests for web novels (src/engine.py): reading a chapter page, and listening on
+"""Tests for web novels (src/sources.py): reading a chapter page, and listening on
 from chapter to chapter.
 
 Run with:  python3 tests/test_novel.py   (or pytest). Needs curl and trafilatura;
@@ -15,7 +15,7 @@ import time
 HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(HERE, "..", "src"))
 sys.path.insert(0, HERE)
-import engine  # noqa: E402
+import sources  # noqa: E402
 
 try:
     import trafilatura  # noqa: F401
@@ -102,22 +102,22 @@ def needs(*mods):
 def test_a_page_in_an_unknown_charset_is_read_as_utf8():
     if not shutil.which("curl"):
         return
-    ctype, body = engine.fetch(site() + "/odd-charset")
+    ctype, body = sources.fetch(site() + "/odd-charset")
     assert ctype == "text/html" and "Café au lait." in body
 
 
 def test_addresses():
     url = "https://freewebnovel.com/novel/starting-with-an-sss-rank-goddess-summon/chapter-5"
-    assert engine.novel_url_of(url) == "https://freewebnovel.com/novel/starting-with-an-sss-rank-goddess-summon"
-    assert engine.chapter_address(url, 12).endswith("/starting-with-an-sss-rank-goddess-summon/chapter-12")
-    assert engine.novel_url_of("https://x.org/fiction/21/mother/chapter/456/a-title") == "https://x.org/fiction/21/mother"
-    assert engine.chapter_address("https://x.org/blog/a-post", 3) is None
+    assert sources.novel_url_of(url) == "https://freewebnovel.com/novel/starting-with-an-sss-rank-goddess-summon"
+    assert sources.chapter_address(url, 12).endswith("/starting-with-an-sss-rank-goddess-summon/chapter-12")
+    assert sources.novel_url_of("https://x.org/fiction/21/mother/chapter/456/a-title") == "https://x.org/fiction/21/mother"
+    assert sources.chapter_address("https://x.org/blog/a-post", 3) is None
 
 
 @needs()
 def test_a_chapter_page_is_read_as_a_chapter():
     base = site()
-    title, text, ch = engine.read_page(f"{base}/chapter-2")
+    title, text, ch = sources.read_page(f"{base}/chapter-2")
     assert ch["novel"] == title == "The Long Road"
     assert ch["label"] == "Chapter 2: The Ridge" and ch["number"] == 2
     assert ch["novel_url"] == base
@@ -130,30 +130,30 @@ def test_a_chapter_page_is_read_as_a_chapter():
 
 def test_lines_that_mention_the_chapter_are_kept():
     page = chapter_page(1).replace(PARA, "She walked on.")                # short lines, "…of chapter 1."
-    ch = engine.novel_chapter(page, "https://example.org/novel/the-long-road/chapter-1")
+    ch = sources.novel_chapter(page, "https://example.org/novel/the-long-road/chapter-1")
     assert ch["text"].split("\n")[1:] == [f"She walked on. This is paragraph {k} of chapter 1." for k in range(1, 6)]
 
 
 @needs()
 def test_the_last_chapter_out_has_no_next_yet():
     base = site()
-    _, _, ch = engine.read_page(f"{base}/chapter-3")
+    _, _, ch = sources.read_page(f"{base}/chapter-3")
     assert ch["next"] == f"{base}/chapter-4" and ch["guessed"]       # worked out from the address
-    assert engine.novel_next(ch) is None                              # (404: not out yet)
+    assert sources.novel_next(ch) is None                              # (404: not out yet)
 
 
 def test_titles_written_the_other_way_round():
     page = chapter_page(1).replace("The Long Road - Chapter 1: Departure | Free Web Novel",
                                    "Chapter 1 - The Long Road - Free Web Novel")
     page = page.replace('<span class="chapter">Chapter 1: Departure</span>', "")
-    ch = engine.novel_chapter(page, "https://example.org/novel/the-long-road/chapter-1")
+    ch = sources.novel_chapter(page, "https://example.org/novel/the-long-road/chapter-1")
     assert ch["novel"] == "The Long Road" and ch["label"] == "Chapter 1"
 
 
 def test_an_ordinary_page_is_not_a_chapter():
     page = "<html><head><title>How to bake bread</title></head><body><article>" + \
         "<p>Mix the flour and water, then knead it for ten minutes until smooth.</p>" * 8 + "</article></body></html>"
-    assert engine.novel_chapter(page, "https://example.org/recipes/bread") is None
+    assert sources.novel_chapter(page, "https://example.org/recipes/bread") is None
 
 
 def lines(path):
@@ -229,11 +229,13 @@ def test_picking_up_mid_listen_keeps_the_numbering():
         jobdir, _ = run("", url=f"{base}/chapter-1", words="0", files={"at": "999"})
         serial = lines(os.path.join(jobdir, "serial"))
         chapters = lines(os.path.join(jobdir, "chapters"))
+        plan = lines(os.path.join(jobdir, "plan"))
         first2 = int(serial[1].split("\t")[0])
         d2, _ = run("", url=f"{base}/chapter-2", words="0", base=str(first2), start=str(first2 + 1),
                     files={"serial": "\n".join(serial[:1]) + "\n", "chapters": "\n".join(chapters[:1]) + "\n",
-                           "at": "999"})
+                           "plan": "\n".join(plan[:first2 - 1]) + "\n", "at": "999"})
         assert lines(os.path.join(d2, "serial")) == serial                   # the same numbers
+        assert lines(os.path.join(d2, "plan")) == plan                       # every part's text, earlier ones kept
         assert lines(os.path.join(d2, "stream", "first")) == [str(first2 + 1)]
         assert not os.path.exists(os.path.join(d2, "stream", f"{first2:04d}.wav"))
     finally:
@@ -255,7 +257,7 @@ def test_carrying_on_after_the_last_chapter_heard():
     try:
         run("", url=f"{base}/chapter-3", words="0", skip="1")
         raise AssertionError("expected: no new chapter")
-    except engine.JobError as e:
+    except sources.JobError as e:
         assert "No new chapter after Chapter 3: The River yet" in str(e)
 
 

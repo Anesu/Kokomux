@@ -1,4 +1,4 @@
-"""Tests for preparing text to be spoken (src/engine.py): tidying it, and
+"""Tests for preparing text to be spoken (src/text.py): tidying it, and
 splitting it into parts with the right pauses between them.
 
 Run with:  python3 tests/test_text.py   (or pytest). The audio tests need numpy.
@@ -8,7 +8,8 @@ import sys
 
 HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(HERE, "..", "src"))
-from engine import MAX_CHUNK, PAUSE, edges, normalise, roman, sentences, silence, split_text  # noqa: E402
+from engine import edges, silence  # noqa: E402
+from text import MAX_CHUNK, PAUSE, normalise, roman, sentences, split_text  # noqa: E402
 
 
 def test_roman_numerals():

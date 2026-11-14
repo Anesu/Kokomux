@@ -22,7 +22,7 @@
 # Expects from kokoro: the run's globals (tmpd, play, ui, show_words, voice,
 # speed, lang, name, kind, source, text, book_id, start, i), CACHE, QUIT_RC,
 # the colours (HL), status/status_clear, die, tick, now_ms, cleanup,
-# write_job and run_engine.
+# write_job and engine_start.
 
 # ------------------------------------------------------------ the line being heard
 # Each line is printed wrapped to the screen while it plays, and a soft
@@ -38,10 +38,15 @@ w_s=(); w_e=(); w_a=(); w_b=(); w_state=none
 TERM_ROWS=24
 in_line=0
 
+parts_total() {  # parts_total [DEFAULT]: PARTS = how many parts the engine has found (DEFAULT, or 1, before it says)
+  PARTS=${1:-1}
+  [ -f "$tmpd/progress" ] && { read -r _ PARTS < "$tmpd/progress" || PARTS=${1:-1}; }
+  [[ "$PARTS" =~ ^[0-9]+$ ]] || PARTS=${1:-1}
+  return 0
+}
 part_of() {      # PART="part I of N · " while a job has more than one part
-  local parts=1
-  [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
-  PART=""; [ "${parts:-1}" -gt 1 ] && PART="part $1 of $parts · "
+  parts_total
+  PART=""; [ "$PARTS" -gt 1 ] && PART="part $1 of $PARTS · "
   return 0
 }
 
@@ -96,14 +101,13 @@ block_finish() { # the whole line as read, nothing lit (it stays on screen as a 
 
 # The view the player draws through: the full-screen reader or the inline block.
 view_part() {    # view_part IDX BASE: a part starts playing
-  local parts=1
   if [ "$ui" = tui ]; then
-    [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
+    parts_total
     TUI_TITLE=${book_title:-$name}
     chapters_load; chapter_of "$1"
     TUI_CHAPTER=""; [ "$CH" -ge 0 ] && TUI_CHAPTER=${CH_TITLE[CH]}
     TUI_HAS_CHAPTERS=$(( ${#CH_START[@]} > 1 )); [ -n "$NOVEL" ] && TUI_HAS_CHAPTERS=1
-    tui_part "$1" "$parts"
+    tui_part "$1" "$PARTS"
     [ "$w_state" = off ] && tui_light -1 -1
   elif [ "$show_words" = 1 ]; then
     block_load "$2.txt"; status_clear
@@ -138,23 +142,21 @@ book_title=""
 title_get() { [ -n "$book_title" ] || { [ -f "$tmpd/title" ] && read -r book_title < "$tmpd/title"; } || true; }   # book_title, from the engine's title file once it's there
 
 bookmark_save() {   # bookmark_save PART: so the same command, or kokoro --continue, picks up here
-  local parts=1
   echo "$1" > "$tmpd/at"                                  # (where the player is: a novel's engine waits for it)
   novel_load
   [ -n "$book_id" ] || return 0
   if [ -n "$NOVEL" ]; then novel_mark "$1"; return 0; fi
-  [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
-  [ "${parts:-1}" -gt 1 ] || return 0                     # nothing to come back to
+  parts_total
+  [ "$PARTS" -gt 1 ] || return 0                          # nothing to come back to
   [ -d "$BOOKS" ] || mkdir -p "$BOOKS"
   [ "$kind" = text ] && [ ! -f "$BOOKS/$book_id.txt" ] && cp "$text" "$BOOKS/$book_id.txt"
   printf 'part=%s\nparts=%s\ntitle=%s\nkind=%s\nsource=%s\nvoice=%s\nspeed=%s\nlang=%s\n' \
-    "$1" "$parts" "${book_title:-$name}" "$kind" "$source" "$voice" "$speed" "$lang" > "$BOOKS/$book_id.mark"
+    "$1" "$PARTS" "${book_title:-$name}" "$kind" "$source" "$voice" "$speed" "$lang" > "$BOOKS/$book_id.mark"
 }
 bookmark_done() {  # read to the end: the bookmark and the book's kept audio go
   if [ -n "$NOVEL" ]; then                                # a novel stays on the shelf, up to date
-    local last=1
-    [ -f "$tmpd/progress" ] && { read -r _ last < "$tmpd/progress" || last=1; }
-    novel_mark "$last" "done"
+    parts_total
+    novel_mark "$PARTS" "done"
     info "You're up to date with ${book_title:-$name}: ${N_LABEL:-that} is the latest chapter."
     printf '  %skokoro --continue carries on once the next one is out.%s\n' "$D" "$R" >&2
     return 0
@@ -180,13 +182,13 @@ novel_load() {   # once the engine says it's a web novel: NOVEL, and the novel's
   title_get
 }
 novel_at() {     # novel_at PART: the chapter PART is in: N_URL N_FIRST N_NUM N_LABEL, and N_PARTS (its length)
-  local k total=0
+  local k
   chapter_of "$1"; k=$CH; [ "$k" -ge 0 ] || k=0
   N_URL=${NV_URL[k]:-$url} N_FIRST=${CH_START[k]:-1} N_NUM=${NV_NUM[k]:-} N_LABEL=${CH_TITLE[k]:-}
   if [ $(( k + 1 )) -lt "${#CH_START[@]}" ]; then N_PARTS=$(( CH_START[k + 1] - N_FIRST ))
   else
-    [ -f "$tmpd/progress" ] && { read -r _ total < "$tmpd/progress" || total=0; }
-    N_PARTS=$(( ${total:-0} - N_FIRST + 1 ))
+    parts_total 0
+    N_PARTS=$(( PARTS - N_FIRST + 1 ))
   fi
   [ "$N_PARTS" -gt 0 ] || N_PARTS=1
   return 0
@@ -301,17 +303,29 @@ sleep_due() {    # sleep_due NEXT_PART: is it time to stop, before NEXT_PART sta
 # reading again at a part: a fresh job folder, so the old job sees its folder
 # go and stops, and the engine picks up from there.
 JUMP=""
-jump_to() {      # jump_to PART
-  local old=$tmpd target=$1 f
-  mpv_stop
+engine_stop() {  # stop this listen's engine, if it's running
   if [ -n "$gen_pid" ]; then kill "$gen_pid" 2>/dev/null || true; wait "$gen_pid" 2>/dev/null || true; gen_pid=""; fi
-  tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
-  for f in in.txt title chapters serial novel progress; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
-  rm -rf "$old"
-  start=$target; i=$target; was_parts=0          # (a part in this run's own numbering)
+  return 0
+}
+engine_start() { # write the job and run it in the background (gen_pid), its messages in engine.log
   write_job
-  bookmark_save "$target"                        # (stopped before it plays, it still picks up there)
   run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
+}
+job_fork() {     # a fresh job folder ($tmpd) with what the engine found in the last one (FORKED_FROM, still there)
+  local f
+  engine_stop
+  FORKED_FROM=$tmpd
+  tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
+  for f in in.txt title chapters serial novel progress plan; do [ -f "$FORKED_FROM/$f" ] && cp "$FORKED_FROM/$f" "$tmpd/"; done
+  return 0
+}
+jump_to() {      # jump_to PART
+  local target=$1
+  mpv_stop
+  job_fork; rm -rf "$FORKED_FROM"
+  start=$target; i=$target; was_parts=0          # (a part in this run's own numbering)
+  bookmark_save "$target"                        # (stopped before it plays, it still picks up there)
+  engine_start
   if [ "$ui" = tui ]; then tui_hist=(); TUI_PART=0; TUI_WRAP=(); TUI_OFFS=(); TUI_INFO="$(voice_label "$voice") · ${speed}×"; TUI_SPEED=$speed; tui_draw; fi
 }
 
@@ -320,27 +334,24 @@ jump_to() {      # jump_to PART
 # which Kokoro speaks more naturally than a stretched recording. The parts
 # already heard stay on screen.
 speed_now() {    # speed_now PART: (while PART plays) $speed from this moment on
-  local at=$1 idx=${MPV_IDX[$1]} old=$tmpd parts=0 n f e files=() ratio
+  local at=$1 idx=${MPV_IDX[$1]} n f e files=() ratio
   ratio="$(awk -v a="$speed" -v b="${MPV_SPD[idx]}" 'BEGIN { printf "%.4f", a / b }')"
   mpv_send "\"set_property\",\"file-local-options/speed\",$ratio"
   mpv_send '"playlist-clear"'                   # (the parts queued after it were made at the old speed)
   MPV_IDX=(["$at"]=0); MPV_PART=("$at"); MPV_SPD=("${MPV_SPD[idx]}"); MPV_N=1; MPV_POS=0; MPV_MAX=0
   MPV_RATE=$(( 10#${ratio%.*} * 1000 + 10#${ratio#*.} / 10 )) MPV_RATE_IDX=0   # (its clock runs at that rate now)
-  [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=0; }
-  if [ "${parts:-0}" -gt "$at" ] || { [ -n "$NOVEL" ] && [ ! -f "$tmpd/stream/end" ]; }; then   # (a novel: more may come)
-    if [ -n "$gen_pid" ]; then kill "$gen_pid" 2>/dev/null || true; wait "$gen_pid" 2>/dev/null || true; gen_pid=""; fi
-    tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
-    for f in in.txt title chapters serial novel progress; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
+  parts_total 0
+  if [ "$PARTS" -gt "$at" ] || { [ -n "$NOVEL" ] && [ ! -f "$tmpd/stream/end" ]; }; then   # (a novel: more may come)
+    job_fork
     mkdir "$tmpd/stream"
     for (( n = at > 40 ? at - 40 : 1; n <= at; n++ )); do   # this part and the ones on screen above it
-      printf -v f '%s/stream/%04d' "$old" "$n"
+      printf -v f '%s/stream/%04d' "$FORKED_FROM" "$n"
       for e in txt words wav; do [ -e "$f.$e" ] && files+=("$f.$e"); done
     done
     [ "${#files[@]}" = 0 ] || mv -f "${files[@]}" "$tmpd/stream/"
-    rm -rf "$old"                               # (the old job sees its folder go and stops)
+    rm -rf "$FORKED_FROM"
     start=$(( at + 1 )); was_parts=0
-    write_job
-    run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
+    engine_start
   fi
   bookmark_save "$at"
   if [ "$ui" = tui ]; then TUI_INFO="$(voice_label "$voice") · ${speed}×"; TUI_SPEED=$speed; tui_draw; fi

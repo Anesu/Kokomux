@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="0.18.2"
+KOKOMUX_VERSION="1.1.0"
 DISTRO=kokoro
 
 VERBOSE=0
@@ -181,6 +181,7 @@ theme_off() {    # no colours (not a terminal, or NO_COLOR)
   THEME_ON=0
 }
 
+# shellcheck disable=SC2120  # (the installer calls it without "screen")
 theme_apply() {  # theme_apply [screen]
   local want=${KOKORO_THEME:-auto} screen=${1:-} bg fg
   local -a p
@@ -487,1642 +488,922 @@ fi
 
 rm -rf "$WORK"; mkdir -p "$WORK"
 
-cat > "$WORK/engine.py" <<'__KOKOMUX_ENGINE__'
-#!/usr/bin/env python3
-"""kokomux engine. Runs inside the "kokoro" Debian container.
-
-The `kokoro` command in Termux writes a job folder under /tmp/kokoro.XXXXXX
-(Termux's $PREFIX/tmp, shared with the container) and runs it either one-off
-or through the background server:
-
-  engine.py job /tmp/kokoro.XXXXXX/job      run one job
-  engine.py serve [--port N] [--idle SECS]  keep the model loaded, serve jobs
-  engine.py voices                          list voice names
-  engine.py download                        fetch the model and voices (resumable)
-  engine.py bench                           time Kokoro each way it can run here
-  (job and serve also take --threads N --block N: how onnxruntime runs)
-
-A job folder holds `job` and `in.txt` (the text, unless url is set). `job` is
-key=value lines:
-
-  voice   a voice, or a blend: af_heart:70+bf_emma:30     speed  0.5 to 2.0
-  lang    en-us, en-gb, es, fr-fr, it, pt-br, hi, ja, cmn  name   what it's called
-  url     read this page instead of in.txt               out    out.<ext>: save a file
-  stream  1: one part at a time, for listening           words  1: word timings too
-  start   the part to begin at                          of     the bookmark's count of parts
-  cache   the book's id: keep parts in /tmp/kokomux-cache/<id>/, reuse them
-  meta    1: write the EPUB's author and cover (for an audiobook)
-
-What it writes into the folder: `title`, `progress` ("part total"), `chapters`
-("first-part<TAB>title" per line), `result` ("seconds-of-audio seconds-taken
-parts"), `out.<ext>` and `chapters_ms` when saving, and with stream=1
-`stream/NNNN.txt` (the part's text), `stream/NNNN.words` (its word timings),
-`stream/NNNN.wav` (its audio, with the pause after it; written last), `stream/first`
-(where it began) and `stream/end` once everything is made. With a cache, the
-stream files are relative links into it.
-
-While listening (stream=1, no out), the engine makes only AHEAD seconds of
-speech ahead of the part the player is on (the player writes its number into
-`at`), so a long book doesn't keep the phone's CPU busy for hours; parts
-already kept in the cache are linked at once.
-
-A web novel's chapter (url, with stream=1) is read on from chapter to chapter:
-the engine fetches the next one when the player reaches the last one made (the
-player writes the part it's on into `at`). It writes `novel` (title=, url=,
-prev=: the chapter before this listen's first) and `serial` ("first-part<TAB>
-number<TAB>address", in step with `chapters`). Parts are numbered across the
-whole listen; a job that picks up mid-listen says where its chapter starts
-(base=N) and has the earlier `chapters` and `serial` lines in its folder.
-skip=1 starts at the chapter after the one at url.
-"""
-import argparse
-import hmac
-import os
-import re
-import secrets
-import sys
-import threading
-import time
-import urllib.parse
-import urllib.request
-import zipfile
-from html.parser import HTMLParser
-
-APP = os.path.dirname(os.path.abspath(__file__))
-if APP not in sys.path:
-    sys.path.insert(0, APP)   # words.py lives beside this file
-MODELS = os.path.join(APP, "models")
-# Kokoro 82M v1.0 at full precision, exported with a "durations" output: it reports
-# when each sound is spoken, which is what lights up each word. Pinned to a commit.
-MODEL = os.path.join(MODELS, "kokoro-v1.0-timestamped.fp32.onnx")
-MODEL_SRC = ("https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX-timestamped/resolve/"
-             "dd4401a9add81ac692d20e240d22ec9dda82cc29/onnx/model.onnx")
-# A voice, or several blended: "af_heart", "af_heart+af_bella", "af_heart:70+af_bella:30"
-VOICE_SPEC = re.compile(r"^[a-z]{2}_[a-z]+(?::\d{1,3})?(?:\+[a-z]{2}_[a-z]+(?::\d{1,3})?){0,3}$")
-VOICES = os.path.join(MODELS, "voices-v1.0.bin")
-VOICES_SRC = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
-SERVER_DIR = "/tmp/kokoro-server"
-JOB_DIR_RE = re.compile(r"^/tmp/kokoro\.[A-Za-z0-9]+$")
-FORMATS = ("wav", "mp3", "ogg", "flac")
-# A phone browser's: some sites (behind Cloudflare, say) turn other clients away.
-USER_AGENT = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36"
-MAX_CHUNK = 360  # characters per part: whole sentences, under Kokoro's 510 sounds
-SERVING = False
-
-
-class JobError(Exception):
-    """A problem with the request itself (bad voice, empty text...)."""
-
-
-def log(msg):
-    print(msg, file=sys.stderr, flush=True)
-
-
-# ------------------------------------------------------------------ model
-
-_tts = None
-_tts_lock = threading.Lock()
-# One synthesis at a time, across every job the server is running: espeak isn't
-# thread-safe, and the phone has only so much CPU. Held per part, not per job, so
-# a book playing for hours doesn't block a quick command.
-SYNTH_LOCK = threading.Lock()
-
-
-# How onnxruntime runs the model: threads (0: its own choice) and the dynamic block
-# base (0: off), which spreads work across cores of different speeds. kokoro
-# --benchmark finds the fastest on the phone; serve and job take them as set.
-TUNING = {"threads": 0, "block": 0}
-
-
-def load_kokoro(threads=0, block=0):
-    """Kokoro on a CPU session tuned this way."""
-    import onnxruntime as rt
-    from kokoro_onnx import Kokoro
-    so = rt.SessionOptions()
-    so.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_ALL
-    so.inter_op_num_threads = 1
-    if threads:
-        so.intra_op_num_threads = threads
-    if block:
-        so.add_session_config_entry("session.dynamic_block_base", str(block))
-    return Kokoro.from_session(rt.InferenceSession(MODEL, so, providers=["CPUExecutionProvider"]), VOICES)
-
-
-def tts():
-    """Kokoro, loaded once."""
-    global _tts
-    with _tts_lock:
-        if _tts is None:
-            _tts = load_kokoro(TUNING["threads"], TUNING["block"])
-            # kokoro-onnx looks for an output called "duration"; this export calls it
-            # "durations". It's the second output either way, which is what it reads.
-            _tts.has_timings = len(_tts.sess.get_outputs()) > 1
-        return _tts
-
-
-def voice_style(engine, spec):
-    """What to hand Kokoro for a voice: its name, or for a blend ("af_heart:70+af_bella:30")
-    the voices' styles mixed in those proportions. Weights left out are shared equally."""
-    if not VOICE_SPEC.match(spec or ""):
-        raise JobError(f"'{spec}' isn't a voice. See: kokoro --list-voices")
-    known = set(engine.get_voices())
-    parts = []
-    for item in spec.split("+"):
-        name, _, weight = item.partition(":")
-        if name not in known:
-            raise JobError(f"Unknown voice '{name}'. See: kokoro --list-voices")
-        parts.append((name, int(weight) if weight else None))
-    if len(parts) == 1:
-        return parts[0][0]
-    given = sum(w for _, w in parts if w is not None)
-    unset = [n for n, w in parts if w is None]
-    share = max(0, 100 - given) / len(unset) if unset else 0
-    weights = [(n, w if w is not None else share) for n, w in parts]
-    total = sum(w for _, w in weights)
-    if total <= 0:
-        raise JobError(f"The voices in '{spec}' need some weight, e.g. af_heart:70+af_bella:30")
-    import numpy as np
-    style = sum((w / total) * np.asarray(engine.get_voice_style(n), dtype=np.float32) for n, w in weights)
-    return style.astype(np.float32)
-
-
-# --- pronunciation ------------------------------------------------------------
-# English is turned into sounds by misaki, the dictionary-based tool Kokoro was
-# trained with: it reads "I read it yesterday", "record the record" and "$42.50"
-# the way people say them. Words it doesn't know, and other languages, go to espeak.
-_g2p = {}
-_g2p_lock = threading.Lock()
-
-
-def g2p_for(lang):
-    """misaki's English G2P (loaded once per accent), or None for other languages."""
-    if lang not in ("en-us", "en-gb"):
-        return None
-    british = lang == "en-gb"
-    with _g2p_lock:
-        if british not in _g2p:
-            from misaki import en, espeak
-            # Words it doesn't know go to espeak, the copy kokoro-onnx already set up.
-            _g2p[british] = en.G2P(trf=False, british=british, fallback=espeak.EspeakFallback(british=british))
-        return _g2p[british]
-
-
-def dictionary_phonemes(g2p, text):
-    """A part's sounds from misaki, and each highlighted word's own sounds, taken from the
-    same reading of the sentence (so "read" is "red" in both), for lining up its timing."""
-    import words
-    ps, tokens = g2p(text)
-    spans, pos = [], 0
-    for t in tokens:                    # where misaki's tokens ("Do", "n't") sit in the text
-        at = text.find(t.text, pos)
-        if at < 0:
-            continue
-        spans.append((at, at + len(t.text), t.phonemes or ""))
-        pos = at + len(t.text)
-    per = ["".join(p for s, e, p in spans if s < b and e > a) for a, b in words._tokens(text)]
-    return (ps or "").replace("❓", "").strip(), per
-
-
-def phonemize_many(words, lang, engine=None):
-    """Each word's phonemes on its own, the way Kokoro phonemises (call under SYNTH_LOCK)."""
-    import phonemizer
-    from kokoro_onnx.tokenizer import Tokenizer
-    vocab = (engine or tts()).tokenizer.vocab
-    out = phonemizer.phonemize([Tokenizer.normalize_text(w) for w in words], lang,
-                               preserve_punctuation=True, with_stress=True)
-    return ["".join(ch for ch in p if ch in vocab) for p in out]
-
-
-# ------------------------------------------------------------------ text
-
-# Pauses between parts, in seconds. Inside a part Kokoro pauses 0.25 s at a
-# full stop; between parts the same, longer after a paragraph and a chapter,
-# in golden-ratio steps (0.25 × φ² and × φ³).
-PAUSE = {"sentence": 0.25, "paragraph": 0.65, "chapter": 1.06}
-
-# --- tidying text before it's spoken -----------------------------------------
-# Kokoro reads what it's given, so things meant for the eye are made speakable
-# first: ligatures, footnote marks, links, markdown, dashes, Roman numerals in
-# headings, ALL-CAPS headings, and (in English) abbreviations and units. The
-# reader shows the tidied text, so what's lit is what's said.
-
-_INVISIBLE = dict.fromkeys(map(ord, "­​‌‍⁠﻿"))
-_LIGATURES = {"ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl",
-              "ﬅ": "st", "ﬆ": "st", "Ĳ": "IJ", "ĳ": "ij"}
-_ROMAN = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
-_HEADING_WORDS = (r"Chapter|Part|Book|Volume|Vol\.|Act|Scene|Section|Canto|Letter|Appendix|"
-                  r"Chapitre|Partie|Livre|Capítulo|Capitulo|Parte|Libro|Capitolo|Kapitel|Teil|Buch")
-# "Chapter IV" or "CHAPTER IV", where the numeral ends the phrase ("the part I liked" stays)
-_HEADING_RE = re.compile(r"\b((?:" + "|".join(f"{w}|{w.upper()}" for w in _HEADING_WORDS.split("|")) +
-                         r"))[ \t]+([IVXLCDM]+)(?=[ \t]*(?:\n|$|[.:,;)–—-])|[ \t]+[A-Z\"“'‘])", re.M)
-_TITLES = {"Mr": "Mister", "Mrs": "Missus", "Ms": "Miz", "Dr": "Doctor", "Prof": "Professor",
-           "St": "Saint", "Gen": "General", "Capt": "Captain", "Lt": "Lieutenant",
-           "Sgt": "Sergeant", "Col": "Colonel", "Rev": "Reverend", "Hon": "Honourable"}
-_PHRASES = [(r"\be\.[ \t]?g\.", "for example"), (r"\bi\.[ \t]?e\.", "that is"),
-            (r"\betc\.", "etcetera."), (r"\bvs\.?(?=[ \t])", "versus"), (r"\bapprox\.", "approximately"),
-            (r"\bNo\.(?=[ \t]*\d)", "number"), (r"\bFig\.(?=[ \t]*\d)", "figure"),
-            (r"\bpp\.(?=[ \t]*\d)", "pages"), (r"\bp\.(?=[ \t]*\d)", "page")]
-# unit: (singular, plural), spoken after a number; (American, British) spellings
-_UNITS = [("km/h", ("kilometer per hour", "kilometers per hour"), ("kilometre per hour", "kilometres per hour")),
-          ("mph", ("mile per hour", "miles per hour"), None),
-          ("km", ("kilometer", "kilometers"), ("kilometre", "kilometres")),
-          ("cm", ("centimeter", "centimeters"), ("centimetre", "centimetres")),
-          ("mm", ("millimeter", "millimeters"), ("millimetre", "millimetres")),
-          ("kg", ("kilogram", "kilograms"), None),
-          ("mg", ("milligram", "milligrams"), None),
-          ("ml", ("milliliter", "milliliters"), ("millilitre", "millilitres")),
-          ("lbs?", ("pound", "pounds"), None),
-          ("ft", ("foot", "feet"), None),
-          ("GB", ("gigabyte", "gigabytes"), None), ("MB", ("megabyte", "megabytes"), None),
-          ("KB", ("kilobyte", "kilobytes"), None), ("kB", ("kilobyte", "kilobytes"), None)]
-
-
-_TITLE_RE = re.compile(r"\b(" + "|".join(_TITLES) + r")\.(?=[ \t]+[A-Z])")
-_UNIT_WORDS = {u: (us, gb) for u, us, gb in _UNITS}
-_UNIT_RE = re.compile(r"(?<![\w.])(\d+(?:[.,]\d+)?)[ \t]?(" + "|".join(u for u, _, _ in _UNITS) + r")\b")
-
-
-def roman(s):
-    """A Roman numeral's value, or None if it isn't one ("MMXXIV" -> 2024)."""
-    s = s.upper()
-    if not s or not re.fullmatch(r"M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})", s):
-        return None
-    total = 0
-    for i, ch in enumerate(s):
-        v = _ROMAN[ch]
-        total += -v if i + 1 < len(s) and _ROMAN[s[i + 1]] > v else v
-    return total
-
-
-def _caps_heading(line):
-    """ "CHAPTER ONE: THE ROAD" -> "Chapter One: The Road" (only whole lines in capitals)."""
-    letters = [c for c in line if c.isalpha()]
-    words = re.findall(r"[^\W\d_]{2,}", line)
-    if len(letters) < 4 or len(words) < 2 or not all(c.isupper() for c in letters):
-        return line
-    return re.sub(r"[^\W\d_]+", lambda m: m.group(0)[0] + m.group(0)[1:].lower(), line)
-
-
-def _english(text, lang):
-    text = _TITLE_RE.sub(lambda m: _TITLES[m.group(1)], text)   # titles before a name: "Dr. Smith"
-    for pat, rep in _PHRASES:
-        text = re.sub(pat, rep, text)
-    text = re.sub(r"(?<=\d)[ \t]?([ap])\.[ \t]?m\.", lambda m: f" {m.group(1).upper()}M" +   # 5 p.m. -> 5 PM
-                  ("." if re.match(r"[ \t]+[\"“]?[A-Z]|[ \t]*(?:\n|$)", m.string[m.end():]) else ""),
-                  text, flags=re.I)
-    text = re.sub(r"(?<=\d)[ \t]?°[ \t]?C\b", " degrees Celsius", text)
-    text = re.sub(r"(?<=\d)[ \t]?°[ \t]?F\b", " degrees Fahrenheit", text)
-    text = re.sub(r"(?<=\d)[ \t]?°", " degrees", text)
-    british = lang == "en-gb"
-
-    def unit(m):
-        us, gb = _UNIT_WORDS[m.group(2) if m.group(2) not in ("lb", "lbs") else "lbs?"]
-        one, many = gb if british and gb else us
-        return f"{m.group(1)} {one if m.group(1) == '1' else many}"
-    text = _UNIT_RE.sub(unit, text)
-    text = re.sub(r"(?<=[ \t])&(?=[ \t])", "and", text)
-    return text
-
-
-def normalise(text, lang="en-us"):
-    """Make text speakable (see above). Line breaks, which mark paragraphs, are kept.
-    Each rule runs once over the whole text, so a long book stays quick."""
-    text = text.translate(_INVISIBLE)
-    for k, v in _LIGATURES.items():
-        text = text.replace(k, v)
-    text = re.sub(r"[¹²³⁰-⁹]+", "", text)                 # footnote marks¹²
-    text = re.sub(r"\[(?:\d+(?:\s*[,–-]\s*\d+)*|[a-z]|note \d+|citation needed|clarification needed)\]", "", text)
-    text = re.sub(r"\b(?:https?://|www\.)(?:www\.)?([\w-]+(?:\.[\w-]+)+)[^\s)\]]*?(?=[.,;:!?)\]]?(?:\s|$))",
-                  r"\1", text)                                                         # links: their site
-    text = re.sub(r"(?m)^[ \t]*(?:#{1,6}|>+|[-*+•·▪◦‣])[ \t]+", "", text)            # markdown marks, bullets
-    text = re.sub(r"(?<![\w*])(\*\*\*|___|\*\*|__|\*|_)(?=\S)([^\n]+?)(?<=\S)\1(?![\w*])", r"\2", text)
-    text = re.sub(r"(?<=\d)[ \t]?[–—][ \t]?(?=\d)", " to ", text)                     # 1990–1995
-    text = re.sub(r"[ \t]*(?:—|–|--)[ \t]*", ", ", text)                             # dashes: a pause
-    text = re.sub(r"([!?])\1+", r"\1", text)
-    text = re.sub(r"(?m)^[ \t]+|[ \t]+$", "", text)
-    text = re.sub(r"(?m)^([IVXLCDM]+)([.:]?)$",                                       # a heading: "IV."
-                  lambda m: f"{roman(m.group(1))}{m.group(2) or '.'}" if roman(m.group(1)) else m.group(0), text)
-    text = _HEADING_RE.sub(lambda m: f"{m.group(1)} {roman(m.group(2))}" if roman(m.group(2)) else m.group(0),
-                           text)                                                       # "Chapter IV"
-    text = re.sub(r"(?m)^[^\na-z]*[A-Z][^\na-z]*$", lambda m: _caps_heading(m.group(0)), text)
-    if lang.startswith("en"):
-        text = _english(text, lang)
-    return re.sub(r"[ \t]{2,}", " ", text)
-
-
-# --- splitting into parts ----------------------------------------------------
-_ABBREV = re.compile(r"(?:\b(?:[A-Z]|Mr|Mrs|Ms|Dr|St|Prof|Sr|Sra|Jr|Mt|Gen|Capt|Lt|Sgt|Col|Rev|Hon|"
-                     r"Inc|Ltd|Co|vs|etc|approx|No|Fig|M|Mme|Mlle|Hr|Fr|Dra|Sig|Sto)\.)$")
-_SENTENCE_END = re.compile(r"(?<=[.!?…])[\"”’»)\]]*\s+")
-
-
-def sentences(paragraph):
-    """A paragraph's sentences, not broken after an initial or abbreviation ("J. R. R.", "Mme.")
-    or before a word in lower case ("approx. five")."""
-    out = []
-    for piece in (p for p in re.split(r"((?<=[.!?…])[\"”’»)\]]*)\s+", paragraph)):
-        if piece is None:
-            continue
-        if out and not out[-1].endswith(" ") and re.fullmatch(r"[\"”’»)\]]*", piece):
-            out[-1] += piece + " "                  # closing quotes stay with their sentence
-            continue
-        if out and (_ABBREV.search(out[-1].rstrip()) or (piece[:1].islower())):
-            out[-1] = out[-1].rstrip() + " " + piece
-        else:
-            out.append(piece)
-    return [s.strip() for s in out if re.search(r"\w", s)]
-
-
-def _clauses(sentence, limit):
-    """A sentence longer than the limit, cut at commas, semicolons and colons."""
-    parts, cur = [], ""
-    for bit in re.split(r"(?<=[,;:])\s+", sentence):
-        if cur and len(cur) + len(bit) + 1 > limit:
-            parts.append(cur)
-            cur = bit
-        else:
-            cur = f"{cur} {bit}" if cur else bit
-    return parts + [cur] if cur else parts
-
-
-def split_text(text):
-    """Split into parts: (text, pause after it). The first part is short, so playback
-    starts quickly; then whole sentences up to MAX_CHUNK characters. A part never
-    runs across a paragraph (a line break), and each paragraph ends with a longer
-    pause. The last part's pause is a paragraph's; the caller makes it a chapter's."""
-    chunks = []
-    for para in text.split("\n"):
-        cur = ""
-        for sent in sentences(para.strip()):
-            for bit in (_clauses(sent, MAX_CHUNK) if len(sent) > 2 * MAX_CHUNK else [sent]):
-                limit = 40 if not chunks else MAX_CHUNK
-                if cur and len(cur) + 1 + len(bit) > limit:
-                    chunks.append((cur, PAUSE["sentence"]))
-                    cur = bit
-                else:
-                    cur = f"{cur} {bit}" if cur else bit
-        if cur:
-            chunks.append((cur, PAUSE["paragraph"]))
-    return chunks
-
-
-class _ChapterText(HTMLParser):
-    """An EPUB chapter's readable text: paragraphs, headings, list items. Skips
-    navigation, tables and citations, prefers <article>/<main> content when there's
-    enough of it, and stops at "References" etc. (Web pages go through trafilatura.)"""
-    SKIP_TAGS = {"script", "style", "noscript", "nav", "header", "footer", "aside",
-                 "form", "svg", "button", "select", "template", "iframe", "table",
-                 "figure", "sup", "math"}
-    # Whole words from class/id/role names that mark non-article parts.
-    SKIP_WORDS = {
-        "nav", "navbar", "navbox", "navigation", "menu", "footer", "sidebar",
-        "comment", "comments", "share", "sharing", "social", "related",
-        "reference", "references", "reflist", "infobox", "toc", "hatnote",
-        "metadata", "editsection", "ad", "ads", "advert", "advertisement",
-        "cookie", "cookies", "banner", "breadcrumb", "breadcrumbs", "subscribe",
-        "newsletter", "caption", "thumb", "promo", "popup", "modal", "noprint"}
-    NEVER_SKIP = {"html", "body", "main", "article"}
-    VOID = {"br", "img", "input", "meta", "link", "hr", "source", "wbr", "area", "col"}
-    BLOCK = {"p", "h1", "h2", "h3", "h4", "li", "blockquote", "pre", "dd"}
-    HEADINGS = {"h1", "h2", "h3", "h4"}
-    END_SECTIONS = {"references", "see also", "external links", "further reading",
-                    "notes", "bibliography", "sources", "citations", "footnotes",
-                    "related articles", "comments"}
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.skip_tag, self.skip_depth = None, 0
-        self.article = 0
-        self.block = None
-        self.buf = []
-        self.blocks = []  # (in_article, text)
-        self.heading = ""  # the first heading: the chapter's title
-        self.done = False
-
-    def handle_starttag(self, tag, attrs):
-        if self.skip_tag:
-            if tag == self.skip_tag:
-                self.skip_depth += 1
-            return
-        if tag in self.VOID:
-            if tag == "br":
-                self.buf.append(" ")
-            return
-        a = dict(attrs)
-        hint = f"{a.get('class') or ''} {a.get('id') or ''} {a.get('role') or ''}"
-        words = set(re.split(r"[^a-z]+", hint.lower()))
-        if tag in self.SKIP_TAGS or (tag not in self.NEVER_SKIP and words & self.SKIP_WORDS):
-            self.skip_tag, self.skip_depth = tag, 1
-        elif tag in ("article", "main"):
-            self.article += 1
-        elif tag in self.BLOCK:
-            self._flush()
-            self.block = tag
-
-    def handle_endtag(self, tag):
-        if self.skip_tag:
-            if tag == self.skip_tag:
-                self.skip_depth -= 1
-                if self.skip_depth == 0:
-                    self.skip_tag = None
-            return
-        if tag in ("article", "main") and self.article:
-            self.article -= 1
-        elif tag in self.BLOCK:
-            self._flush()
-
-    def handle_data(self, data):
-        if not self.skip_tag and self.block and not self.done:
-            self.buf.append(data)
-
-    def _flush(self):
-        t = re.sub(r"\[\s*(?:\d+|[a-z]|edit|citation needed|note \d+)\s*\]", "", "".join(self.buf), flags=re.I)
-        t = re.sub(r"\s+", " ", t.replace("¶", "")).strip()
-        if t and not self.done:
-            if self.block in self.HEADINGS and t.lower().strip(" :") in self.END_SECTIONS:
-                self.done = True
-            else:
-                self.blocks.append((self.article > 0, t))
-                if self.block in self.HEADINGS and not self.heading:
-                    self.heading = t
-        self.buf = []
-        self.block = None
-
-    def text(self):
-        self._flush()
-        art = [t for a, t in self.blocks if a]
-        use = art if sum(map(len, art)) > 500 else [t for _, t in self.blocks]
-        # Headings and list items often lack a full stop; end each block so it
-        # gets its own pause.
-        use = [t if t[-1] in ".!?…:;" else t + "." for t in use]
-        return "\n".join(use)
-
-
-class NotFound(JobError):
-    """The address answered 404: no such page (a chapter that isn't out yet)."""
-
-
-def fetch(url):
-    """Fetch a web page with curl, as a phone browser would: (content type, text)."""
-    import subprocess
-    import tempfile
-    if not re.match(r"^https?://", url):
-        raise JobError(f"Not a web address: {url}")
-    with tempfile.NamedTemporaryFile(prefix="kokomux-page.") as tmp:
-        r = subprocess.run(["curl", "-sS", "-L", "--compressed", "--max-time", "30", "--max-filesize", "5000000",
-                            "-A", USER_AGENT, "-o", tmp.name, "-w", "%{http_code}\t%{content_type}", url],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            raise JobError(f"Couldn't fetch {url}: {r.stderr.strip() or f'curl error {r.returncode}'}")
-        code, _, ctype = r.stdout.partition("\t")
-        raw = tmp.read()
-    m = re.search(r"charset=([\w-]+)", ctype)
-    try:
-        body = raw.decode(m.group(1) if m else "utf-8", errors="replace")
-    except LookupError:                       # a charset Python doesn't know: read it as UTF-8
-        body = raw.decode("utf-8", errors="replace")
-    if code == "404":
-        raise NotFound(f"There's no page at {url}")
-    if re.search(r"<title>\s*Just a moment", body[:3000]):
-        raise JobError("That site wants a browser check (Cloudflare) before it shows the page")
-    if not code.startswith("2"):
-        raise JobError(f"Couldn't fetch {url}: the site answered {code}")
-    return ctype.split(";")[0].strip().lower(), body
-
-
-def read_page(url):
-    """A web page: (title, text, chapter), where chapter has a novel chapter's details, or is None."""
-    ctype, body = fetch(url)
-    if ctype == "text/plain":
-        return url, body, None
-    if "html" not in ctype and "xml" not in ctype:
-        raise JobError(f"That link is {ctype}, not a web page")
-    chapter = novel_chapter(body, url)
-    if chapter:
-        return chapter["novel"], chapter["text"], chapter
-    title, text = page_text(body, url)
-    return title, text, None
-
-
-# Where an article ends: from a heading like these on it's links, not reading.
-_PAGE_END = set(_ChapterText.END_SECTIONS) | {
-    "more recent articles", "recent articles", "recent posts", "related", "related posts", "related stories",
-    "read more", "more from", "more stories", "you might also like", "you may also like", "popular",
-    "most popular", "most read", "share this", "share", "tags", "about the author", "newsletter", "sign up"}
-
-
-def page_text(html, url):
-    """A web page's (title, text to read), found by trafilatura: the article, not the menus,
-    sidebars, ads or comments, and stopping where the links start ("See also", "Recent posts")."""
-    import trafilatura
-    text = "\n".join(article_lines(html, url))
-    if len(text.split()) < 5:                # a menu or a "Home" link is not an article
-        raise JobError("Couldn't find any readable text on that page")
-    meta = trafilatura.extract_metadata(html, default_url=url)
-    title = (meta.title if meta is not None and meta.title else "") or url
-    short = title.split(" - ")[0].split(" | ")[0].strip()
-    if short and short not in text.split("\n", 1)[0]:
-        text = f"{short}.\n{text}"           # say what it is first
-    return title, text
-
-
-def article_lines(html, url):
-    """The article on a page, as lines (paragraphs), by trafilatura."""
-    import trafilatura
-    # Two line breaks in a row are a paragraph break (older pages lay text out that way).
-    html = re.sub(r"(?i)(?:<br\s*/?>\s*){2,}", "</p><p>", html)
-    md = trafilatura.extract(html, url=url, output_format="markdown", include_comments=False,
-                             include_images=False, include_links=False, include_tables=False) or ""
-    lines = []
-    for line in md.splitlines():
-        line = re.sub(r"<[^>]+>", "", line.replace("\\", "")).strip()       # markdown escapes, stray tags
-        head = re.match(r"^#{1,6}\s+(.*)$", line)
-        if head:
-            name = re.sub(r"[^\w\s]", "", head.group(1)).strip().lower()
-            if name in _PAGE_END:
-                break
-            line = head.group(1)
-            if not re.search(r"[.!?:…]$", line):
-                line += "."                   # a heading gets its own pause
-        line = re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", line)         # list items
-        if line and line != "[edit]":
-            lines.append(line)
-    return lines
-
-
-# ------------------------------------------------------------------ novels
-# A chapter page of a web novel (freewebnovel.com and the like): the novel's
-# title, the chapter's number and title, its text, and the links to the
-# chapters either side. Listening goes on from chapter to chapter.
-
-CHAPTER_RE = re.compile(r"(?i)\b(?:chapter|chap\.?|ch\.)\s*(\d+)")
-CHAPTER_URL_RE = re.compile(r"(?i)chapter[-_]?(\d+)")
-# Where novel sites put the chapter's text.
-_TEXT_IDS = {"article", "chapter-content", "chr-content", "chapter-c", "chaptercontent", "content", "booktxt"}
-_TEXT_CLASSES = {"txt", "chapter-content", "chr-c", "reading-content", "chapter-body", "text-left", "entry-content",
-                 "chapter-inner", "read-content"}
-_NAV_LINE = re.compile(r"(?i)^(?:<<|>>|«|»)?\s*(?:prev(?:ious)?|next)(?: chapter)?\s*(?:<<|>>|«|»)?$|"
-                       r"^(?:index|table of contents|chapter list|report( chapter)?|bookmark|comments?)$")
-
-
-class _ChapterPage(HTMLParser):
-    """Reads what a chapter page says about itself: title, headings, links and the chapter's text."""
-    SKIP = {"script", "style", "noscript", "button", "select"}
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.title, self.site, self.heads, self.links, self.rel = "", "", [], [], {}
-        self.paras, self._text_depth, self._depth, self._skip = [], 0, 0, 0
-        self._tag, self._buf, self._a, self._para = None, [], None, []
-
-    def handle_starttag(self, tag, attrs):
-        a = {k: (v or "") for k, v in attrs}
-        if tag in self.SKIP:
-            self._skip += 1
-        if tag in ("title", "h1", "h2", "h3"):
-            self._tag, self._buf = tag, []
-        elif tag == "meta" and a.get("property") == "og:site_name":
-            self.site = a.get("content", "")
-        elif tag == "link" and a.get("rel", "").lower() in ("next", "prev", "previous"):
-            self.rel.setdefault(a["rel"].lower()[:4], a.get("href", ""))
-        elif tag == "a":
-            self._a = {"href": a.get("href", ""), "rel": a.get("rel", "").lower(), "text": [],
-                       "meta": " ".join((a.get("id", ""), a.get("class", ""), a.get("title", ""))).lower()}
-        if tag in ("div", "article", "section", "main", "td"):
-            self._depth += 1
-            ident = a.get("id", "").lower()
-            classes = set(a.get("class", "").lower().split())
-            if not self._text_depth and (ident in _TEXT_IDS or classes & _TEXT_CLASSES):
-                self._text_depth = self._depth
-        if self._text_depth and tag in ("p", "br", "div"):
-            self._end_para()
-
-    def handle_endtag(self, tag):
-        if tag in self.SKIP and self._skip:
-            self._skip -= 1
-        if tag == self._tag:
-            text = " ".join("".join(self._buf).split())
-            if tag == "title":
-                self.title = self.title or text
-            elif text:
-                self.heads.append(text)
-            self._tag = None
-        elif tag == "a" and self._a is not None:
-            self._a["text"] = " ".join("".join(self._a["text"]).split()).lower()
-            self.links.append(self._a)
-            self._a = None
-        if self._text_depth and tag in ("p", "div", "article", "section", "main", "td"):
-            self._end_para()
-        if tag in ("div", "article", "section", "main", "td"):
-            if self._text_depth == self._depth:
-                self._text_depth = 0
-            self._depth -= 1
-
-    def handle_data(self, data):
-        if self._tag:
-            self._buf.append(data)
-        if self._a is not None:
-            self._a["text"].append(data)
-        if self._text_depth and not self._skip:
-            self._para.append(data)
-
-    def _end_para(self):
-        text = " ".join("".join(self._para).split())
-        if text:
-            self.paras.append(text)
-        self._para = []
-
-
-def novel_url_of(url):
-    """The novel a chapter belongs to: its address up to the "chapter…" part of the path
-    (or without the last part). kokomux keeps one bookmark per novel, by this."""
-    u = urllib.parse.urlsplit(url)
-    parts = [p for p in u.path.split("/") if p]
-    for k, p in enumerate(parts):
-        if p.lower().startswith(("chapter", "chap-", "ch-")):
-            parts = parts[:k]
-            break
-    else:
-        parts = parts[:-1]
-    return urllib.parse.urlunsplit((u.scheme, u.netloc, "/" + "/".join(parts), "", ""))
-
-
-def chapter_address(url, number):
-    """The address of chapter NUMBER of the novel URL is a chapter of, where its address
-    counts chapters (…/chapter-5); None where it doesn't."""
-    u = urllib.parse.urlsplit(url)
-    head, _, last = u.path.rstrip("/").rpartition("/")
-    if not CHAPTER_URL_RE.search(last):
-        return None
-    last = CHAPTER_URL_RE.sub(lambda m: m.group(0)[:-len(m.group(1))] + str(number), last, count=1)
-    return urllib.parse.urlunsplit((u.scheme, u.netloc, f"{head}/{last}", "", ""))
-
-
-def _nav_link(page, url, novel_url, word):
-    """The link to the next (or previous) chapter: rel=next, or a link that says so."""
-    host = urllib.parse.urlsplit(url).netloc
-    best, score = None, 0
-    cands = [{"href": page.rel.get(word, ""), "rel": word, "text": "", "meta": ""}] + page.links
-    for a in cands:
-        href = urllib.parse.urljoin(url, a["href"]).split("#")[0]
-        if not a["href"] or not href.startswith("http") or urllib.parse.urlsplit(href).netloc != host:
-            continue
-        if href.rstrip("/") in (url.split("#")[0].rstrip("/"), novel_url.rstrip("/")):
-            continue
-        said = f"{a['text']} {a['meta']}"
-        if word == "prev":
-            says = re.search(r"\bprev|previous|prev_|prevchap", said)
-        else:
-            says = re.search(r"\bnext|next_|nextchap", said)
-        n = (3 if word in a["rel"] else 0) + (2 if says else 0)
-        if n == 0:
-            continue
-        n += 1 if CHAPTER_URL_RE.search(href) or "chapter" in href.lower() else 0
-        if n > score:
-            best, score = href, n
-    return best
-
-
-def novel_chapter(html, url):
-    """A novel's chapter page, read: a dict with novel (its title), novel_url, label
-    ("Chapter 5: Weapon Haggling"), number, text (to speak: the label, then the chapter),
-    next and prev (addresses or None), and guessed (next was worked out from the address,
-    not linked). None if the page isn't a chapter of something."""
-    page = _ChapterPage()
-    try:
-        page.feed(html)
-        page.close()
-    except Exception:  # noqa: BLE001 - a page this parser can't follow isn't a chapter page to us
-        return None
-    last = urllib.parse.urlsplit(url).path.rstrip("/").rpartition("/")[2]
-    m_url = CHAPTER_URL_RE.search(last)
-    # The page title: "Novel - Chapter 5: Title | Site", or "Chapter 5 - Novel - Site".
-    parts = [p.strip() for p in re.split(r"\s+\|\s+", page.title) if p.strip()]
-    with_ch = [p for p in parts if CHAPTER_RE.search(p)]
-    novel, label = "", ""
-    if with_ch:
-        t = with_ch[0]
-        m = CHAPTER_RE.search(t)
-        novel, label = t[:m.start()].strip(" -–—:|"), t[m.start():].strip()
-        if not novel:
-            bits = re.split(r"\s+[-–—]\s+", label)
-            label, novel = bits[0], (bits[1] if len(bits) > 1 else "")
-    for h in page.heads:                       # a heading names the chapter better than the title
-        if CHAPTER_RE.search(h) and len(h) < 150 and (not label or len(h) >= len(label)):
-            label = h if not novel or not h.startswith(novel) else h[len(novel):].strip(" -–—:|")
-            break
-    number = int(CHAPTER_RE.search(label).group(1)) if CHAPTER_RE.search(label) else (
-        int(m_url.group(1)) if m_url else None)
-    if number is None:
-        return None
-    novel_url = novel_url_of(url)
-    if not novel:
-        novel = next((h for h in page.heads if not CHAPTER_RE.search(h)), "") or \
-            urllib.parse.urlsplit(novel_url).path.rstrip("/").rpartition("/")[2].replace("-", " ").title()
-    label = label or f"Chapter {number}"
-    nxt, prev = _nav_link(page, url, novel_url, "next"), _nav_link(page, url, novel_url, "prev")
-    guessed = False
-    if not nxt:
-        nxt, guessed = chapter_address(url, number + 1), True
-    if not (nxt or prev or m_url):
-        return None
-
-    # The text: from where these sites keep it, else whatever trafilatura finds.
-    lines = page.paras if len(" ".join(page.paras).split()) >= 50 else article_lines(html, url)
-    site = re.sub(r"[^a-z0-9]", "", (page.site or urllib.parse.urlsplit(url).netloc.split(".")[-2]).lower())
-    names = {re.sub(r"\W", "", x.lower()) for x in (label, novel, f"chapter {number}")}
-    keep = []
-    for k, line in enumerate(lines):
-        bare = re.sub(r"\W", "", line.lower())
-        if k < 4 and not keep and (bare in names or (CHAPTER_RE.match(line.strip()) and len(line) < 100)):
-            continue                                   # the heading again (it's said first anyway)
-        if site and len(site) > 4 and site in bare:
-            continue                                   # "Read the latest chapters at freewebnovel.com"
-        if _NAV_LINE.match(line.strip()):
-            continue
-        keep.append(line)
-    if len(" ".join(keep).split()) < 20:
-        return None
-    said = label if re.search(r"[.!?:…]$", label) else label + "."
-    return {"novel": novel, "novel_url": novel_url, "url": url, "label": label, "number": number,
-            "text": said + "\n" + "\n".join(keep), "next": nxt, "prev": prev, "guessed": guessed}
-
-
-def novel_next(chapter):
-    """The chapter after this one, read, or None if there isn't one (yet)."""
-    if not chapter.get("next"):
-        return None
-    try:
-        _, html = fetch(chapter["next"])
-    except NotFound:
-        return None
-    nxt = novel_chapter(html, chapter["next"])
-    if not nxt or nxt["novel_url"] != chapter["novel_url"] or nxt["number"] <= chapter["number"]:
-        return None                                    # the "next" link left the novel, or went back
-    return nxt
-
-
-# ------------------------------------------------------------------ books
-
-def read_epub(path, name):
-    """An EPUB's (title, [(chapter title, text)]): its chapters in reading order."""
-    import posixpath
-    import xml.etree.ElementTree as ET
-
-    def local(tag):
-        return tag.rsplit("}", 1)[-1]
-
-    parts = []
-    try:
-        with zipfile.ZipFile(path) as z:
-            names = set(z.namelist())
-            if "META-INF/encryption.xml" in names and b"EncryptedData" in z.read("META-INF/encryption.xml"):
-                raise JobError("That EPUB is DRM-protected, so its text can't be read")
-            container = ET.fromstring(z.read("META-INF/container.xml"))
-            opf_path = next(el.get("full-path") for el in container.iter() if local(el.tag) == "rootfile")
-            opf = ET.fromstring(z.read(opf_path))
-            title = next((el.text for el in opf.iter() if local(el.tag) == "title" and el.text), "")
-            manifest = {el.get("id"): el.get("href") for el in opf.iter() if local(el.tag) == "item"}
-            spine = [el.get("idref") for el in opf.iter()
-                     if local(el.tag) == "itemref" and el.get("linear", "yes") != "no"]
-            base = posixpath.dirname(opf_path)
-            for idref in spine:
-                href = manifest.get(idref)
-                if not href:
-                    continue
-                inner = posixpath.normpath(posixpath.join(base, urllib.parse.unquote(href.split("#")[0])))
-                if inner not in names:
-                    continue
-                ex = _ChapterText()
-                ex.feed(z.read(inner).decode("utf-8", "replace"))
-                chapter = ex.text()
-                if chapter.strip():
-                    parts.append((ex.heading or f"Part {len(parts) + 1}", chapter))
-    except JobError:
-        raise
-    except (KeyError, StopIteration, zipfile.BadZipFile, ET.ParseError) as e:
-        raise JobError(f"Couldn't read that EPUB ({type(e).__name__})") from None
-    if not parts:
-        raise JobError("That EPUB has no readable text")
-    return (title or "").strip() or name, parts
-
-
-def epub_meta(path):
-    """An EPUB's author and cover image, as (author, cover bytes, extension); blanks if it has none."""
-    import posixpath
-    import xml.etree.ElementTree as ET
-
-    def local(tag):
-        return tag.rsplit("}", 1)[-1]
-    try:
-        with zipfile.ZipFile(path) as z:
-            container = ET.fromstring(z.read("META-INF/container.xml"))
-            opf_path = next(el.get("full-path") for el in container.iter() if local(el.tag) == "rootfile")
-            opf = ET.fromstring(z.read(opf_path))
-            author = next((el.text.strip() for el in opf.iter() if local(el.tag) == "creator" and el.text), "")
-            items = [el for el in opf.iter() if local(el.tag) == "item"]
-            cover_id = next((el.get("content") for el in opf.iter()
-                             if local(el.tag) == "meta" and el.get("name") == "cover"), None)
-            item = next((el for el in items if "cover-image" in (el.get("properties") or "").split()), None) or \
-                next((el for el in items if el.get("id") == cover_id), None)
-            if item is None or not (item.get("media-type") or "").startswith("image/"):
-                return author, b"", ""
-            inner = posixpath.normpath(posixpath.join(posixpath.dirname(opf_path),
-                                                      urllib.parse.unquote(item.get("href", ""))))
-            ext = {"image/jpeg": "jpg", "image/png": "png"}.get(item.get("media-type"), "")
-            return author, (z.read(inner) if ext else b""), ext
-    except (KeyError, StopIteration, zipfile.BadZipFile, ET.ParseError):
-        return "", b"", ""
-
-
-def read_pdf(path, name):
-    """A PDF's (title, text), with its lines joined back into sentences."""
-    from pypdf import PdfReader
-    try:
-        reader = PdfReader(path)
-        if reader.is_encrypted and not reader.decrypt(""):
-            raise JobError("That PDF is password-protected")
-        pages = [page.extract_text() or "" for page in reader.pages]
-        title = (reader.metadata.title if reader.metadata else None) or name
-    except JobError:
-        raise
-    except Exception as e:  # noqa: BLE001 - pypdf raises many kinds of error for broken files
-        raise JobError(f"Couldn't read that PDF ({type(e).__name__})") from None
-    text = re.sub(r"(\w)-\n(\w)", r"\1\2", "\n".join(pages))        # words split across lines
-    lines = [ln.strip() for ln in text.splitlines()]
-    lines = [ln for ln in lines if ln and not re.fullmatch(r"\d{1,4}", ln)]   # bare page numbers
-    sentences, buf = [], ""
-    for ln in lines:   # a line that doesn't end a sentence carries on into the next
-        buf = f"{buf} {ln}" if buf else ln
-        if re.search(r"[.!?:;\"”’)]$", ln):
-            sentences.append(buf)
-            buf = ""
-    if buf:
-        sentences.append(buf)
-    if not sentences:
-        raise JobError("That PDF has no text to read (is it a scan?)")
-    title = str(title).strip() or name
-    return title, [(title, "\n".join(sentences))]
-
-
-def read_source(jobdir, job):
-    """What a job reads, as (title, [(chapter title, text)]): a web page, or a file
-    that is an EPUB, a PDF or plain text. Only an EPUB has more than one chapter."""
-    name = job.get("name", "")
-    if job.get("url"):
-        log(f"Fetching {job['url']}")
-        title, text, chapter = read_page(job["url"])
-        return title, [(chapter["label"] if chapter else title, text)]
-    file = job.get("file", "in.txt")
-    if "/" in file:
-        raise JobError(f"Bad input file name: {file}")
-    path = os.path.join(jobdir, file)
-    with open(path, "rb") as fh:
-        head = fh.read(64)
-    if head.startswith(b"%PDF"):
-        return read_pdf(path, name)
-    if head.startswith(b"PK") and zipfile.is_zipfile(path):
-        return read_epub(path, name)   # already chapters
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        text = fh.read()
-    bad = text.count("\ufffd") + text.count("\x00")
-    if text and bad > max(3, len(text) // 100):
-        raise JobError("That doesn't look like text, an EPUB or a PDF")
-    return name, [(name, text)]
-
-
-# ------------------------------------------------------------------ jobs
-
-def read_job(path):
-    real = os.path.realpath(path)
-    jobdir = os.path.dirname(real)
-    if not JOB_DIR_RE.match(jobdir) or os.path.basename(real) != "job":
-        raise JobError(f"Refusing job outside /tmp/kokoro.*: {path}")
-    job = {}
-    with open(real, encoding="utf-8") as fh:
-        for line in fh:
-            key, sep, val = line.rstrip("\n").partition("=")
-            if sep:
-                job[key] = val
-    return jobdir, job
-
-
-CACHE_ROOT = "/tmp/kokomux-cache"   # Termux's $PREFIX/tmp/kokomux-cache: made parts, kept per book
-
-
-def cache_dir(book, voice, speed, lang):
-    """Where a book's parts are kept for these settings (None: not kept)."""
-    if not re.fullmatch(r"[0-9a-f]{8,64}", book or ""):
-        return None
-    import hashlib
-    key = hashlib.sha1(f"{voice}|{speed:.2f}|{lang}|{os.path.basename(MODEL)}".encode()).hexdigest()[:12]
-    d = os.path.join(CACHE_ROOT, book, key)
-    os.makedirs(d, exist_ok=True)
-    return d
-
-
-def cached_part(cache, name, text):
-    """A kept part's audio, if it was made from exactly this text."""
-    wav, txt = os.path.join(cache, f"{name}.wav"), os.path.join(cache, f"{name}.txt")
-    try:
-        with open(txt, encoding="utf-8") as fh:
-            same = fh.read() == text
-    except OSError:
-        return None
-    return wav if same and os.path.exists(wav) else None
-
-
-def _link(src, dest):
-    """A relative link, so it resolves both in the container (/tmp) and in Termux ($PREFIX/tmp)."""
-    tmp = dest + ".lnk"
-    if os.path.lexists(tmp):
-        os.remove(tmp)
-    os.symlink(os.path.relpath(src, os.path.dirname(dest)), tmp)
-    os.replace(tmp, dest)
-
-
-def synthesize(engine, g2p, chunk, voice, speed, lang, timed, i):
-    """One part's audio, and its word timings when timed (else None)."""
-    import words
-    with SYNTH_LOCK:
-        ps, per = None, None
-        if g2p is not None:
-            try:
-                ps, per = dictionary_phonemes(g2p, chunk)
-            except Exception as e:      # a sentence misaki can't parse: espeak reads it
-                log(f"misaki: part {i}: {e.__class__.__name__}: {e}")
-                ps = None
-        if timed:
-            if ps:
-                samples, rate, timings = engine.create_timed(ps, voice=voice, speed=speed, lang=lang, is_phonemes=True)
-                return samples, rate, words.words_from_timings(chunk, timings, lambda ws: per)
-            samples, rate, timings = engine.create_timed(chunk, voice=voice, speed=speed, lang=lang)
-            return samples, rate, words.words_from_timings(chunk, timings, lambda ws: phonemize_many(ws, lang, engine))
-        if ps:
-            samples, rate = engine.create(ps, voice=voice, speed=speed, lang=lang, is_phonemes=True)
-        else:
-            samples, rate = engine.create(chunk, voice=voice, speed=speed, lang=lang)
-        return samples, rate, None
-
-
-def edges(samples, rate):
-    """Soften a part's first and last few milliseconds, so a trimmed edge can't click."""
-    import numpy as np
-    n = min(len(samples) // 4, int(rate * 0.004)), min(len(samples) // 4, int(rate * 0.012))
-    samples = np.array(samples, dtype=np.float32, copy=True)
-    if n[0]:
-        samples[:n[0]] *= np.linspace(0, 1, n[0], dtype=np.float32)
-    if n[1]:
-        samples[-n[1]:] *= np.linspace(1, 0, n[1], dtype=np.float32)
-    return samples
-
-
-def silence(seconds, rate):
-    import numpy as np
-    return np.zeros(max(0, int(seconds * rate)), dtype=np.float32)
-
-
-def _novel_listed(jobdir, base):
-    """The chapters already in this listen, before part BASE: (chapters lines, serial lines).
-    (A jump or a new speed starts a new job folder, with these copied into it.)"""
-    got = []
-    for name in ("chapters", "serial"):
-        try:
-            with open(os.path.join(jobdir, name), encoding="utf-8") as fh:
-                got.append([ln.rstrip("\n") for ln in fh if ln.strip() and int(ln.split("\t", 1)[0]) < base])
-        except (OSError, ValueError):
-            got.append([])
-    if len(got[0]) != len(got[1]):
-        return [], []
-    return got[0], got[1]
-
-
-def _novel_add(jobdir, chapter, chunks, starts, serial, lang, new=False):
-    """Add a novel's chapter to the listen: its parts, and where it starts in the chapter
-    list (chapters: "first<TAB>label") and the novel's (serial: "first<TAB>number<TAB>address")."""
-    parts = split_text(normalise(chapter["text"], lang))
-    if not parts:
-        return
-    parts[-1] = (parts[-1][0], PAUSE["chapter"])
-    first = len(chunks) + 1
-    starts.append(f"{first}\t{chapter['label'].replace(chr(9), ' ')[:80]}")
-    serial.append(f"{first}\t{chapter['number']}\t{chapter['url']}")
-    chunks += parts
-    _write_atomic(os.path.join(jobdir, "chapters"), "\n".join(starts) + "\n")
-    _write_atomic(os.path.join(jobdir, "serial"), "\n".join(serial) + "\n")
-    if new:                                     # the novel, and the chapter before this listen's first
-        _write_atomic(os.path.join(jobdir, "novel"),
-                      f"title={chapter['novel']}\nurl={chapter['novel_url']}\nprev={chapter['prev'] or ''}\n")
-
-
-# While listening, how much speech is made ahead of the player: about ten minutes
-# (a Fibonacci number of seconds), plenty to ride out a busy or throttled phone.
-AHEAD = 610
-
-
-def _listener_at(jobdir):
-    """The part the player is on (it writes it into `at`); 0 before it starts."""
-    try:
-        with open(os.path.join(jobdir, "at")) as fh:
-            return int(fh.read().strip() or 0)
-    except (OSError, ValueError):
-        return 0
-
-
-def _keep_ahead(jobdir, made):
-    """Wait until less than AHEAD seconds of speech is ready ahead of the player.
-    MADE: each part made in this job, and its length in seconds."""
-    while True:
-        if not os.path.isdir(jobdir):
-            raise JobError("Cancelled")
-        at = _listener_at(jobdir)
-        if sum(secs for part, secs in made.items() if part >= at) < AHEAD:
-            return
-        time.sleep(0.5)
-
-
-def _novel_more(jobdir, chapter, chunks, starts, serial, lang):
-    """The next chapter, added once the listener has reached the last one made (so one
-    chapter is always ready ahead, and no more). None at the end of what's out."""
-    last = int(serial[-1].split("\t", 1)[0]) if serial else 0
-    while True:
-        if not os.path.isdir(jobdir):
-            raise JobError("Cancelled")
-        if _listener_at(jobdir) >= last:
-            break
-        time.sleep(0.5)
-    log(f"Fetching {chapter['next']}")
-    nxt = novel_next(chapter)
-    if nxt:
-        _novel_add(jobdir, nxt, chunks, starts, serial, lang)
-    return nxt
-
-
-def run_job(path):
-    import numpy as np
-    import soundfile as sf
-    import words
-
-    t0 = time.time()
-    jobdir, job = read_job(path)
-    engine = tts()
-
-    voice = voice_style(engine, job.get("voice", "af_heart"))
-    try:
-        speed = float(job.get("speed", "1.0"))
-    except ValueError:
-        raise JobError("Speed must be a number, e.g. 1.2") from None
-    if not 0.5 <= speed <= 2.0:
-        raise JobError("Speed must be between 0.5 and 2.0")
-    lang = job.get("lang", "en-us")
-    g2p = g2p_for(lang)
-
-    out = job.get("out")
-    if out:
-        if "/" in out or out.rsplit(".", 1)[-1] not in FORMATS:
-            raise JobError(f"Output must be one of: {', '.join(FORMATS)}")
-        out = os.path.join(jobdir, out)
-
-    stream = None
-    timed = False
-    if job.get("stream") == "1":
-        stream = os.path.join(jobdir, "stream")
-        os.makedirs(stream, exist_ok=True)
-        # Word timings come from Kokoro itself, with the audio.
-        timed = job.get("words") == "1" and engine.has_timings
-        if job.get("words") == "1" and not timed:
-            _write_atomic(os.path.join(stream, "words-off"), "this model reports no timings\n")
-
-    writer = None
-    total = 0.0
-    try:
-        novel = None        # a web novel: read on from chapter to chapter, as the listener gets there
-        if job.get("url") and stream:
-            log(f"Fetching {job['url']}")
-            title, text, novel = read_page(job["url"])
-            if novel and job.get("skip") == "1":       # on from a chapter already heard
-                heard, novel = novel, novel_next(novel)
-                if not novel:
-                    raise JobError(f"No new chapter after {heard['label']} yet")
-                text = novel["text"]
-            chapters = [(novel["label"] if novel else title, text)]
-        else:
-            title, chapters = read_source(jobdir, job)
-        _write_atomic(os.path.join(jobdir, "title"), (title or "").replace("\n", " ")[:120] + "\n")
-        if job.get("meta") == "1":            # for an audiobook: who wrote it, and its cover
-            src = os.path.join(jobdir, job.get("file", "in.txt"))
-            if not job.get("url") and zipfile.is_zipfile(src):
-                author, cover, ext = epub_meta(src)
-                _write_atomic(os.path.join(jobdir, "author"), author.replace("\n", " ")[:200] + "\n")
-                if cover:
-                    with open(os.path.join(jobdir, f"cover.{ext}"), "wb") as fh:
-                        fh.write(cover)
-        # Each chapter is split on its own, so a part never runs across chapters, and
-        # where each chapter starts is written down for the player's chapter list.
-        chunks, starts, serial = [], [], []
-        if novel:
-            try:
-                base = max(1, int(job.get("base", "1")))   # this chapter's first part, in the whole listen
-            except ValueError:
-                base = 1
-            starts, serial = _novel_listed(jobdir, base)
-            chunks = [None] * (base - 1)
-            _novel_add(jobdir, novel, chunks, starts, serial, lang, new=base == 1 or not serial)
-            chapters = []
-        for heading, text in chapters:
-            parts = split_text(normalise(text, lang))
-            if parts:
-                starts.append(f"{len(chunks) + 1}\t{heading.replace(chr(9), ' ').replace(chr(10), ' ')[:80]}")
-                parts[-1] = (parts[-1][0], PAUSE["chapter"])         # a longer breath between chapters
-                chunks += parts
-        if not chunks:
-            raise JobError("No text to read")
-        if len(starts) > 1 and not novel:
-            _write_atomic(os.path.join(jobdir, "chapters"), "\n".join(starts) + "\n")
-        try:
-            first = int(job.get("start", "1"))
-        except ValueError:
-            first = 1
-        try:
-            was = int(job.get("of", "0"))       # the bookmark's count of parts, if it had one
-        except ValueError:
-            was = 0
-        if was > 1 and was != len(chunks):
-            # Made with another version's parts: the same place, as a fraction of the text.
-            first = 1 + round((first - 1) * len(chunks) / was)
-        if novel:
-            first = max(first, int(serial[-1].split("\t", 1)[0]))   # (not before this chapter)
-        elif not 1 <= first <= len(chunks):
-            first = 1   # a bookmark past the end: start again
-        if stream:
-            _write_atomic(os.path.join(stream, "first"), f"{first}\n")
-
-        # (a novel's parts aren't kept: each listen numbers them from where it began)
-        cache = None if novel else cache_dir(job.get("cache", ""), job.get("voice", "af_heart"), speed, lang)
-        if cache and engine.has_timings:
-            timed = True                    # kept parts carry their word timings, whatever this run shows
-        chapter_at = {int(line.split("\t", 1)[0]): line.split("\t", 1)[1] for line in starts}
-        chapter_times, written = [], 0
-        made = {}                           # part -> seconds of speech, for keeping just ahead of the listener
-        i = first - 1
-        while True:
-            i += 1
-            if i > len(chunks) and not (novel and (novel := _novel_more(jobdir, novel, chunks, starts,
-                                                                        serial, lang))):
-                break
-            chunk, pause = chunks[i - 1]
-            # The kokoro command deletes its job folder when it exits or is
-            # stopped, so a vanished folder means nobody is waiting any more.
-            if not os.path.isdir(jobdir) or (stream and not os.path.isdir(stream)):
-                raise JobError("Cancelled")
-            _write_atomic(os.path.join(jobdir, "progress"), f"{i} {len(chunks)}\n")
-            name = f"{i:04d}"
-            got = cached_part(cache, name, chunk) if cache else None
-            if not got and stream and not out:
-                _keep_ahead(jobdir, made)       # (a kept part costs nothing: it's linked at once)
-            if got:
-                info = sf.info(got)
-                rate, length = info.samplerate, info.frames
-                samples = sf.read(got, dtype="float32")[0] if out else None
-            else:
-                samples, rate, marks = synthesize(engine, g2p, chunk, voice, speed, lang, timed, i)
-                samples = np.concatenate([edges(samples, rate), silence(pause, rate)])   # mpv plays them back to back
-                length = len(samples)
-                home = cache or stream
-                if home:
-                    # The text and word timings first, so the player has them when the audio lands.
-                    _write_atomic(os.path.join(home, f"{name}.txt"), chunk)
-                    if marks is not None:
-                        _write_atomic(os.path.join(home, f"{name}.words"), words.player_rows(chunk, marks))
-                    tmp = os.path.join(home, f"{name}.tmp.wav")
-                    sf.write(tmp, samples, rate)
-                    os.replace(tmp, os.path.join(home, f"{name}.wav"))
-            if stream and cache:
-                for ext in ("txt", "words", "wav"):                  # (the audio last: the player waits for it)
-                    src = os.path.join(cache, f"{name}.{ext}")
-                    if os.path.exists(src):
-                        _link(src, os.path.join(stream, f"{name}.{ext}"))
-            if chapter_at.get(i) is not None and out:
-                chapter_times.append((round(written / rate * 1000), chapter_at[i]))
-            total += length / rate
-            made[i] = length / rate
-            if out:
-                # Written as it's made, so a whole book never has to fit in memory.
-                if writer is None:
-                    writer = sf.SoundFile(out, "w", samplerate=rate, channels=1)
-                if i == len(chunks):
-                    samples = samples[:max(0, len(samples) - int(pause * rate))]   # no pause after the end
-                writer.write(samples)
-                written += len(samples)
-        if out:
-            total = written / rate if written else total     # (no pause after the last part)
-        if out and chapter_times:
-            _write_atomic(os.path.join(jobdir, "chapters_ms"),
-                          "".join(f"{ms}\t{title}\n" for ms, title in chapter_times))
-    finally:
-        if writer is not None:
-            writer.close()
-        if stream and os.path.isdir(stream):
-            open(os.path.join(stream, "end"), "w").close()
-
-    elapsed = time.time() - t0
-    _write_atomic(os.path.join(jobdir, "result"), f"{total:.1f} {elapsed:.1f} {len(chunks)}\n")
-    return f"Made {total:.1f}s of audio in {elapsed:.1f}s"
-
-
-def _write_atomic(path, text):
-    try:
-        with open(path + ".tmp", "w") as fh:
-            fh.write(text)
-        os.replace(path + ".tmp", path)
-    except OSError:
-        pass  # the job folder vanished (cancelled); the loop will notice
-
-
-# ------------------------------------------------------------------ server
-
-def serve(port, idle):
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    from urllib.parse import parse_qs, urlparse
-
-    global SERVING
-    SERVING = True
-    log("Loading model...")
-    tts()
-    g2p_for("en-us")                    # (a few seconds: done before the first job)
-    token = secrets.token_hex(16)
-    state = {"last": time.time(), "busy": 0}
-
-    class Handler(BaseHTTPRequestHandler):
-        def _reply(self, code, text):
-            body = (text + "\n").encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def _authorized(self):
-            given = self.headers.get("X-Kokoro-Token", "")
-            if hmac.compare_digest(given, token):
-                return True
-            self._reply(403, "bad token")
-            return False
-
-        def do_GET(self):
-            if urlparse(self.path).path == "/health" and self._authorized():
-                self._reply(200, "ok")
-            elif urlparse(self.path).path != "/health":
-                self._reply(404, "not found")
-
-        def do_POST(self):
-            if not self._authorized():
-                return
-            url = urlparse(self.path)
-            if url.path == "/shutdown":
-                self._reply(200, "bye")
-                threading.Thread(target=httpd.shutdown, daemon=True).start()
-                return
-            if url.path != "/job":
-                self._reply(404, "not found")
-                return
-            path = parse_qs(url.query).get("path", [""])[0]
-            state["busy"] += 1
-            try:
-                msg = run_job(path)
-                self._reply(200, msg)
-            except JobError as e:
-                self._reply(400, f"Error: {e}")
-            except Exception as e:  # noqa: BLE001 - send the error to the client
-                self._reply(500, f"Error: {type(e).__name__}: {e}")
-            finally:
-                state["busy"] -= 1
-                state["last"] = time.time()
-
-        def log_message(self, fmt, *args):
-            pass
-
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    httpd.daemon_threads = True
-
-    # Publish the token only once we're listening. $PREFIX/tmp is private to
-    # Termux, so other apps on the phone can't use the server.
-    os.makedirs(SERVER_DIR, exist_ok=True)
-    tok = os.path.join(SERVER_DIR, "token")
-    with open(tok + ".tmp", "w") as fh:
-        fh.write(f"{port} {token}\n")
-    os.chmod(tok + ".tmp", 0o600)
-    os.replace(tok + ".tmp", tok)
-
-    def watch_idle():
-        while True:
-            time.sleep(15)
-            if idle and not state["busy"] and time.time() - state["last"] > idle:
-                log(f"Idle for {idle // 60} min, stopping")
-                httpd.shutdown()
-                return
-
-    threading.Thread(target=watch_idle, daemon=True).start()
-    log(f"Ready on 127.0.0.1:{port}")
-    try:
-        httpd.serve_forever()
-    finally:
-        try:
-            with open(tok) as fh:
-                if token in fh.read():
-                    os.remove(tok)
-        except OSError:
-            pass
-
-
-# ------------------------------------------------------------------ benchmark and download
-
-BENCH_TEXT = ("The road left the village at first light and climbed into the hills, where the fields "
-              "gave way to heather. For three days she walked without meeting anyone, sleeping in the "
-              "lee of stone walls and waking to the sound of sheep.")
-
-
-def benchmark():
-    """Time Kokoro on this phone with each way of running it, and say which is fastest.
-    Prints "@@bench THREADS BLOCK SECONDS SPEED" per try, then "@@best THREADS BLOCK SPEED"."""
-    cpus = os.cpu_count() or 4
-    tries = [(0, 0)] + [(t, b) for t in sorted({2, 4, 6, 8, cpus}) if t <= cpus for b in (0, 4)]
-    best = None
-    for threads, block in tries:
-        k = load_kokoro(threads, block)
-        k.create(BENCH_TEXT, voice="af_heart")                    # warm up
-        took = []
-        for _ in range(2):
-            t0 = time.time()
-            audio, rate = k.create(BENCH_TEXT, voice="af_heart")
-            took.append(time.time() - t0)
-        secs = min(took)
-        speed = len(audio) / rate / secs
-        print(f"@@bench {threads} {block} {secs:.2f} {speed:.1f}", flush=True)
-        if best is None or speed > best[2]:
-            best = (threads, block, speed)
-        del k
-    print(f"@@best {best[0]} {best[1]} {best[2]:.1f}", flush=True)
-
-
-def download():
-    os.makedirs(MODELS, exist_ok=True)
-    for dest, src, label in ((MODEL, MODEL_SRC, "model"), (VOICES, VOICES_SRC, "voices")):
-        name = os.path.basename(dest)
-        if os.path.exists(dest) and os.path.getsize(dest) > 0:
-            print(f"@@progress {label} 100 0 0")
-            print(f"{name}: already downloaded", flush=True)
-            continue
-        part = dest + ".part"
-        for attempt in range(1, 6):
-            have = os.path.getsize(part) if os.path.exists(part) else 0
-            req = urllib.request.Request(src, headers={"User-Agent": USER_AGENT})
-            if have:
-                req.add_header("Range", f"bytes={have}-")
-            try:
-                with urllib.request.urlopen(req, timeout=60) as r:
-                    if have and r.status != 206:
-                        have = 0  # server ignored the range; start over
-                    size = have + int(r.headers.get("Content-Length", 0))
-                    with open(part, "ab" if have else "wb") as fh:
-                        done, shown = have, -1
-                        while block := r.read(1 << 18):
-                            fh.write(block)
-                            done += len(block)
-                            pct = done * 100 // size if size else 0
-                            if pct != shown:
-                                shown = pct
-                                # "@@progress LABEL PCT DONE_MB TOTAL_MB"
-                                print(f"@@progress {label} {pct} {done / 2**20:.0f} {size / 2**20:.0f}", flush=True)
-                os.replace(part, dest)
-                break
-            except OSError as e:
-                print(f"{name}: download interrupted ({e}), retry {attempt}/5", flush=True)
-                time.sleep(2 * attempt)
-        else:
-            sys.exit(f"Couldn't download {name}. Try again: it picks up where it stopped.")
-
-
-# ------------------------------------------------------------------ voices
-
-LANGS = {"a": ("American English", "en-us"), "b": ("British English", "en-gb"),
-         "e": ("Spanish", "es"), "f": ("French", "fr-fr"), "h": ("Hindi", "hi"),
-         "i": ("Italian", "it"), "j": ("Japanese", "ja"),
-         "p": ("Brazilian Portuguese", "pt-br"), "z": ("Mandarin Chinese", "cmn")}
-
-
-def sgr(params, fallback):
-    """An SGR escape from kokoro's theme ("38;2;182;156;255"), or the fallback."""
-    return f"\033[{params}m" if params and all(c in "0123456789;" for c in params) else fallback
-
-
-def print_voices(names, width, default, accent="", muted=""):
-    """Group voices by language and gender, wrapped to the terminal width.
-    Colour only when stdout is a terminal, in kokoro's theme colours."""
-    tty = (sys.stdout.isatty() or "--color" in sys.argv) and not os.environ.get("NO_COLOR")
-    bold, dim, acc, off = ("\033[1m", sgr(muted, "\033[2m"), sgr(accent, "\033[38;5;141m"), "\033[0m") if tty else ("",) * 4
-    width = max(30, min(width, 100))
-    groups = {}
-    for n in names:
-        groups.setdefault(n[0], {}).setdefault(n[1] if len(n) > 1 else "?", []).append(n)
-    for code in sorted(groups, key=lambda c: list(LANGS).index(c) if c in LANGS else 99):
-        title, lang = LANGS.get(code, (f"Other ({code})", ""))
-        note = " (basic pronunciation)" if code in "jz" else ""
-        print(f"{bold}{title}{off}{dim}{note}" + (f" -l {lang}" if lang else "") + off)
-        for g, label in (("f", "female"), ("m", "male")):
-            vs = groups[code].get(g)
-            if not vs:
-                continue
-            line, cur = [], 9
-            out = []
-            for v in vs:
-                shown = f"{acc}{v}*{off}" if v == default else v
-                w = len(v) + (1 if v == default else 0) + 1
-                if cur + w > width and line:
-                    out.append(" ".join(line))
-                    line, cur = [], 9
-                line.append(shown)
-                cur += w
-            out.append(" ".join(line))
-            print(f"  {dim}{label:<7}{off}" + f"\n  {'':<7}".join(out))
-        print()
-    if default:
-        other = "bm_george" if default != "bm_george" else "af_heart"
-        print(f"{dim}* your default{off}")
-        print(f"{dim}Try another: kokoro -v {other} -p \"Hi\"{off}")
-
-
-# ------------------------------------------------------------------ main
-
-def main():
-    p = argparse.ArgumentParser(prog="engine.py")
-    sub = p.add_subparsers(dest="cmd", required=True)
-    j = sub.add_parser("job")
-    j.add_argument("path")
-    s = sub.add_parser("serve")
-    s.add_argument("--port", type=int, default=8880)
-    s.add_argument("--idle", type=int, default=1800, help="stop after this many idle seconds (0 = never)")
-    for sp in (s, j):
-        sp.add_argument("--threads", type=int, default=0, help="onnxruntime threads (0: its choice)")
-        sp.add_argument("--block", type=int, default=0, help="onnxruntime dynamic block base (0: off)")
-    v = sub.add_parser("voices")
-    v.add_argument("--plain", action="store_true", help="one name per line")
-    v.add_argument("--width", type=int, default=60)
-    v.add_argument("--default", default="")
-    v.add_argument("--color", action="store_true", help="colour even when piped")
-    v.add_argument("--accent", default="", help="SGR parameters for the accent colour")
-    v.add_argument("--muted", default="", help="SGR parameters for secondary text")
-    sub.add_parser("download")
-    sub.add_parser("bench", help="time Kokoro each way it can run here")
-    a = p.parse_args()
-
-    if a.cmd in ("job", "serve"):
-        TUNING.update(threads=max(0, a.threads), block=max(0, a.block))
-    if a.cmd == "job":
-        try:
-            log(run_job(a.path))
-        except JobError as e:
-            sys.exit(f"Error: {e}")
-    elif a.cmd == "serve":
-        serve(a.port, a.idle)
-    elif a.cmd == "voices":
-        names = sorted(tts().get_voices())
-        if a.plain:
-            print("\n".join(names))
-        else:
-            print_voices(names, a.width, a.default, a.accent, a.muted)
-    elif a.cmd == "download":
-        download()
-    elif a.cmd == "bench":
-        benchmark()
-
-
-if __name__ == "__main__":
-    main()
-__KOKOMUX_ENGINE__
-
-cat > "$WORK/words.py" <<'__KOKOMUX_WORDS__'
-"""Word timings for spoken lines: which word is being said, and when.
-
-Runs inside the "kokoro" Debian container, next to engine.py.
-
-Kokoro reports how long it spends on every sound it makes (the timestamped
-model's "durations" output, read by kokoro-onnx as per-phoneme timings). Each
-word of the line is phonemised on its own, and its sounds are lined up against
-the sounds Kokoro actually spoke, so a word takes exactly the times of the
-phonemes it became. No speech recogniser is needed, and it works in every
-language Kokoro speaks.
-
-A line's result has the shape {v, engine, confidence, words: [{s, e, a, b, p}]}:
-s/e are the start and end in ms, a/b the character range in the line's text,
-and p the confidence (the share of the word's sounds that lined up).
-"""
-import re
-
-LINE_WORDS_VERSION = 2
-# Below this, too few of a line's sounds lined up to trust: it gets no highlight
-# rather than a wrong one.
-WORDS_MIN_CONFIDENCE = 0.35
-
-
-def empty_result(engine):
-    """Timings for a line that has none usable: nothing is lit."""
-    return {"v": LINE_WORDS_VERSION, "engine": engine, "confidence": 0, "words": []}
-
-
-def player_rows(text, data):
-    """A line's timings in the form the bash player reads (stream/NNNN.words): a
-    "confidence" line, then one "start end a b" row per word, with a/b the word's
-    UTF-8 byte range in the line. Below WORDS_MIN_CONFIDENCE there are no rows,
-    so nothing is lit."""
-    rows = [f"confidence\t{data.get('confidence', 0)}"]
-    if data.get("confidence", 0) >= WORDS_MIN_CONFIDENCE:
-        for w, (a, b) in zip(data["words"], byte_ranges(text, data["words"])):
-            rows.append(f"{w['s']}\t{w['e']}\t{a}\t{b}")
-    return "\n".join(rows) + "\n"
-
-
-def byte_ranges(text, words):
-    """The same words as UTF-8 byte ranges, which is what the bash player slices by."""
-    out, pos, byte = [], 0, 0
-    for w in words:
-        byte += len(text[pos:w["a"]].encode("utf-8"))
-        a = byte
-        byte += len(text[w["a"]:w["b"]].encode("utf-8"))
-        pos = w["b"]
-        out.append((a, byte))
-    return out
-
-
-# ---------------------------------------------------------------- Kokoro's own timings
-
-# Not sounds: spaces, stress marks and the punctuation espeak passes through.
-_SILENT = set(" ˈˌ;:,.!?¡¿—…\"«»“”()'-")
-# Stripped from the ends of a token to find the word to highlight (any script).
-_EDGE_PUNCT = "\"'“”‘’«»()[]{}<>.,;:!?¡¿…—–-、。，！？：；（）「」『』।॥"
-# Split points inside a token for scripts written without spaces.
-_CJK_BREAK = re.compile(r"(?<=[、。，！？：；])")
-
-
-def _tokens(text):
-    """The words to highlight: whitespace-separated tokens (also split after CJK
-    punctuation), with punctuation trimmed from their ends, as (start, end)."""
-    out = []
-    for m in re.finditer(r"\S+", text):
-        pos = m.start()
-        for part in _CJK_BREAK.split(m.group()):
-            core = part.strip(_EDGE_PUNCT)
-            if core:
-                a = pos + part.index(core)
-                out.append((a, a + len(core)))
-            pos += len(part)
-    return out
-
-
-def words_from_timings(text, timings, phonemize_many):
-    """Word timings for a line from Kokoro's own per-phoneme timings.
-
-    Each word is phonemised on its own, and its sounds are lined up against the
-    sounds Kokoro actually spoke (stress marks, spaces and punctuation aside), so
-    a word takes the times of exactly the phonemes it became. This survives
-    espeak running words together in a sentence ("in the" -> one spoken word)
-    and expanding numbers ("1999" -> three). Confidence is the share of sounds
-    that lined up. Returns the same shape as the cache: {v, engine, confidence, words}."""
-    import difflib
-
-    tokens = _tokens(text)
-    spoken = [t for t in timings if t.phoneme not in _SILENT]
-    if not tokens or not spoken:
-        return empty_result("kokoro")
-    per = phonemize_many([text[a:b] for a, b in tokens])
-    mine, owner = [], []                       # each token's sounds, end to end
-    for i, p in enumerate(per):
-        for ch in p:
-            if ch not in _SILENT:
-                mine.append(ch)
-                owner.append(i)
-    said = [t.phoneme for t in spoken]
-    match = [None] * len(mine)                 # the spoken sound each of mine lined up with
-    blocks = difflib.SequenceMatcher(None, mine, said, autojunk=False).get_matching_blocks()
-    for blk in blocks:
-        for k in range(blk.size):
-            match[blk.a + k] = blk.b + k
-    matched = sum(m is not None for m in match)
-    confidence = round(matched / max(len(mine), len(said)), 3) if mine else 0.0
-    words, floor = [], 0
-    for i, (a, b) in enumerate(tokens):
-        hits = [match[k] for k in range(len(mine)) if owner[k] == i and match[k] is not None]
-        if not hits:
-            continue                           # nothing of it lined up: leave it unlit
-        start, end = spoken[min(hits)].start, spoken[max(hits)].end
-        s_ms = max(floor, round(start * 1000))
-        e_ms = max(s_ms + 1, round(end * 1000))
-        words.append({"s": s_ms, "e": e_ms, "a": a, "b": b, "p": confidence})
-        floor = e_ms
-    return {"v": LINE_WORDS_VERSION, "engine": "kokoro", "confidence": confidence, "words": words}
-__KOKOMUX_WORDS__
-
-cat > "$WORK/tui.sh" <<'__KOKOMUX_TUI__'
+# Every file kokomux is made of, unpacked into $WORK (build.sh fills these in).
+cat > "$WORK/kokoro" <<'__KOKOMUX_FILE__'
+#!/data/data/com.termux/files/usr/bin/bash
+# kokomux: the `kokoro` command. https://github.com/Anesu/kokomux
+#
+# Turns text into speech with Kokoro, which lives in the "kokoro"
+# proot-distro container (/opt/kokoro: engine.py, its venv and the models).
+# Each run writes a job folder in $PREFIX/tmp, which the container sees as
+# /tmp, and the engine fills its stream/ folder part by part. If the
+# background server is running, jobs go to it over localhost (fast);
+# otherwise each run starts the container (slower).
+#
+# This file: settings, the server, keys and the frame timer, options, the job
+# folder, then the run. The admin commands (--status, --update, the queue...)
+# are in commands.sh, the screens in tui.sh, playing in player.sh, the colours
+# in theme.sh (all four loaded below).
+set -euo pipefail
+
+KOKOMUX_VERSION="1.1.0"
+CONF_DIR="$HOME/.config/kokoro"
+CONF="$CONF_DIR/config"
+
+# Precedence: environment (KOKORO_VOICE=am_adam kokoro ...) > settings file
+# > these defaults.
+env_names="${!KOKORO_@}"
+env_overrides=""
+# shellcheck disable=SC2086
+[ -n "$env_names" ] && env_overrides="$(declare -p $env_names)"
+# The defaults, in one place (the settings menu's "Reset to defaults" uses them too).
+KOKORO_DEFAULTS=(
+  KOKORO_VOICE=af_heart         # see: kokoro --list-voices
+  KOKORO_BLEND=                 # a second voice mixed in, and how much: af_bella:30 (empty: none)
+  KOKORO_SPEED=1.0              # 0.5 to 2.0
+  KOKORO_LANG=en-us
+  KOKORO_OUT=kokoro.wav         # file name when -o isn't given
+  KOKORO_AUTOSERVE=1            # keep Kokoro loaded in the background
+  KOKORO_IDLE_MINUTES=0         # unload it after this long unused (0: never; the phone has the memory)
+  KOKORO_PORT=8880
+  KOKORO_WORDS=1                # light up each word as it's spoken (-p on a terminal)
+  KOKORO_WORDS_OFFSET_MS=0      # moves the highlight against mpv's clock (+: later, -: earlier)
+  KOKORO_NOTIFY=1               # a notification with pause / next / again buttons (Termux:API)
+  KOKORO_TUI=1                  # -p on a terminal opens the full-screen reader (0: inline)
+  KOKORO_CACHE_GB=50            # made audio kept for books in progress, at most this much
+  KOKORO_THREADS=0              # how Kokoro runs on this phone (kokoro --benchmark sets these)
+  KOKORO_BLOCK=0
+  KOKORO_THEME=auto             # colours: auto (follow the terminal), dark or light
+  KOKORO_FOCUS=1                # the reader fades text with its distance from the line being read
+)
+for kv in "${KOKORO_DEFAULTS[@]}"; do declare "$kv"; done
+KOKORO_REPO_RAW=https://raw.githubusercontent.com/Anesu/kokomux/main
+# shellcheck source=/dev/null
+[ -f "$CONF" ] && . "$CONF"
+eval "$env_overrides"
+
+DISTRO=kokoro
+PY=/opt/kokoro/venv/bin/python
+ENGINE=/opt/kokoro/engine.py
+SRV_DIR="$PREFIX/tmp/kokoro-server"
+TOKEN_FILE="$SRV_DIR/token"
+PLAYER_PID="$PREFIX/tmp/kokoro-player.pid"
+CONTROL="$PREFIX/tmp/kokoro-control"      # kokoro --pause/--next/--again leave a word here
+PLAYER_STATE="$PREFIX/tmp/kokoro-state"   # "playing" or "paused", for --pause to report
+BOOKS="$HOME/.local/share/kokomux/bookmarks"
+QUEUE_DIR="$HOME/.local/share/kokomux/queue"   # shared links and files, to hear in order
+QUEUE="$QUEUE_DIR/list"                        # one per line: id, kind (url/file), source, title (tab-separated)
+QUIT_RC=0; [ "${KOKORO_QUEUE:-0}" = 1 ] && QUIT_RC=10   # stopped, not finished: the queue waits
+CACHE="$PREFIX/tmp/kokomux-cache"         # made parts, per book (the container sees /tmp/kokomux-cache)
+
+# ------------------------------------------------------------ look & feel
+
+# Count characters, not bytes ("…", "▶" and "␣" are one column each), so text
+# lines up whatever locale the terminal was started with. Byte-exact slicing of
+# the text being read still uses a local LC_ALL=C where it needs it.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *UTF-8*|*utf8*|*UTF8*) ;;
+  *) export LC_CTYPE=C.UTF-8 2>/dev/null ;;
+esac
+# Messages go to stderr. Colours and live status only on a terminal, so
+# scripts and pipes get plain, quiet output.
+
+# The rest of kokomux lives beside this command, in $PREFIX/share/kokomux:
+# theme.sh (the colours), tui.sh (the full-screen screens) and player.sh
+# (playing a text). The installer puts all three there.
+LIB="$PREFIX/share/kokomux"
+for f in theme.sh tui.sh player.sh commands.sh; do
+  [ -f "$LIB/$f" ] || { echo "kokomux is only partly installed ($f is missing). Run the installer again." >&2; exit 1; }
+done
+# shellcheck source=src/theme.sh
+. "$LIB/theme.sh"
+# shellcheck source=src/tui.sh
+. "$LIB/tui.sh"
+# shellcheck source=src/player.sh
+. "$LIB/player.sh"
+# shellcheck source=src/commands.sh
+. "$LIB/commands.sh"
+
+# The colours follow the terminal: a dark or light palette, made from its own
+# background where it has told us what that is.
+LIVE=0
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then LIVE=1; fi
+if [ "$LIVE" = 1 ]; then theme_apply; else theme_off; fi
+SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+frame=0
+
+cols() {         # the terminal's width (60 when it can't be asked)
+  local c
+  c="$(stty size 2>/dev/null </dev/tty | cut -d' ' -f2)" || true
+  [[ "${c:-}" =~ ^[0-9]+$ ]] && [ "$c" -ge 20 ] && echo "$c" || echo 60
+}
+
+# die "what went wrong" ["what to do about it"]
+die() {
+  tui_close
+  status_clear
+  printf '%s✗%s %s\n' "$RED" "$R" "$1" >&2
+  [ -n "${2:-}" ] && printf '  %s%s%s\n' "$D" "$2" "$R" >&2
+  exit 1
+}
+done_msg() { printf '%s✓%s %s%s\n' "$GRN" "$R" "$1" "${2:+ $D$2$R}" >&2; }   # done_msg TEXT [DIM]: a ✓ line
+info() { printf '%s›%s %s\n' "$ACC" "$R" "$1" >&2; }   # info TEXT: a › line
+
+# One live status line, never wider than the screen (a wrapped line can't
+# be redrawn in place): status "text" ["dim extra"] ["symbol"]
+TERM_COLS=60; [ "$LIVE" = 1 ] && TERM_COLS="$(cols)"
+status() {       # status TEXT [DIM] [SYMBOL]: the live status line, redrawn in place
+  [ "$LIVE" = 1 ] || return 0
+  local main=$1 extra=${2:-} sym=${3:-${SPIN[frame % 10]}} vis room
+  vis="$(printf '%s' "$main" | sed 's/\x1b\[[0-9;]*m//g')"
+  room=$(( TERM_COLS - 4 - ${#vis} ))
+  if [ "$room" -lt 4 ]; then extra=""
+  elif [ "${#extra}" -gt "$room" ]; then extra="${extra:0:$((room - 1))}…"; fi
+  printf '\r\033[K%s%s%s %s %s%s%s' "$ACC" "$sym" "$R" "$main" "$D" "$extra" "$R" >&2
+  frame=$((frame + 1))
+}
+status_clear() { [ "$LIVE" = 1 ] && printf '\r\033[K' >&2; return 0; }   # rub out the live status line
+
+snippet() {      # snippet FILE: its first 60 characters, on one line (a title for a text)
+  local t
+  t="$(head -c 600 "$1" | tr '\n\t\r' '   ' | tr -s ' ')" || t=""
+  t=${t# }; t=${t:0:60}; printf '%s' "${t% }"
+}
+is_link() { [ "$(wc -l < "$1")" -le 1 ] && grep -qE '^[[:space:]]*https?://[^[:space:]]+[[:space:]]*$' "$1"; }   # is_link FILE: is it a web address on its own (a copied link)?
+# shellcheck disable=SC2088  # a literal ~ is the point
+tilde() { case "$1" in "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac; }
+# Voices: one, or several blended ("af_heart:70+af_bella:30").
+VOICE_RE='^[a-z]{2}_[a-z0-9]+(:[0-9]{1,3})?(\+[a-z]{2}_[a-z0-9]+(:[0-9]{1,3})?){0,3}$'
+voice_mix() {    # voice_mix [VOICE [BLEND]]: the voice to use, with KOKORO_BLEND ("af_bella:30") mixed in
+  local v=${1:-$KOKORO_VOICE} b=${2-$KOKORO_BLEND} n a=30
+  n=${b%%:*}; [[ "$b" == *:* ]] && a=${b#*:}
+  if [ -n "$n" ] && [ "$n" != "$v" ] && [[ "$v" != *[+:]* ]] && [[ "$a" =~ ^[0-9]+$ ]] && [ "$a" -gt 0 ] && [ "$a" -lt 100 ]; then
+    printf '%s:%s+%s:%s' "$v" $(( 100 - a )) "$n" "$a"
+  else printf '%s' "$v"; fi
+}
+voice_label() {  # voice_label SPEC: "af_heart:70+af_bella:30" -> "af_heart + af_bella"
+  local s=$1
+  while [[ "$s" =~ ^(.*):[0-9]+(.*)$ ]]; do s=${BASH_REMATCH[1]}${BASH_REMATCH[2]}; done
+  printf '%s' "${s//+/ + }"
+}
+human_size() {   # human_size BYTES: "1.2 MB" or "340 KB"
+  local b=$1
+  if [ "$b" -ge 1048576 ]; then awk "BEGIN { printf \"%.1f MB\", $b / 1048576 }"
+  else echo "$(( (b + 1023) / 1024 )) KB"; fi
+}
+human_secs() {   # human_secs SECONDS: "2m 05s" or "4.2s"
+  awk -v s="$1" 'BEGIN { if (s >= 60) printf "%dm %02ds", s / 60, s % 60; else printf "%.1fs", s }'
+}
+
+# ------------------------------------------------------------ server
+
+server_token() { [ -f "$TOKEN_FILE" ] && cut -d' ' -f2 "$TOKEN_FILE"; }   # the background server's secret (from its token file)
+server_port() { [ -f "$TOKEN_FILE" ] && cut -d' ' -f1 "$TOKEN_FILE"; }   # the port it listens on (from the same file)
+
+server_up() {    # is the background server answering?
+  local tok port
+  tok="$(server_token 2>/dev/null)" || return 1
+  port="$(server_port)"
+  curl -fsS -m 2 -H "X-Kokoro-Token: $tok" "http://127.0.0.1:$port/health" >/dev/null 2>&1
+}
+
+start_server() {   # start the server in the container and wait (a spinner) until it answers
+  server_up && return 0
+  mkdir -p "$SRV_DIR"
+  rm -f "$TOKEN_FILE"
+  # Ignore Ctrl+C and hang-ups so the server outlives the command that started it.
+  ( trap '' INT HUP
+    exec nohup proot-distro login "$DISTRO" --shared-tmp -- \
+      "$PY" "$ENGINE" serve --port "$KOKORO_PORT" --idle "$((KOKORO_IDLE_MINUTES * 60))" \
+        --threads "$KOKORO_THREADS" --block "$KOKORO_BLOCK"
+  ) > "$SRV_DIR/log" 2>&1 < /dev/null &
+  local pid=$! n=0
+  [ "$LIVE" = 1 ] || echo "Starting the Kokoro server..." >&2
+  while [ "$n" -lt 1200 ]; do          # up to 2 minutes
+    if [ $((n % 5)) = 0 ]; then
+      server_up && { status_clear; return 0; }
+      kill -0 "$pid" 2>/dev/null || break
+    fi
+    status "Warming up Kokoro" "(a few seconds)"
+    sleep 0.1; n=$((n + 1))
+  done
+  status_clear
+  printf '%s✗%s The Kokoro server didn'"'"'t start.\n' "$RED" "$R" >&2
+  tail -n 5 "$SRV_DIR/log" 2>/dev/null | sed "s/^/  $D/; s/\$/$R/" >&2 || true
+  printf '  %sFull log: %s%s\n' "$D" "${SRV_DIR}/log" "$R" >&2
+  return 1
+}
+
+stop_server() {  # ask the server to stop, and wait until it has
+  if ! server_up; then info "The server isn't running."; return 0; fi
+  curl -fsS -m 5 -X POST -H "X-Kokoro-Token: $(server_token)" \
+    "http://127.0.0.1:$(server_port)/shutdown" >/dev/null || true
+  local i
+  for i in $(seq 1 20); do server_up || break; sleep 0.25; done
+  done_msg "Server stopped." "It restarts when needed."
+}
+
+# ------------------------------------------------------------ playback
+
+player_alive() { local pid; pid="$(cat "$PLAYER_PID" 2>/dev/null)" && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }   # is a kokoro -p running (by its pid file)?
+
+# control WORD MESSAGE: tell the running player to pause, skip or replay
+control() {
+  player_alive || { info "Nothing is playing."; exit 0; }
+  echo "$1" > "$CONTROL"
+  [ -n "${2:-}" ] && done_msg "$2"
+  return 0
+}
+
+# Bookmarks: where a long text was stopped, as key=value lines.
+mark_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1 || true; }   # (empty if there's no such file)
+chapter_url() {  # chapter_url URL N: CHURL = chapter N's address, where a novel's addresses count chapters (…/chapter-5)
+  local u=${1%%[?#]*}
+  u=${u%/}; CHURL=""
+  [[ "$u" =~ ^(.*/[^/]*[Cc][Hh][Aa][Pp][Tt][Ee][Rr][-_]?)([0-9]+)([^/]*)$ ]] || return 1
+  CHURL="${BASH_REMATCH[1]}$2${BASH_REMATCH[3]}"
+}
+
+stop_playback() {   # stop the running player, if any (returns 1 if there was none)
+  local pid
+  pid="$(cat "$PLAYER_PID" 2>/dev/null)" || return 1
+  rm -f "$PLAYER_PID"
+  [ -n "$pid" ] && [ "$pid" != "$$" ] && kill "$pid" 2>/dev/null
+}
+
+# ------------------------------------------------------------ keys and the frame timer
+# tick waits a moment (no process) and, on a terminal, reads one key or click
+# into KEY, by name (key_name): a printable key is itself ("q", " ", "+"), the
+# others are up down left right enter esc backspace pgup pgdn, and click (a
+# left click or tap, at CLICK_X, CLICK_Y). The mouse wheel is up and down.
+# A stop signal during the wait must not exit from inside `read -t`:
+# if cleanup then outlives the timer, bash's alarm jumps back into a read that's
+# gone and bash crashes (seen with bash 5.2). So during the wait the signal only
+# sets a flag, and tick exits once read has returned.
+
+STOP=""; IN_TICK=0; KEY=""; CMD=""; KBD=""; KEYS_TTY=""; TICK_BG=""; CLICK_X=0; CLICK_Y=0
+exec {TICK}<> <(:)                    # read -t on this is a sleep with no process
+now_ms() { local t=${EPOCHREALTIME//[!0-9]/}; NOW=$(( t / 1000 )); }   # no subshell: called every frame
+keys_on() {      # read keys from the terminal, unechoed (restored on exit)
+  [ -n "$KBD" ] && return 0
+  [ "$LIVE" = 1 ] && [ -r /dev/tty ] || return 0
+  { exec {KBD}</dev/tty; } 2>/dev/null || { KBD=""; return 0; }
+  KEYS_TTY="$(stty -g 2>/dev/null </dev/tty)" || KEYS_TTY=""
+  stty -echo -icanon 2>/dev/null </dev/tty || true
+}
+keys_off() { [ -n "$KEYS_TTY" ] && stty "$KEYS_TTY" 2>/dev/null </dev/tty; KEYS_TTY=""; return 0; }   # give the terminal back its echo and line editing
+tick() {         # tick SECONDS: flush the frame, wait, and read a key into KEY (by name)
+  local c rest=""
+  [ -n "${FRAME:-}" ] && flush          # the frame drawn since the last wait, in one write
+  [ -n "${TICK_BG:-}" ] && "$TICK_BG"    # the player keeping mpv fed, while a menu is open
+  IN_TICK=1; KEY=""
+  if [ -n "$KBD" ]; then
+    if IFS= read -rsn1 -d '' -t "$1" -u "$KBD" KEY && [ "$KEY" = $'\033' ]; then
+      # an arrow key or a click: the rest of the sequence follows at once
+      while IFS= read -rsn1 -d '' -t 0.01 -u "$KBD" c; do
+        rest+=$c; [[ "$c" == [A-Za-z~] ]] && [ "${#rest}" -gt 1 ] && break
+      done
+      KEY=$'\033'$rest
+    fi
+    key_name
+  else
+    read -r -t "$1" -u "$TICK" _ || true
+  fi
+  IN_TICK=0
+  [ -z "$STOP" ] || exit 130
+}
+key_name() {     # KEY, as the terminal sent it, to its name (see above); "" for what no screen uses
+  case "$KEY" in
+    $'\033[A'|$'\033OA'|$'\033[<64;'*M) KEY=up ;;
+    $'\033[B'|$'\033OB'|$'\033[<65;'*M) KEY=down ;;
+    $'\033[C'|$'\033OC') KEY=right ;;
+    $'\033[D'|$'\033OD') KEY=left ;;
+    $'\033[5~') KEY=pgup ;;
+    $'\033[6~') KEY=pgdn ;;
+    $'\r'|$'\n') KEY=enter ;;
+    $'\033') KEY=esc ;;
+    $'\177'|$'\b') KEY=backspace ;;
+    $'\033[<0;'*M)                            # a left click or tap: "ESC [ < 0 ; x ; y M"
+      if [[ "$KEY" =~ \;([0-9]+)\;([0-9]+)M$ ]]; then CLICK_X=${BASH_REMATCH[1]} CLICK_Y=${BASH_REMATCH[2]} KEY=click
+      else KEY=""; fi ;;
+    $'\033'*) KEY="" ;;                        # a release, another button, a key no screen uses
+  esac
+}
+key_cmd() {      # what KEY asks for (or a clicked button): see the player for each
+  CMD=""
+  case "$KEY" in
+    " "|p|P|k) CMD=toggle ;;
+    n|N|l|right) CMD=next ;;
+    b|B|h|left) CMD=again ;;
+    q|Q|esc) CMD=quit ;;
+    +|=) CMD=faster ;;
+    -|_) CMD=slower ;;
+    t|T) CMD="sleep" ;;
+    c|C) CMD=chapters ;;
+    m|M) CMD=menu ;;
+    s|S) CMD=settings ;;
+    v|V) CMD=voice ;;
+    ']') CMD=next_chapter ;;
+    '[') CMD=prev_chapter ;;
+    click) [ "${ui:-}" = tui ] && tui_click ;;
+  esac
+  KEY=""
+}
+
+# kokoro on its own, on a terminal: the home screen.
+if [ $# = 0 ] && [ -t 1 ] && screen_run tui_home; then
+  [ "${#HOME_CHOICE[@]}" -gt 0 ] && exec "$0" "${HOME_CHOICE[@]}"
+  exit 0
+fi
+
+# ------------------------------------------------------------ admin commands
+# (in commands.sh: --status, --queue, --continue, --update...; each exits)
+
+admin_cmd "$@" || true
+
+# ------------------------------------------------------------ options
+
+out=""; infile=""; url=""; play=0; clip=0; restart=0; words=()
+voice="$(voice_mix)"; speed="$KOKORO_SPEED"; lang="$KOKORO_LANG"
+need() { [ $# -ge 2 ] || die "$1 needs a value." "See: kokoro --help"; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o|--out)       need "$@"; out="$2"; shift 2 ;;
+    --out=*)        out="${1#*=}"; shift ;;
+    -f|--file)      need "$@"; infile="$2"; shift 2 ;;
+    --file=*)       infile="${1#*=}"; shift ;;
+    -u|--url)       need "$@"; url="$2"; shift 2 ;;
+    --url=*)        url="${1#*=}"; shift ;;
+    -v|--voice)     need "$@"; voice="$2"; shift 2 ;;
+    --voice=*)      voice="${1#*=}"; shift ;;
+    -s|--speed)     need "$@"; speed="$2"; shift 2 ;;
+    --speed=*)      speed="${1#*=}"; shift ;;
+    -l|--lang)      need "$@"; lang="$2"; shift 2 ;;
+    --lang=*)       lang="${1#*=}"; shift ;;
+    -p|--play)      play=1; shift ;;
+    -c|--clipboard) clip=1; shift ;;
+    --restart)      restart=1; shift ;;
+    --)             shift; words+=("$@"); break ;;
+    -?*)            die "Unknown option $1" "See: kokoro --help" ;;
+    *)              words+=("$1"); shift ;;
+  esac
+done
+
+[[ "$voice" =~ $VOICE_RE ]] || die "\"$voice\" isn't a voice name." "One voice, like af_heart, or a blend, like af_heart:70+af_bella:30. See: kokoro --list-voices"
+[[ "$speed" =~ ^[0-9]*\.?[0-9]+$ ]] || die "Speed must be a number, like 1.2"
+[[ "$lang" =~ ^[A-Za-z0-9-]+$ ]] || die "\"$lang\" isn't a language code." "Try en-us, en-gb, es, fr-fr, it, pt-br or hi."
+
+[ "$play" = 1 ] || out="${out:-$KOKORO_OUT}"
+ext=""
+if [ -n "$out" ]; then
+  ext="$(printf '%s' "${out##*.}" | tr '[:upper:]' '[:lower:]')"
+  case "$ext" in wav|mp3|ogg|flac|m4b) ;; *) die "Can't save as \"$out\"." "End the name with .wav, .mp3, .ogg, .flac or .m4b (an audiobook with chapters)" ;; esac
+  [ -d "$(dirname "$out")" ] || die "The folder for \"$out\" doesn't exist."
+fi
+if [ "$ext" = m4b ] && ! command -v ffmpeg >/dev/null; then
+  die "Audiobooks need ffmpeg." "Install it with: pkg install ffmpeg"
+fi
+if [ "$play" = 1 ] && ! { command -v mpv && command -v socat; } >/dev/null; then
+  die "Playback needs mpv and socat." "Install them with: pkg install mpv socat"
+fi
+
+# ------------------------------------------------------------ job folder
+
+tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
+gen_pid=""
+cleanup() {      # on exit: the screen, the bookmark message, mpv, the engine and the job folder
+  set +e   # best effort from here: a process that's already gone mustn't change the exit code
+  status_clear
+  [ "${in_line:-0}" = 1 ] && [ "${ui:-}" = inline ] && [ "${show_words:-0}" = 1 ] && block_finish
+  tui_close
+  keys_off
+  if [ "${ui:-none}" != none ] && [ -n "${book_id:-}" ] && [ -f "$BOOKS/$book_id.mark" ]; then
+    [ "${SLEPT:-0}" = 1 ] && info "Sleep timer: good night."
+    if [ "$(mark_get "$BOOKS/$book_id.mark" kind)" = novel ]; then
+      info "Stopped in $(mark_get "$BOOKS/$book_id.mark" chapter). ${D}kokoro --continue picks up there.${R}"
+    else
+      info "Stopped at part $(mark_get "$BOOKS/$book_id.mark" part) of $(mark_get "$BOOKS/$book_id.mark" parts). ${D}kokoro --continue picks up there.${R}"
+    fi
+  fi
+  if [ "${play:-0}" = 1 ]; then notify_clear; rm -f "$PLAYER_STATE"; fi
+  mpv_quit
+  [ "${WAKE:-0}" = 1 ] && termux-wake-unlock >/dev/null 2>&1
+  [ -n "$gen_pid" ] && kill "$gen_pid" 2>/dev/null
+  rm -rf "$tmpd"
+  if [ "$play" = 1 ] && [ "$(cat "$PLAYER_PID" 2>/dev/null)" = "$$" ]; then rm -f "$PLAYER_PID"; fi
+  return 0
+}
+trap cleanup EXIT
+# (see tick: during the frame timer a stop signal only sets a flag)
+on_signal() { if [ "$IN_TICK" = 1 ]; then STOP=1; else exit 130; fi; }
+trap on_signal INT TERM HUP
+
+text="$tmpd/in.txt"
+book=0
+if [ -n "$url" ]; then
+  :
+elif [ "$clip" = 1 ]; then
+  command -v termux-clipboard-get >/dev/null ||
+    die "Reading the clipboard needs Termux:API." "Install the Termux:API app, then: pkg install termux-api"
+  # termux-clipboard-get waits forever without the Termux:API app, so give it a few
+  # seconds, show that it's waiting, and remember the answer for the home screen.
+  termux-clipboard-get > "$text" 2>/dev/null & cpid=$!
+  for n in $(seq 60); do
+    kill -0 "$cpid" 2>/dev/null || break
+    status "Reading the clipboard" "(this needs the Termux:API app)"; sleep 0.1
+  done
+  mkdir -p "$CONF_DIR"
+  if kill -0 "$cpid" 2>/dev/null || ! wait "$cpid"; then
+    kill "$cpid" 2>/dev/null || true
+    echo no > "$CONF_DIR/termux-api"
+    die "Couldn't read the clipboard: the Termux:API app didn't answer." \
+        "Install the Termux:API app from F-Droid (where you got Termux), open it once, then try again."
+  fi
+  echo yes > "$CONF_DIR/termux-api"
+elif [ -n "$infile" ]; then
+  [ -f "$infile" ] || die "There's no file called \"$infile\"."
+  cp "$infile" "$text"
+  magic=""; read -r -n 4 magic < "$infile" || true
+  case "$magic" in %PDF*|PK*) book=1 ;; esac   # a PDF or EPUB: the engine reads it
+elif [ ${#words[@]} -gt 0 ]; then
+  printf '%s\n' "${words[*]}" > "$text"
+elif [ ! -t 0 ]; then
+  cat > "$text"
+else
+  usage >&2; exit 2
+fi
+
+# A copied link on its own means "read that page".
+if [ -z "$url" ] && [ "$book" = 0 ] && is_link "$text"; then
+  url="$(tr -d '[:space:]' < "$text")"
+fi
+if [ -z "$url" ] && [ "$book" = 0 ] && ! grep -q '[^[:space:]]' "$text"; then
+  [ "$clip" = 1 ] && die "The clipboard is empty."
+  die "There's no text to read."
+fi
+[[ "$url" != *$'\n'* ]] || die "That doesn't look like a web address."
+
+# What it's called (the engine may find a better title inside), and, when
+# listening, a bookmark keyed by what's being read: the same text, file or page
+# picks up where it was stopped.
+if [ -n "$url" ]; then kind=url source=$url name=$url
+elif [ -n "$infile" ]; then kind=file source="$(realpath "$infile")" name="$(basename "$infile")"
+else kind=text source="" name="$(snippet "$text")"; fi
+book_id=""; start=1; was_parts=0
+if { [ "$play" = 1 ] && [ -z "$out" ]; } || [ "$ext" = m4b ]; then   # (an audiobook reuses what listening made)
+  if [ "$kind" = url ]; then book_id="$(printf '%s' "$url" | sha256sum | cut -c1-16)"
+  else book_id="$(sha256sum < "$text" | cut -c1-16)"; fi
+fi
+skip=0
+if [ "$play" = 1 ] && [ -z "$out" ]; then
+  # A web novel's chapter: its bookmark is the novel's, which names the chapter it's at.
+  if [ "$kind" = url ]; then
+    mark="$(grep -lFx "source=$url" "$BOOKS"/*.mark 2>/dev/null | head -n 1)" || true
+    if [ -n "$mark" ] && [ "$(mark_get "$mark" kind)" = novel ]; then book_id="$(basename "$mark" .mark)"; fi
+  fi
+  mark="$BOOKS/$book_id.mark"
+  if [ "$restart" = 1 ]; then [ "$(mark_get "$mark" kind)" = novel ] || rm -f "$mark" "$BOOKS/$book_id.txt"
+  elif [ "$(mark_get "$mark" "done")" = 1 ]; then          # heard to the latest chapter: on to the next
+    skip=1; info "On from $(mark_get "$mark" chapter)."
+  elif [ "$(mark_get "$mark" kind)" = novel ] && [ "$(mark_get "$mark" part)" -gt 1 ] 2>/dev/null; then
+    start="$(mark_get "$mark" part)"; was_parts="$(mark_get "$mark" parts)"
+    [[ "$was_parts" =~ ^[0-9]+$ ]] || was_parts=0
+    info "Picking up in $(mark_get "$mark" chapter), where you stopped."
+  elif [ -f "$mark" ] && [ "$(mark_get "$mark" part)" -gt 1 ] 2>/dev/null; then
+    start="$(mark_get "$mark" part)"; was_parts="$(mark_get "$mark" parts)"
+    [[ "$was_parts" =~ ^[0-9]+$ ]] && [ "$was_parts" -gt 0 ] || was_parts=0
+    if [ "$was_parts" -gt 0 ]; then
+      info "Picking up where you stopped, $(( (start - 1) * 100 / was_parts ))% of the way through."
+    else info "Picking up where you stopped."; fi
+    printf '  %s(--restart starts from the top)%s\n' "$D" "$R" >&2
+  fi
+fi
+
+# With -p on a terminal, show each line as it's read and light the spoken word,
+# in the full-screen reader (ui=tui) or inline below the command (ui=inline).
+show_words=0
+[ "$play" = 1 ] && [ "$LIVE" = 1 ] && [ "$KOKORO_WORDS" = 1 ] && show_words=1
+ui=none
+if [ "$play" = 1 ] && [ "$LIVE" = 1 ]; then
+  ui=inline; keys_on
+  if [ "$KOKORO_TUI" = 1 ] && [ -n "$KBD" ] && tui_fits; then ui=tui; fi
+fi
+
+write_job() {    # the job, for the engine (where it starts and how fast can change mid-listen)
+  local u=$url b=1
+  if [ -n "${NOVEL:-}" ]; then chapters_load; novel_at "$start"; u=$N_URL; b=$N_FIRST; fi   # (the chapter it's in)
+  echo "$start" > "$tmpd/at"
+  {
+    echo "voice=$voice"
+    echo "speed=$speed"
+    echo "lang=$lang"
+    [ -n "$u" ] && echo "url=$u"
+    [ "$b" -gt 1 ] && echo "base=$b"           # where that chapter starts in this listen
+    [ "$skip" = 1 ] && echo "skip=1"          # on from the chapter at url
+    echo "name=$name"
+    [ "$start" -gt 1 ] && echo "start=$start"
+    [ "$was_parts" -gt 0 ] && echo "of=$was_parts"   # the bookmark's count: the engine maps it if its parts differ
+    [ -n "$book_id" ] && echo "cache=$book_id"       # keep what's made, and reuse what was
+    if [ "$ext" = m4b ]; then echo "out=out.wav"; echo "meta=1"     # ffmpeg makes the .m4b from it
+    elif [ -n "$out" ]; then echo "out=out.$ext"; fi
+    [ "$play" = 1 ] && echo "stream=1"
+    [ "$show_words" = 1 ] && echo "words=1"
+  } > "$tmpd/job"
+  job="/tmp/$(basename "$tmpd")/job"   # the same file, as the container sees it
+}
+
+# The book's made audio is kept; the cache stays under KOKORO_CACHE_GB by letting
+# go of the books heard least recently.
+cache_trim() {
+  [ -d "$CACHE" ] || return 0
+  local cap=$(( ${KOKORO_CACHE_GB:-50} * 1024 )) total d
+  total="$(du -sm "$CACHE" 2>/dev/null | cut -f1)" || true   # (du complains about a part replaced as it counts)
+  while [ "${total:-0}" -gt "$cap" ]; do
+    d="$(find "$CACHE" -mindepth 1 -maxdepth 1 -type d ! -name "${book_id:-none}" -printf '%T@ %p\n' |
+         sort -n | head -n 1 | cut -d' ' -f2-)" || true
+    [ -n "$d" ] || break
+    rm -rf "$d"
+    total="$(du -sm "$CACHE" 2>/dev/null | cut -f1)" || true
+  done
+}
+if [ -n "$book_id" ]; then mkdir -p "$CACHE/$book_id"; touch "$CACHE/$book_id"; cache_trim; fi
+
+# Use the server if it's up (or start it); otherwise run the job directly.
+use_server=0
+if server_up || { [ "$KOKORO_AUTOSERVE" = 1 ] && start_server; }; then use_server=1; fi
+
+run_engine() {   # run the job: through the server, or one-off in the container
+  if [ "$use_server" = 1 ]; then
+    local rc=0
+    curl -s --fail-with-body -X POST -H "X-Kokoro-Token: $(server_token)" \
+      "http://127.0.0.1:$(server_port)/job?path=$job" || rc=$?
+    # 22 = the server answered with an error, which it has already printed.
+    [ "$rc" = 0 ] || [ "$rc" = 22 ] || echo "Error: lost contact with the Kokoro server (curl error $rc)"
+    [ "$rc" = 0 ] || return 1
+  else
+    proot-distro login "$DISTRO" --shared-tmp -- "$PY" "$ENGINE" job "$job" --threads "$KOKORO_THREADS" --block "$KOKORO_BLOCK"
+  fi
+}
+
+# What's happening, for the live status line.
+progress() {
+  local p n i
+  if [ -f "$tmpd/progress" ] && read -r i n < "$tmpd/progress"; then
+    if [ "$n" -gt 1 ]; then p="part $i of $n"; else p=""; fi
+    echo "$p"; return
+  fi
+  echo ""
+}
+waiting_label() {   # what the status line says while the next part is being made
+  if [ "$play" = 1 ] && [ "$i" -gt "$start" ]; then echo "Preparing"
+  elif [ "$start" -gt 1 ]; then echo "Picking up at part $start"
+  elif [ -f "$tmpd/progress" ]; then echo "Making speech"
+  elif [ -n "$url" ]; then echo "Fetching the page"
+  else echo "Getting ready"; fi
+}
+
+# ------------------------------------------------------------ audiobooks
+# -o book.m4b: the engine makes one WAV and says where each chapter starts;
+# ffmpeg turns it into AAC in an .m4b with chapter marks, title, author and cover.
+
+ffmeta() { sed 's/[=;#\\]/\\&/g' | tr '\n' ' ' | sed 's/ *$//'; }   # a value for ffmpeg's metadata file
+make_audiobook() { # make_audiobook WAV M4B
+  local wav=$1 m4b=$2 meta="$tmpd/ffmeta" total_ms title author line ms prev="" prev_t="" cover="" rc=1
+  title="$(cat "$tmpd/title" 2>/dev/null)"; [ -n "$title" ] || title=$name
+  author="$(cat "$tmpd/author" 2>/dev/null)" || author=""
+  total_ms=$(awk '{ printf "%d", $1 * 1000 }' "$tmpd/result")
+  {
+    echo ";FFMETADATA1"
+    echo "title=$(printf '%s' "$title" | ffmeta)"; echo "album=$(printf '%s' "$title" | ffmeta)"
+    [ -n "$author" ] && echo "artist=$(printf '%s' "$author" | ffmeta)"
+    echo "genre=Audiobook"
+    if [ -s "$tmpd/chapters_ms" ]; then
+      while IFS=$'\t' read -r ms line; do
+        [ -n "$prev" ] && printf '[CHAPTER]\nTIMEBASE=1/1000\nSTART=%s\nEND=%s\ntitle=%s\n' "$prev" "$ms" "$prev_t"
+        prev=$ms prev_t="$(printf '%s' "$line" | ffmeta)"
+      done < "$tmpd/chapters_ms"
+      printf '[CHAPTER]\nTIMEBASE=1/1000\nSTART=%s\nEND=%s\ntitle=%s\n' "$prev" "$total_ms" "$prev_t"
+    fi
+  } > "$meta"
+  for cover in "$tmpd"/cover.jpg "$tmpd"/cover.png ""; do [ -f "$cover" ] && break; done
+  local args=(-hide_banner -loglevel error -nostats -y -i "$wav" -i "$meta")
+  [ -n "$cover" ] && args+=(-i "$cover")
+  args+=(-map 0:a -map_metadata 1 -map_chapters 1)
+  [ -n "$cover" ] && args+=(-map 2:v -c:v copy -disposition:v:0 attached_pic)
+  args+=(-c:a aac -b:a 96k -ac 1 -movflags +faststart -f mp4 -progress pipe:1 "$m4b")
+  while IFS='=' read -r line ms; do         # ffmpeg reports how far it's got (out_time_us)
+    case "$line" in
+      out_time_us) [[ "$ms" =~ ^[0-9]+$ ]] && [ "$total_ms" -gt 0 ] && status "Making the audiobook" "$(( ms / 10 / total_ms ))%" ;;
+      rc) rc=$ms ;;
+    esac
+  done < <(ffmpeg "${args[@]}" 2>"$tmpd/ffmpeg.log"; echo "rc=$?")
+  status_clear
+  [ "$rc" = 0 ] || die "ffmpeg couldn't make the audiobook." "$(tail -n 2 "$tmpd/ffmpeg.log")"
+}
+
+# ------------------------------------------------------------ run
+
+if [ "$play" = 1 ]; then
+  stop_playback || true
+  rm -f "$CONTROL"                             # nothing left over from an earlier player
+  echo "$$" > "$PLAYER_PID"
+fi
+WAKE=0                                          # an audiobook can take a while: keep the phone awake
+if [ "$ext" = m4b ] && command -v termux-wake-lock >/dev/null && termux-wake-lock >/dev/null 2>&1; then WAKE=1; fi
+engine_start
+if [ "$ui" = tui ]; then
+  TUI_TITLE=$name; TUI_INFO="$(voice_label "$voice") · ${speed}×"; TUI_SPEED=$speed; tui_open
+fi
+
+i=$start
+while :; do
+  # The engine starts over at part 1 if a bookmark points past the end (the text changed).
+  [ "$i" = "$start" ] && [ -f "$tmpd/stream/first" ] && { read -r i < "$tmpd/stream/first" || i=$start; start=$i; was_parts=0; }
+  f="$(printf '%s/stream/%04d.wav' "$tmpd" "$i")"
+  if [ "$play" = 1 ] && [ -f "$f" ]; then
+    play_line "$f" "$i"
+    if [ -n "$JUMP" ]; then jump_to "$JUMP"; JUMP=""; continue; fi
+    i=$((i + 1))
+    if sleep_due "$i"; then SLEPT=1; bookmark_save "$i"; exit "$QUIT_RC"; fi   # the sleep timer: stop between parts
+  elif [ "$play" = 1 ] && [ -f "$tmpd/stream/end" ]; then
+    [ -f "$f" ] && continue   # a last chunk may have landed just now
+    break
+  elif ! kill -0 "$gen_pid" 2>/dev/null; then
+    [ "$play" = 1 ] && [ -f "$f" ] && continue
+    break
+  else
+    view_state "$(waiting_label)" "$(progress)"
+    view_refresh
+    tick 0.1
+    if [ -n "$KEY" ]; then
+      key_cmd; [ "$CMD" = quit ] && exit "$QUIT_RC"
+      [ -n "$CMD" ] && listen_cmd "$CMD" "$i" && [ -n "$JUMP" ] && { jump_to "$JUMP"; JUMP=""; }
+      case "$CMD_PENDING" in quit) exit "$QUIT_RC" ;; home) go_home ;; esac   # (chosen in the menu)
+      CMD_PENDING="${CMD_PENDING/toggle/}"
+    fi
+  fi
+done
+rc=0; wait "$gen_pid" || rc=$?
+gen_pid=""
+tui_close
+status_clear
+if [ "$play" = 1 ] && [ "$rc" = 0 ]; then bookmark_done; book_id=""; fi   # read to the end: no bookmark
+
+if [ "$rc" != 0 ]; then
+  msg="$(grep -m1 '^Error: ' "$tmpd/engine.log" | sed 's/^Error: //')" || true
+  [ "$msg" = "Cancelled" ] && exit 130
+  if [ -n "$msg" ]; then die "$msg"; fi
+  printf '%s✗%s Something went wrong:\n' "$RED" "$R" >&2
+  tail -n 5 "$tmpd/engine.log" | sed "s/^/  $D/; s/\$/$R/" >&2
+  exit 1
+fi
+
+secs=""
+if [ -f "$tmpd/result" ] && read -r a _ < "$tmpd/result"; then secs="$(human_secs "$a") of audio"; fi
+
+if [ "$ext" = m4b ]; then
+  [ -f "$tmpd/out.wav" ] || die "No audio was made."
+  make_audiobook "$tmpd/out.wav" "$tmpd/book.m4b"
+  mv "$tmpd/book.m4b" "$out"
+  chapters=$(( $(wc -l < "$tmpd/chapters_ms" 2>/dev/null || echo 0) ))
+  [ "$chapters" -gt 1 ] && secs="${secs:+$secs · }$chapters chapters"
+  ext=saved
+fi
+if [ -n "$out" ]; then
+  [ "$ext" = saved ] || { [ -f "$tmpd/out.$ext" ] || die "No audio was made."; mv "$tmpd/out.$ext" "$out"; }
+  if [ "$LIVE" = 1 ]; then
+    size="$(human_size "$(stat -c %s "$out" 2>/dev/null || wc -c < "$out")")"
+    done_msg "Saved ${B}$out${R}" "${secs:+$secs · }$size"
+  else
+    echo "Saved $out" >&2
+  fi
+elif [ "$LIVE" = 1 ]; then
+  done_msg "Done" "$secs"
+fi
+__KOKOMUX_FILE__
+cat > "$WORK/theme.sh" <<'__KOKOMUX_FILE__'
+# kokomux: colours. Sourced by `kokoro` and built into the installer (bash).
+# shellcheck shell=bash disable=SC2034  # the colours are used by whoever sources this
+#
+#   theme_apply [screen]   set the colours below for the terminal (or, with
+#                          "screen", for a full-screen view, which may paint
+#                          its own background)
+#   theme_detect           ask the terminal what its colours are (OSC 10/11)
+#   theme_grad N           GRAD: N colours from violet to cyan (the logo)
+#   theme_tone LEVEL       REPLY: the text colour faded to LEVEL thousandths
+#                          (the reader's focus effect)
+#
+# One palette for dark and light, derived from the terminal's own background:
+# every grey is the background moved part of the way towards the text colour,
+# in steps of the golden ratio (φ = 1.618…). Each step is φ times the one
+# before it, so the levels read as evenly spaced, and there are only five:
+#
+#   φ⁻¹  .618  D      secondary text: hints, labels, what's still to be read
+#   φ⁻²  .382  LINE   rules, the progress bar's track
+#   φ⁻³  .236  GHOST  the logo's texture; PSEL, a selected row on a panel
+#   φ⁻⁴  .146  SURF   buttons and panels; SEL, a selected row (accent-tinted)
+#   ½          PAST   what's already been heard: it recedes, but stays legible
+#
+# The accents (violet ACC, sky ACC2, GRN, RED, YEL) come in a dark and a light
+# set, each checked against the backgrounds of popular terminal themes
+# (tests/test_theme.py): text ≥ 10:1, accents and secondary text ≈ 4.5:1 or
+# better. The word being spoken (HL) sits on the background moved φ⁻² of the
+# way towards the accent: soft, but clearly lit.
+#
+# KOKORO_THEME picks: auto (follow the terminal), dark or light. A full-screen
+# view on a terminal of the other kind paints its own background; plain
+# command-line output always follows the terminal, since it can't.
+
+THEME_STEPS=(1000 618 382 236 146 90)            # φ⁻ⁿ, in thousandths
+# φ^(−i/4), in thousandths: a falloff in quarter golden steps (the focus effect)
+THEME_DECAY=(1000 887 786 697 618 548 486 431 382 339 300 266 236 209 186 165 146 129 115 102
+             90 80 71 63 56 49 44 39 34 31 27 24 21 19 17 15 13 12 10 9 8)
+declare -gA THEME_TONES=()            # theme_tone's colours, by level
+# name:   background  text    violet  sky     green   red     amber   cyan (logo end)
+THEME_DARK=(16151d    e8e6f0  b69cff  7cd0f5  86d39a  ff7a7a  efc764  9ff0ec)
+THEME_LIGHT=(fbfaf8   1c1b22  6438c9  0b67a0  21743a  c0262d  855300  0f7c86)
+THEME_TERM_BG=""; THEME_TERM_FG=""    # the terminal's colours as rrggbb (asked, or remembered)
+THEME_ASKED=0                         # 1 once theme_detect has asked, this run
+THEME_MODE=dark; THEME_PAINT=0; THEME_TERM_MODE=""; THEME_TRUE=0; THEME_ON=0
+THEME_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/kokomux/theme"
+
+# --------------------------------------------------------------- colour maths
+# Colours are rrggbb strings; results come back in REPLY (no subshells: this
+# runs every time kokoro starts).
+
+theme_mix() {    # theme_mix A B T: A moved T thousandths of the way to B
+  local a=$1 b=$2 t=$3 i x y out=""
+  for i in 0 2 4; do
+    x=$(( 16#${a:i:2} )) y=$(( 16#${b:i:2} ))
+    printf -v out '%s%02x' "$out" $(( x + ((y - x) * t + ((y - x) * t >= 0 ? 500 : -500)) / 1000 ))
+  done
+  REPLY=$out
+}
+
+theme_luma() {   # theme_luma RGB: perceived brightness, 0 to 255
+  REPLY=$(( (2126 * 16#${1:0:2} + 7152 * 16#${1:2:2} + 722 * 16#${1:4:2}) / 10000 ))
+}
+
+theme_sgr() {    # theme_sgr 38|48 RGB: the SGR parameters for that colour (REPLY)
+  local r=$(( 16#${2:0:2} )) g=$(( 16#${2:2:2} )) b=$(( 16#${2:4:2} ))
+  if [ "$THEME_TRUE" = 1 ]; then REPLY="$1;2;$r;$g;$b"; return 0; fi
+  # The nearest of the 256 colours: the 6×6×6 cube or the 24 greys.
+  local -a lv=(0 95 135 175 215 255)
+  local ri gi bi k v d1 d2 grey
+  for k in r g b; do
+    v=${!k}; if [ "$v" -lt 48 ]; then v=0; elif [ "$v" -lt 115 ]; then v=1; else v=$(( (v - 35) / 40 )); fi
+    printf -v "${k}i" '%s' "$v"
+  done
+  d1=$(( (r - lv[ri]) ** 2 + (g - lv[gi]) ** 2 + (b - lv[bi]) ** 2 ))
+  grey=$(( (r + g + b) / 3 )); k=$(( grey > 238 ? 23 : (grey < 8 ? 0 : (grey - 3) / 10) ))
+  v=$(( 8 + 10 * k ))
+  d2=$(( (r - v) ** 2 + (g - v) ** 2 + (b - v) ** 2 ))
+  if [ "$d2" -lt "$d1" ]; then REPLY="$1;5;$(( 232 + k ))"; else REPLY="$1;5;$(( 16 + 36 * ri + 6 * gi + bi ))"; fi
+}
+
+theme_fg() { theme_sgr 38 "$1"; REPLY=$'\033['"$REPLY"m; }   # theme_fg RGB: REPLY = the escape for that text colour
+theme_bg() { theme_sgr 48 "$1"; REPLY=$'\033['"$REPLY"m; }   # theme_bg RGB: REPLY = the escape for that background
+
+# --------------------------------------------------------------- the terminal
+
+theme_truecolor() {   # does the terminal show 24-bit colour?
+  case "${KOKORO_TRUECOLOR:-}" in 1) return 0 ;; 0) return 1 ;; esac
+  case "${COLORTERM:-}" in truecolor|24bit) return 0 ;; esac
+  [ -n "${TERMUX_VERSION:-}" ] && return 0                  # Termux has 24-bit colour
+  case "${TERM_PROGRAM:-}" in iTerm.app|WezTerm|vscode|ghostty) return 0 ;; esac
+  case "${TERM:-}" in *-direct|xterm-kitty|alacritty|foot*|wezterm) return 0 ;; esac
+  return 1
+}
+
+theme_detect() { # ask the terminal for its background and text colours
+  # OSC 11 and 10 ask; DA1 (which every terminal answers) marks the end of the
+  # replies, so a terminal that doesn't know OSC 11 costs no waiting.
+  local fd saved="" buf="" c n=0 hex x wait=1 got=0
+  THEME_ASKED=1
+  [ -t 2 ] || return 1
+  { exec {fd}<>/dev/tty; } 2>/dev/null || return 1
+  saved="$(stty -g <&"$fd" 2>/dev/null)" || saved=""
+  stty -echo -icanon <&"$fd" 2>/dev/null || true
+  printf '\033]11;?\033\\\033]10;?\033\\\033[c' >&"$fd"
+  while [ "$n" -lt 160 ] && IFS= read -r -s -n1 -t "$wait" -u "$fd" c; do
+    buf+=$c; n=$(( n + 1 )) wait=0.2                    # the first reply may take a moment
+    [[ "$buf" =~ $'\033'\[\?[0-9\;]*c$ ]] && break
+  done
+  [ -n "$saved" ] && stty "$saved" <&"$fd" 2>/dev/null
+  exec {fd}>&-
+  for x in 11 10; do
+    [[ "$buf" =~ \]$x\;rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+) ]] || continue
+    hex=""
+    for c in "${BASH_REMATCH[@]:1:3}"; do              # 1 to 4 hex digits per channel
+      [ "${#c}" = 1 ] && c="$c$c"
+      hex+="${c:0:2}"
+    done
+    hex=${hex,,}
+    if [ "$x" = 11 ]; then THEME_TERM_BG=$hex got=1; else THEME_TERM_FG=$hex; fi
+  done
+  [ "$got" = 1 ] || return 1                          # no answer: what we remembered stands
+  # Remember it, so plain command-line output can follow the terminal too.
+  if [ "$(cat "$THEME_CACHE" 2>/dev/null)" != "$THEME_TERM_BG $THEME_TERM_FG" ]; then
+    mkdir -p "${THEME_CACHE%/*}" 2>/dev/null && printf '%s %s\n' "$THEME_TERM_BG" "$THEME_TERM_FG" > "$THEME_CACHE" 2>/dev/null
+  fi
+  return 0
+}
+
+theme_term() {   # THEME_TERM_MODE (dark, light or "") and THEME_TERM_BG, from what we know
+  local f="" bgi
+  if [ -z "$THEME_TERM_BG" ] && [ -f "$THEME_CACHE" ]; then
+    read -r f _ < "$THEME_CACHE" 2>/dev/null || f=""
+    [[ "$f" =~ ^[0-9a-f]{6}$ ]] && THEME_TERM_BG=$f
+  fi
+  THEME_TERM_MODE=""
+  if [ -n "$THEME_TERM_BG" ]; then
+    theme_luma "$THEME_TERM_BG"; if [ "$REPLY" -ge 128 ]; then THEME_TERM_MODE=light; else THEME_TERM_MODE=dark; fi
+  elif [[ "${COLORFGBG:-}" =~ ([0-9]+)$ ]]; then          # "15;0": text white, background black
+    bgi=${BASH_REMATCH[1]}
+    if [ "$bgi" = 7 ] || [ "$bgi" -ge 9 ]; then THEME_TERM_MODE=light; else THEME_TERM_MODE=dark; fi
+  fi
+}
+
+# --------------------------------------------------------------- the palette
+
+theme_off() {    # no colours (not a terminal, or NO_COLOR)
+  R="" B="" D="" PAST="" LINE="" GHOST="" ACC="" ACC2="" GRN="" RED="" YEL=""
+  HL="" SURF="" SEL="" PSEL="" BASE="" ACC_SGR="" D_SGR=""
+  THEME_ON=0
+}
+
+# shellcheck disable=SC2120  # (the installer calls it without "screen")
+theme_apply() {  # theme_apply [screen]
+  local want=${KOKORO_THEME:-auto} screen=${1:-} bg fg
+  local -a p
+  case "$want" in dark|light) ;; *) want=auto ;; esac
+  theme_term
+  THEME_PAINT=0
+  if [ "$want" != auto ] && [ "$screen" = screen ]; then
+    THEME_MODE=$want
+    [ "$THEME_TERM_MODE" = "$want" ] || THEME_PAINT=1           # paint our own canvas
+  elif [ -n "$THEME_TERM_MODE" ]; then THEME_MODE=$THEME_TERM_MODE
+  elif [ "$want" != auto ]; then THEME_MODE=$want                # the best guess we have
+  else THEME_MODE=dark; fi
+  if [ "$THEME_MODE" = light ]; then p=("${THEME_LIGHT[@]}"); else p=("${THEME_DARK[@]}"); fi
+  # The greys are made from the real background when we know it, and always
+  # lead towards the palette's own text colour, so they keep their contrast
+  # even with a low-contrast terminal theme.
+  bg=${p[0]} fg=${p[1]}
+  [ "$THEME_PAINT" = 0 ] && [ -n "$THEME_TERM_BG" ] && [ "$THEME_TERM_MODE" = "$THEME_MODE" ] && bg=$THEME_TERM_BG
+  THEME_BG=$bg THEME_FG=$fg THEME_ACC=${p[2]} THEME_END=${p[7]}
+  THEME_TONES=()
+  if theme_truecolor; then THEME_TRUE=1; else THEME_TRUE=0; fi
+
+  R=$'\033[0m' B=$'\033[1m' BASE=""
+  if [ "$THEME_PAINT" = 1 ]; then
+    theme_bg "$bg"; BASE=$REPLY; theme_fg "$fg"; BASE+=$REPLY
+    R+=$BASE                                    # a reset goes back to our canvas
+  fi
+  theme_mix "$bg" "$fg" "${THEME_STEPS[1]}"; theme_fg "$REPLY"; D=$REPLY
+  D_SGR=${D#$'\033['}; D_SGR=${D_SGR%m}
+  theme_mix "$bg" "$fg" 500;                  theme_fg "$REPLY"; PAST=$REPLY
+  theme_mix "$bg" "$fg" "${THEME_STEPS[2]}"; theme_fg "$REPLY"; LINE=$REPLY
+  theme_mix "$bg" "$fg" "${THEME_STEPS[3]}"; theme_fg "$REPLY"; GHOST=$REPLY
+  theme_mix "$bg" "$fg" "${THEME_STEPS[4]}"; theme_bg "$REPLY"; SURF=$REPLY
+  local tint; theme_mix "$fg" "${p[2]}" "${THEME_STEPS[1]}"; tint=$REPLY
+  theme_mix "$bg" "$tint" "${THEME_STEPS[4]}"; theme_bg "$REPLY"; SEL=$REPLY
+  theme_mix "$bg" "$tint" "${THEME_STEPS[3]}"; theme_bg "$REPLY"; PSEL=$REPLY
+  theme_mix "$bg" "${p[2]}" "${THEME_STEPS[2]}"; theme_bg "$REPLY"; HL=$REPLY
+  theme_fg "$fg"; HL+=$REPLY
+  theme_fg "${p[2]}"; ACC=$REPLY; ACC_SGR=${ACC#$'\033['}; ACC_SGR=${ACC_SGR%m}
+  theme_fg "${p[3]}"; ACC2=$REPLY
+  theme_fg "${p[4]}"; GRN=$REPLY
+  theme_fg "${p[5]}"; RED=$REPLY
+  theme_fg "${p[6]}"; YEL=$REPLY
+  THEME_ON=1
+}
+
+theme_grad() {   # theme_grad N: GRAD, N colours from the accent to the logo's cyan
+  local n=$1 k
+  GRAD=()
+  for (( k = 0; k < n; k++ )); do
+    theme_mix "$THEME_ACC" "$THEME_END" $(( n > 1 ? k * 1000 / (n - 1) : 0 ))
+    theme_fg "$REPLY"; GRAD+=("$REPLY")
+  done
+}
+
+theme_tone() {   # theme_tone LEVEL: REPLY = the text colour, LEVEL thousandths of the way from the background
+  local k=$(( ($1 + 5) / 10 * 10 ))                # in steps of 1%, so there are few to remember
+  if [ -z "${THEME_TONES[$k]+x}" ]; then
+    theme_mix "$THEME_BG" "$THEME_FG" "$k"; theme_fg "$REPLY"; THEME_TONES[$k]=$REPLY
+  fi
+  REPLY=${THEME_TONES[$k]}
+}
+
+theme_name() {   # what the settings menu shows beside "Colours"
+  case "${KOKORO_THEME:-auto}" in
+    dark) REPLY="Dark" ;; light) REPLY="Light" ;;
+    *) REPLY="Auto" ;;
+  esac
+}
+__KOKOMUX_FILE__
+cat > "$WORK/tui.sh" <<'__KOKOMUX_FILE__'
 # kokomux: the full-screen interface. Sourced by `kokoro` (bash).
 # shellcheck shell=bash disable=SC2034,SC2153,SC2154  # shares its globals with kokoro
 #
@@ -3098,9 +2379,8 @@ tui_voices() {   # tui_voices [blend]: the voice picker: type to filter, Space t
     esac
   done
 }
-__KOKOMUX_TUI__
-
-cat > "$WORK/player.sh" <<'__KOKOMUX_PLAYER__'
+__KOKOMUX_FILE__
+cat > "$WORK/player.sh" <<'__KOKOMUX_FILE__'
 # kokomux: the player. Sourced by `kokoro` (bash) once a listening run is set up.
 # shellcheck shell=bash disable=SC2034,SC2153,SC2154  # shares its globals with kokoro
 #
@@ -3125,7 +2405,7 @@ cat > "$WORK/player.sh" <<'__KOKOMUX_PLAYER__'
 # Expects from kokoro: the run's globals (tmpd, play, ui, show_words, voice,
 # speed, lang, name, kind, source, text, book_id, start, i), CACHE, QUIT_RC,
 # the colours (HL), status/status_clear, die, tick, now_ms, cleanup,
-# write_job and run_engine.
+# write_job and engine_start.
 
 # ------------------------------------------------------------ the line being heard
 # Each line is printed wrapped to the screen while it plays, and a soft
@@ -3141,10 +2421,15 @@ w_s=(); w_e=(); w_a=(); w_b=(); w_state=none
 TERM_ROWS=24
 in_line=0
 
+parts_total() {  # parts_total [DEFAULT]: PARTS = how many parts the engine has found (DEFAULT, or 1, before it says)
+  PARTS=${1:-1}
+  [ -f "$tmpd/progress" ] && { read -r _ PARTS < "$tmpd/progress" || PARTS=${1:-1}; }
+  [[ "$PARTS" =~ ^[0-9]+$ ]] || PARTS=${1:-1}
+  return 0
+}
 part_of() {      # PART="part I of N · " while a job has more than one part
-  local parts=1
-  [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
-  PART=""; [ "${parts:-1}" -gt 1 ] && PART="part $1 of $parts · "
+  parts_total
+  PART=""; [ "$PARTS" -gt 1 ] && PART="part $1 of $PARTS · "
   return 0
 }
 
@@ -3199,14 +2484,13 @@ block_finish() { # the whole line as read, nothing lit (it stays on screen as a 
 
 # The view the player draws through: the full-screen reader or the inline block.
 view_part() {    # view_part IDX BASE: a part starts playing
-  local parts=1
   if [ "$ui" = tui ]; then
-    [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
+    parts_total
     TUI_TITLE=${book_title:-$name}
     chapters_load; chapter_of "$1"
     TUI_CHAPTER=""; [ "$CH" -ge 0 ] && TUI_CHAPTER=${CH_TITLE[CH]}
     TUI_HAS_CHAPTERS=$(( ${#CH_START[@]} > 1 )); [ -n "$NOVEL" ] && TUI_HAS_CHAPTERS=1
-    tui_part "$1" "$parts"
+    tui_part "$1" "$PARTS"
     [ "$w_state" = off ] && tui_light -1 -1
   elif [ "$show_words" = 1 ]; then
     block_load "$2.txt"; status_clear
@@ -3241,23 +2525,21 @@ book_title=""
 title_get() { [ -n "$book_title" ] || { [ -f "$tmpd/title" ] && read -r book_title < "$tmpd/title"; } || true; }   # book_title, from the engine's title file once it's there
 
 bookmark_save() {   # bookmark_save PART: so the same command, or kokoro --continue, picks up here
-  local parts=1
   echo "$1" > "$tmpd/at"                                  # (where the player is: a novel's engine waits for it)
   novel_load
   [ -n "$book_id" ] || return 0
   if [ -n "$NOVEL" ]; then novel_mark "$1"; return 0; fi
-  [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=1; }
-  [ "${parts:-1}" -gt 1 ] || return 0                     # nothing to come back to
+  parts_total
+  [ "$PARTS" -gt 1 ] || return 0                          # nothing to come back to
   [ -d "$BOOKS" ] || mkdir -p "$BOOKS"
   [ "$kind" = text ] && [ ! -f "$BOOKS/$book_id.txt" ] && cp "$text" "$BOOKS/$book_id.txt"
   printf 'part=%s\nparts=%s\ntitle=%s\nkind=%s\nsource=%s\nvoice=%s\nspeed=%s\nlang=%s\n' \
-    "$1" "$parts" "${book_title:-$name}" "$kind" "$source" "$voice" "$speed" "$lang" > "$BOOKS/$book_id.mark"
+    "$1" "$PARTS" "${book_title:-$name}" "$kind" "$source" "$voice" "$speed" "$lang" > "$BOOKS/$book_id.mark"
 }
 bookmark_done() {  # read to the end: the bookmark and the book's kept audio go
   if [ -n "$NOVEL" ]; then                                # a novel stays on the shelf, up to date
-    local last=1
-    [ -f "$tmpd/progress" ] && { read -r _ last < "$tmpd/progress" || last=1; }
-    novel_mark "$last" "done"
+    parts_total
+    novel_mark "$PARTS" "done"
     info "You're up to date with ${book_title:-$name}: ${N_LABEL:-that} is the latest chapter."
     printf '  %skokoro --continue carries on once the next one is out.%s\n' "$D" "$R" >&2
     return 0
@@ -3283,13 +2565,13 @@ novel_load() {   # once the engine says it's a web novel: NOVEL, and the novel's
   title_get
 }
 novel_at() {     # novel_at PART: the chapter PART is in: N_URL N_FIRST N_NUM N_LABEL, and N_PARTS (its length)
-  local k total=0
+  local k
   chapter_of "$1"; k=$CH; [ "$k" -ge 0 ] || k=0
   N_URL=${NV_URL[k]:-$url} N_FIRST=${CH_START[k]:-1} N_NUM=${NV_NUM[k]:-} N_LABEL=${CH_TITLE[k]:-}
   if [ $(( k + 1 )) -lt "${#CH_START[@]}" ]; then N_PARTS=$(( CH_START[k + 1] - N_FIRST ))
   else
-    [ -f "$tmpd/progress" ] && { read -r _ total < "$tmpd/progress" || total=0; }
-    N_PARTS=$(( ${total:-0} - N_FIRST + 1 ))
+    parts_total 0
+    N_PARTS=$(( PARTS - N_FIRST + 1 ))
   fi
   [ "$N_PARTS" -gt 0 ] || N_PARTS=1
   return 0
@@ -3404,17 +2686,29 @@ sleep_due() {    # sleep_due NEXT_PART: is it time to stop, before NEXT_PART sta
 # reading again at a part: a fresh job folder, so the old job sees its folder
 # go and stops, and the engine picks up from there.
 JUMP=""
-jump_to() {      # jump_to PART
-  local old=$tmpd target=$1 f
-  mpv_stop
+engine_stop() {  # stop this listen's engine, if it's running
   if [ -n "$gen_pid" ]; then kill "$gen_pid" 2>/dev/null || true; wait "$gen_pid" 2>/dev/null || true; gen_pid=""; fi
-  tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
-  for f in in.txt title chapters serial novel progress; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
-  rm -rf "$old"
-  start=$target; i=$target; was_parts=0          # (a part in this run's own numbering)
+  return 0
+}
+engine_start() { # write the job and run it in the background (gen_pid), its messages in engine.log
   write_job
-  bookmark_save "$target"                        # (stopped before it plays, it still picks up there)
   run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
+}
+job_fork() {     # a fresh job folder ($tmpd) with what the engine found in the last one (FORKED_FROM, still there)
+  local f
+  engine_stop
+  FORKED_FROM=$tmpd
+  tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
+  for f in in.txt title chapters serial novel progress plan; do [ -f "$FORKED_FROM/$f" ] && cp "$FORKED_FROM/$f" "$tmpd/"; done
+  return 0
+}
+jump_to() {      # jump_to PART
+  local target=$1
+  mpv_stop
+  job_fork; rm -rf "$FORKED_FROM"
+  start=$target; i=$target; was_parts=0          # (a part in this run's own numbering)
+  bookmark_save "$target"                        # (stopped before it plays, it still picks up there)
+  engine_start
   if [ "$ui" = tui ]; then tui_hist=(); TUI_PART=0; TUI_WRAP=(); TUI_OFFS=(); TUI_INFO="$(voice_label "$voice") · ${speed}×"; TUI_SPEED=$speed; tui_draw; fi
 }
 
@@ -3423,27 +2717,24 @@ jump_to() {      # jump_to PART
 # which Kokoro speaks more naturally than a stretched recording. The parts
 # already heard stay on screen.
 speed_now() {    # speed_now PART: (while PART plays) $speed from this moment on
-  local at=$1 idx=${MPV_IDX[$1]} old=$tmpd parts=0 n f e files=() ratio
+  local at=$1 idx=${MPV_IDX[$1]} n f e files=() ratio
   ratio="$(awk -v a="$speed" -v b="${MPV_SPD[idx]}" 'BEGIN { printf "%.4f", a / b }')"
   mpv_send "\"set_property\",\"file-local-options/speed\",$ratio"
   mpv_send '"playlist-clear"'                   # (the parts queued after it were made at the old speed)
   MPV_IDX=(["$at"]=0); MPV_PART=("$at"); MPV_SPD=("${MPV_SPD[idx]}"); MPV_N=1; MPV_POS=0; MPV_MAX=0
   MPV_RATE=$(( 10#${ratio%.*} * 1000 + 10#${ratio#*.} / 10 )) MPV_RATE_IDX=0   # (its clock runs at that rate now)
-  [ -f "$tmpd/progress" ] && { read -r _ parts < "$tmpd/progress" || parts=0; }
-  if [ "${parts:-0}" -gt "$at" ] || { [ -n "$NOVEL" ] && [ ! -f "$tmpd/stream/end" ]; }; then   # (a novel: more may come)
-    if [ -n "$gen_pid" ]; then kill "$gen_pid" 2>/dev/null || true; wait "$gen_pid" 2>/dev/null || true; gen_pid=""; fi
-    tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
-    for f in in.txt title chapters serial novel progress; do [ -f "$old/$f" ] && cp "$old/$f" "$tmpd/"; done
+  parts_total 0
+  if [ "$PARTS" -gt "$at" ] || { [ -n "$NOVEL" ] && [ ! -f "$tmpd/stream/end" ]; }; then   # (a novel: more may come)
+    job_fork
     mkdir "$tmpd/stream"
     for (( n = at > 40 ? at - 40 : 1; n <= at; n++ )); do   # this part and the ones on screen above it
-      printf -v f '%s/stream/%04d' "$old" "$n"
+      printf -v f '%s/stream/%04d' "$FORKED_FROM" "$n"
       for e in txt words wav; do [ -e "$f.$e" ] && files+=("$f.$e"); done
     done
     [ "${#files[@]}" = 0 ] || mv -f "${files[@]}" "$tmpd/stream/"
-    rm -rf "$old"                               # (the old job sees its folder go and stops)
+    rm -rf "$FORKED_FROM"
     start=$(( at + 1 )); was_parts=0
-    write_job
-    run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
+    engine_start
   fi
   bookmark_save "$at"
   if [ "$ui" = tui ]; then TUI_INFO="$(voice_label "$voice") · ${speed}×"; TUI_SPEED=$speed; tui_draw; fi
@@ -3706,449 +2997,71 @@ play_line() {    # play_line WAV IDX: hear one part; light its words; obey pause
   TICK_BG=""; in_line=0
   view_part_end
 }
-__KOKOMUX_PLAYER__
-
-cat > "$WORK/theme.sh" <<'__KOKOMUX_THEME__'
-# kokomux: colours. Sourced by `kokoro` and built into the installer (bash).
-# shellcheck shell=bash disable=SC2034  # the colours are used by whoever sources this
+__KOKOMUX_FILE__
+cat > "$WORK/commands.sh" <<'__KOKOMUX_FILE__'
+# kokomux: the admin commands. Sourced by `kokoro` (bash).
+# shellcheck shell=bash disable=SC2034,SC2153,SC2154  # shares its globals with kokoro
 #
-#   theme_apply [screen]   set the colours below for the terminal (or, with
-#                          "screen", for a full-screen view, which may paint
-#                          its own background)
-#   theme_detect           ask the terminal what its colours are (OSC 10/11)
-#   theme_grad N           GRAD: N colours from violet to cyan (the logo)
-#   theme_tone LEVEL       REPLY: the text colour faded to LEVEL thousandths
-#                          (the reader's focus effect)
+#   kokoro --help, --status, --settings, --config, --list-voices
+#   kokoro --add, --queue [list|skip|clear]      the queue: shared links and files, in order
+#   kokoro --continue [MARK]                     carry on with a bookmark (the last one)
+#   kokoro --serve, --benchmark, --update, --uninstall
 #
-# One palette for dark and light, derived from the terminal's own background:
-# every grey is the background moved part of the way towards the text colour,
-# in steps of the golden ratio (φ = 1.618…). Each step is φ times the one
-# before it, so the levels read as evenly spaced, and there are only five:
+# Each cmd_* function takes the whole command line ($1 is the option itself)
+# and exits; `kokoro` calls the one its first argument names (admin_cmd).
 #
-#   φ⁻¹  .618  D      secondary text: hints, labels, what's still to be read
-#   φ⁻²  .382  LINE   rules, the progress bar's track
-#   φ⁻³  .236  GHOST  the logo's texture; PSEL, a selected row on a panel
-#   φ⁻⁴  .146  SURF   buttons and panels; SEL, a selected row (accent-tinted)
-#   ½          PAST   what's already been heard: it recedes, but stays legible
+# Sections: help, the queue, bookmarks, the server, keeping kokomux up to date.
 #
-# The accents (violet ACC, sky ACC2, GRN, RED, YEL) come in a dark and a light
-# set, each checked against the backgrounds of popular terminal themes
-# (tests/test_theme.py): text ≥ 10:1, accents and secondary text ≈ 4.5:1 or
-# better. The word being spoken (HL) sits on the background moved φ⁻² of the
-# way towards the accent: soft, but clearly lit.
-#
-# KOKORO_THEME picks: auto (follow the terminal), dark or light. A full-screen
-# view on a terminal of the other kind paints its own background; plain
-# command-line output always follows the terminal, since it can't.
+# Expects from kokoro: the settings, the paths (CONF BOOKS QUEUE QUEUE_DIR
+# CACHE SRV_DIR PLAYER_STATE), the colours, die/info/done_msg/status,
+# server_up/start_server/stop_server, control, stop_playback, mark_get, and
+# from tui.sh conf_set, tui_settings.
 
-THEME_STEPS=(1000 618 382 236 146 90)            # φ⁻ⁿ, in thousandths
-# φ^(−i/4), in thousandths: a falloff in quarter golden steps (the focus effect)
-THEME_DECAY=(1000 887 786 697 618 548 486 431 382 339 300 266 236 209 186 165 146 129 115 102
-             90 80 71 63 56 49 44 39 34 31 27 24 21 19 17 15 13 12 10 9 8)
-declare -gA THEME_TONES=()            # theme_tone's colours, by level
-# name:   background  text    violet  sky     green   red     amber   cyan (logo end)
-THEME_DARK=(16151d    e8e6f0  b69cff  7cd0f5  86d39a  ff7a7a  efc764  9ff0ec)
-THEME_LIGHT=(fbfaf8   1c1b22  6438c9  0b67a0  21743a  c0262d  855300  0f7c86)
-THEME_TERM_BG=""; THEME_TERM_FG=""    # the terminal's colours as rrggbb (asked, or remembered)
-THEME_ASKED=0                         # 1 once theme_detect has asked, this run
-THEME_MODE=dark; THEME_PAINT=0; THEME_TERM_MODE=""; THEME_TRUE=0; THEME_ON=0
-THEME_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/kokomux/theme"
-
-# --------------------------------------------------------------- colour maths
-# Colours are rrggbb strings; results come back in REPLY (no subshells: this
-# runs every time kokoro starts).
-
-theme_mix() {    # theme_mix A B T: A moved T thousandths of the way to B
-  local a=$1 b=$2 t=$3 i x y out=""
-  for i in 0 2 4; do
-    x=$(( 16#${a:i:2} )) y=$(( 16#${b:i:2} ))
-    printf -v out '%s%02x' "$out" $(( x + ((y - x) * t + ((y - x) * t >= 0 ? 500 : -500)) / 1000 ))
-  done
-  REPLY=$out
-}
-
-theme_luma() {   # theme_luma RGB: perceived brightness, 0 to 255
-  REPLY=$(( (2126 * 16#${1:0:2} + 7152 * 16#${1:2:2} + 722 * 16#${1:4:2}) / 10000 ))
-}
-
-theme_sgr() {    # theme_sgr 38|48 RGB: the SGR parameters for that colour (REPLY)
-  local r=$(( 16#${2:0:2} )) g=$(( 16#${2:2:2} )) b=$(( 16#${2:4:2} ))
-  if [ "$THEME_TRUE" = 1 ]; then REPLY="$1;2;$r;$g;$b"; return 0; fi
-  # The nearest of the 256 colours: the 6×6×6 cube or the 24 greys.
-  local -a lv=(0 95 135 175 215 255)
-  local ri gi bi k v d1 d2 grey
-  for k in r g b; do
-    v=${!k}; if [ "$v" -lt 48 ]; then v=0; elif [ "$v" -lt 115 ]; then v=1; else v=$(( (v - 35) / 40 )); fi
-    printf -v "${k}i" '%s' "$v"
-  done
-  d1=$(( (r - lv[ri]) ** 2 + (g - lv[gi]) ** 2 + (b - lv[bi]) ** 2 ))
-  grey=$(( (r + g + b) / 3 )); k=$(( grey > 238 ? 23 : (grey < 8 ? 0 : (grey - 3) / 10) ))
-  v=$(( 8 + 10 * k ))
-  d2=$(( (r - v) ** 2 + (g - v) ** 2 + (b - v) ** 2 ))
-  if [ "$d2" -lt "$d1" ]; then REPLY="$1;5;$(( 232 + k ))"; else REPLY="$1;5;$(( 16 + 36 * ri + 6 * gi + bi ))"; fi
-}
-
-theme_fg() { theme_sgr 38 "$1"; REPLY=$'\033['"$REPLY"m; }   # theme_fg RGB: REPLY = the escape for that text colour
-theme_bg() { theme_sgr 48 "$1"; REPLY=$'\033['"$REPLY"m; }   # theme_bg RGB: REPLY = the escape for that background
-
-# --------------------------------------------------------------- the terminal
-
-theme_truecolor() {   # does the terminal show 24-bit colour?
-  case "${KOKORO_TRUECOLOR:-}" in 1) return 0 ;; 0) return 1 ;; esac
-  case "${COLORTERM:-}" in truecolor|24bit) return 0 ;; esac
-  [ -n "${TERMUX_VERSION:-}" ] && return 0                  # Termux has 24-bit colour
-  case "${TERM_PROGRAM:-}" in iTerm.app|WezTerm|vscode|ghostty) return 0 ;; esac
-  case "${TERM:-}" in *-direct|xterm-kitty|alacritty|foot*|wezterm) return 0 ;; esac
+admin_cmd() {    # admin_cmd ARGS...: run the admin command ARGS names (returns 1 if it's not one)
+  case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    --version) echo "kokomux $KOKOMUX_VERSION"; exit 0 ;;
+    --stop) if stop_playback; then done_msg "Stopped."; else info "Nothing is playing."; fi; exit 0 ;;
+    --pause)
+      if [ "$(cat "$PLAYER_STATE" 2>/dev/null)" = paused ]; then control toggle "Playing again."
+      else control toggle "Paused."; fi
+      exit 0 ;;
+    --next) control next "Skipping to the next part."; exit 0 ;;
+    --again) control again "Playing this part again."; exit 0 ;;
+    --add) cmd_add "$@" ;;
+    --queue) cmd_queue "$@" ;;
+    --continue) cmd_continue "$@" ;;
+    --serve) cmd_serve ;;
+    --stop-server) stop_server; exit 0 ;;
+    --benchmark) cmd_benchmark ;;
+    --status) cmd_status ;;
+    --settings) screen_run tui_settings || exec "$0" --status; exit 0 ;;
+    --config)
+      [ -f "$CONF" ] || die "There's no settings file at $(tilde "$CONF")." "Run the installer again to create it."
+      exec "${EDITOR:-nano}" "$CONF" ;;
+    --update) cmd_update "$@" ;;
+    --uninstall) cmd_uninstall ;;
+    --list-voices) cmd_list_voices ;;
+  esac
   return 1
 }
 
-theme_detect() { # ask the terminal for its background and text colours
-  # OSC 11 and 10 ask; DA1 (which every terminal answers) marks the end of the
-  # replies, so a terminal that doesn't know OSC 11 costs no waiting.
-  local fd saved="" buf="" c n=0 hex x wait=1 got=0
-  THEME_ASKED=1
-  [ -t 2 ] || return 1
-  { exec {fd}<>/dev/tty; } 2>/dev/null || return 1
-  saved="$(stty -g <&"$fd" 2>/dev/null)" || saved=""
-  stty -echo -icanon <&"$fd" 2>/dev/null || true
-  printf '\033]11;?\033\\\033]10;?\033\\\033[c' >&"$fd"
-  while [ "$n" -lt 160 ] && IFS= read -r -s -n1 -t "$wait" -u "$fd" c; do
-    buf+=$c; n=$(( n + 1 )) wait=0.2                    # the first reply may take a moment
-    [[ "$buf" =~ $'\033'\[\?[0-9\;]*c$ ]] && break
-  done
-  [ -n "$saved" ] && stty "$saved" <&"$fd" 2>/dev/null
-  exec {fd}>&-
-  for x in 11 10; do
-    [[ "$buf" =~ \]$x\;rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+) ]] || continue
-    hex=""
-    for c in "${BASH_REMATCH[@]:1:3}"; do              # 1 to 4 hex digits per channel
-      [ "${#c}" = 1 ] && c="$c$c"
-      hex+="${c:0:2}"
-    done
-    hex=${hex,,}
-    if [ "$x" = 11 ]; then THEME_TERM_BG=$hex got=1; else THEME_TERM_FG=$hex; fi
-  done
-  [ "$got" = 1 ] || return 1                          # no answer: what we remembered stands
-  # Remember it, so plain command-line output can follow the terminal too.
-  if [ "$(cat "$THEME_CACHE" 2>/dev/null)" != "$THEME_TERM_BG $THEME_TERM_FG" ]; then
-    mkdir -p "${THEME_CACHE%/*}" 2>/dev/null && printf '%s %s\n' "$THEME_TERM_BG" "$THEME_TERM_FG" > "$THEME_CACHE" 2>/dev/null
-  fi
+screen_run() {   # screen_run FUNC: run a full-screen FUNC with keys on, giving the terminal back however it ends (1: no terminal)
+  [ "$LIVE" = 1 ] && [ -t 0 ] || return 1
+  keys_on
+  # However it ends, give back taps and typing (a tap opens Termux's keyboard again).
+  trap 'tui_close; keys_off' EXIT
+  trap 'exit 130' INT TERM HUP
+  "$1"
+  keys_off; trap - EXIT INT TERM HUP
   return 0
 }
 
-theme_term() {   # THEME_TERM_MODE (dark, light or "") and THEME_TERM_BG, from what we know
-  local f="" bgi
-  if [ -z "$THEME_TERM_BG" ] && [ -f "$THEME_CACHE" ]; then
-    read -r f _ < "$THEME_CACHE" 2>/dev/null || f=""
-    [[ "$f" =~ ^[0-9a-f]{6}$ ]] && THEME_TERM_BG=$f
-  fi
-  THEME_TERM_MODE=""
-  if [ -n "$THEME_TERM_BG" ]; then
-    theme_luma "$THEME_TERM_BG"; if [ "$REPLY" -ge 128 ]; then THEME_TERM_MODE=light; else THEME_TERM_MODE=dark; fi
-  elif [[ "${COLORFGBG:-}" =~ ([0-9]+)$ ]]; then          # "15;0": text white, background black
-    bgi=${BASH_REMATCH[1]}
-    if [ "$bgi" = 7 ] || [ "$bgi" -ge 9 ]; then THEME_TERM_MODE=light; else THEME_TERM_MODE=dark; fi
-  fi
-}
-
-# --------------------------------------------------------------- the palette
-
-theme_off() {    # no colours (not a terminal, or NO_COLOR)
-  R="" B="" D="" PAST="" LINE="" GHOST="" ACC="" ACC2="" GRN="" RED="" YEL=""
-  HL="" SURF="" SEL="" PSEL="" BASE="" ACC_SGR="" D_SGR=""
-  THEME_ON=0
-}
-
-theme_apply() {  # theme_apply [screen]
-  local want=${KOKORO_THEME:-auto} screen=${1:-} bg fg
-  local -a p
-  case "$want" in dark|light) ;; *) want=auto ;; esac
-  theme_term
-  THEME_PAINT=0
-  if [ "$want" != auto ] && [ "$screen" = screen ]; then
-    THEME_MODE=$want
-    [ "$THEME_TERM_MODE" = "$want" ] || THEME_PAINT=1           # paint our own canvas
-  elif [ -n "$THEME_TERM_MODE" ]; then THEME_MODE=$THEME_TERM_MODE
-  elif [ "$want" != auto ]; then THEME_MODE=$want                # the best guess we have
-  else THEME_MODE=dark; fi
-  if [ "$THEME_MODE" = light ]; then p=("${THEME_LIGHT[@]}"); else p=("${THEME_DARK[@]}"); fi
-  # The greys are made from the real background when we know it, and always
-  # lead towards the palette's own text colour, so they keep their contrast
-  # even with a low-contrast terminal theme.
-  bg=${p[0]} fg=${p[1]}
-  [ "$THEME_PAINT" = 0 ] && [ -n "$THEME_TERM_BG" ] && [ "$THEME_TERM_MODE" = "$THEME_MODE" ] && bg=$THEME_TERM_BG
-  THEME_BG=$bg THEME_FG=$fg THEME_ACC=${p[2]} THEME_END=${p[7]}
-  THEME_TONES=()
-  if theme_truecolor; then THEME_TRUE=1; else THEME_TRUE=0; fi
-
-  R=$'\033[0m' B=$'\033[1m' BASE=""
-  if [ "$THEME_PAINT" = 1 ]; then
-    theme_bg "$bg"; BASE=$REPLY; theme_fg "$fg"; BASE+=$REPLY
-    R+=$BASE                                    # a reset goes back to our canvas
-  fi
-  theme_mix "$bg" "$fg" "${THEME_STEPS[1]}"; theme_fg "$REPLY"; D=$REPLY
-  D_SGR=${D#$'\033['}; D_SGR=${D_SGR%m}
-  theme_mix "$bg" "$fg" 500;                  theme_fg "$REPLY"; PAST=$REPLY
-  theme_mix "$bg" "$fg" "${THEME_STEPS[2]}"; theme_fg "$REPLY"; LINE=$REPLY
-  theme_mix "$bg" "$fg" "${THEME_STEPS[3]}"; theme_fg "$REPLY"; GHOST=$REPLY
-  theme_mix "$bg" "$fg" "${THEME_STEPS[4]}"; theme_bg "$REPLY"; SURF=$REPLY
-  local tint; theme_mix "$fg" "${p[2]}" "${THEME_STEPS[1]}"; tint=$REPLY
-  theme_mix "$bg" "$tint" "${THEME_STEPS[4]}"; theme_bg "$REPLY"; SEL=$REPLY
-  theme_mix "$bg" "$tint" "${THEME_STEPS[3]}"; theme_bg "$REPLY"; PSEL=$REPLY
-  theme_mix "$bg" "${p[2]}" "${THEME_STEPS[2]}"; theme_bg "$REPLY"; HL=$REPLY
-  theme_fg "$fg"; HL+=$REPLY
-  theme_fg "${p[2]}"; ACC=$REPLY; ACC_SGR=${ACC#$'\033['}; ACC_SGR=${ACC_SGR%m}
-  theme_fg "${p[3]}"; ACC2=$REPLY
-  theme_fg "${p[4]}"; GRN=$REPLY
-  theme_fg "${p[5]}"; RED=$REPLY
-  theme_fg "${p[6]}"; YEL=$REPLY
-  THEME_ON=1
-}
-
-theme_grad() {   # theme_grad N: GRAD, N colours from the accent to the logo's cyan
-  local n=$1 k
-  GRAD=()
-  for (( k = 0; k < n; k++ )); do
-    theme_mix "$THEME_ACC" "$THEME_END" $(( n > 1 ? k * 1000 / (n - 1) : 0 ))
-    theme_fg "$REPLY"; GRAD+=("$REPLY")
-  done
-}
-
-theme_tone() {   # theme_tone LEVEL: REPLY = the text colour, LEVEL thousandths of the way from the background
-  local k=$(( ($1 + 5) / 10 * 10 ))                # in steps of 1%, so there are few to remember
-  if [ -z "${THEME_TONES[$k]+x}" ]; then
-    theme_mix "$THEME_BG" "$THEME_FG" "$k"; theme_fg "$REPLY"; THEME_TONES[$k]=$REPLY
-  fi
-  REPLY=${THEME_TONES[$k]}
-}
-
-theme_name() {   # what the settings menu shows beside "Colours"
-  case "${KOKORO_THEME:-auto}" in
-    dark) REPLY="Dark" ;; light) REPLY="Light" ;;
-    *) REPLY="Auto" ;;
-  esac
-}
-__KOKOMUX_THEME__
-
-cat > "$WORK/setup.sh" <<'__KOKOMUX_SETUP__'
-# shellcheck shell=bash
-# kokomux: runs inside the "kokoro" Debian container (as root), one phase
-# per call, from install.sh:  bash setup.sh apt|pip|models|tidy
-set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
-export PIP_PROGRESS_BAR=off
-APP=/opt/kokoro
-SRC=/tmp/kokoro-setup
-
-case "${1:-}" in
-  apt)
-    # Skip docs, man pages and translations for everything apt installs.
-    mkdir -p /etc/dpkg/dpkg.cfg.d
-    cat > /etc/dpkg/dpkg.cfg.d/01-kokomux-nodoc <<'CFG'
-path-exclude=/usr/share/doc/*
-path-include=/usr/share/doc/*/copyright
-path-exclude=/usr/share/man/*
-path-exclude=/usr/share/info/*
-path-exclude=/usr/share/locale/*
-path-include=/usr/share/locale/locale.alias
-CFG
-    apt-get update
-    apt-get install -y --no-install-recommends python3 python3-venv ca-certificates curl
-    ;;
-  pip)
-    mkdir -p "$APP"
-    [ -x "$APP/venv/bin/python" ] || python3 -m venv "$APP/venv"
-    "$APP/venv/bin/pip" install --upgrade pip
-    # pypdf reads PDFs, trafilatura finds the article on a web page. misaki turns
-    # English into sounds as Kokoro was trained, with spaCy's small English model (no PyTorch).
-    "$APP/venv/bin/pip" install --upgrade kokoro-onnx soundfile pypdf "trafilatura>=2.0,<3" \
-      "misaki>=0.7.4,<0.8" num2words "spacy>=3.8,<3.9" \
-      "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" \
-      | tee /tmp/kokoro-setup/.pip
-    grep -q '^Successfully installed' /tmp/kokoro-setup/.pip || printf 'up to date' > "$SRC/.note"
-    cp "$SRC/engine.py" "$SRC/words.py" "$APP/"
-    ;;
-  models)
-    if [ -s "$APP/models/kokoro-v1.0-timestamped.fp32.onnx" ] && [ -s "$APP/models/voices-v1.0.bin" ]; then
-      printf 'already downloaded' > "$SRC/.note"
-    fi
-    "$APP/venv/bin/python" -u "$APP/engine.py" download
-    ;;
-  tidy)
-    apt-get clean
-    rm -rf /var/lib/apt/lists/* /root/.cache/pip /usr/share/man/* /usr/share/info/*
-    find /usr/share/doc -mindepth 2 ! -name copyright -delete 2>/dev/null || true
-    ;;
-  *)
-    echo "usage: setup.sh apt|pip|models|tidy" >&2; exit 2 ;;
-esac
-__KOKOMUX_SETUP__
-
-cat > "$WORK/kokoro" <<'__KOKOMUX_WRAPPER__'
-#!/data/data/com.termux/files/usr/bin/bash
-# kokomux: the `kokoro` command. https://github.com/Anesu/kokomux
-#
-# Turns text into speech with Kokoro, which lives in the "kokoro"
-# proot-distro container (/opt/kokoro: engine.py, its venv and the models).
-# Each run writes a job folder in $PREFIX/tmp, which the container sees as
-# /tmp, and the engine fills its stream/ folder part by part. If the
-# background server is running, jobs go to it over localhost (fast);
-# otherwise each run starts the container (slower).
-#
-# This file: settings, admin commands (--status, --update, the queue, ...),
-# options, the job folder, then the run. The screens are in tui.sh, playing
-# in player.sh, the colours in theme.sh (all three loaded below).
-set -euo pipefail
-
-KOKOMUX_VERSION="0.18.2"
-CONF_DIR="$HOME/.config/kokoro"
-CONF="$CONF_DIR/config"
-
-# Precedence: environment (KOKORO_VOICE=am_adam kokoro ...) > settings file
-# > these defaults.
-env_names="${!KOKORO_@}"
-env_overrides=""
-# shellcheck disable=SC2086
-[ -n "$env_names" ] && env_overrides="$(declare -p $env_names)"
-# The defaults, in one place (the settings menu's "Reset to defaults" uses them too).
-KOKORO_DEFAULTS=(
-  KOKORO_VOICE=af_heart         # see: kokoro --list-voices
-  KOKORO_BLEND=                 # a second voice mixed in, and how much: af_bella:30 (empty: none)
-  KOKORO_SPEED=1.0              # 0.5 to 2.0
-  KOKORO_LANG=en-us
-  KOKORO_OUT=kokoro.wav         # file name when -o isn't given
-  KOKORO_AUTOSERVE=1            # keep Kokoro loaded in the background
-  KOKORO_IDLE_MINUTES=0         # unload it after this long unused (0: never; the phone has the memory)
-  KOKORO_PORT=8880
-  KOKORO_WORDS=1                # light up each word as it's spoken (-p on a terminal)
-  KOKORO_WORDS_OFFSET_MS=0      # moves the highlight against mpv's clock (+: later, -: earlier)
-  KOKORO_NOTIFY=1               # a notification with pause / next / again buttons (Termux:API)
-  KOKORO_TUI=1                  # -p on a terminal opens the full-screen reader (0: inline)
-  KOKORO_CACHE_GB=50            # made audio kept for books in progress, at most this much
-  KOKORO_THREADS=0              # how Kokoro runs on this phone (kokoro --benchmark sets these)
-  KOKORO_BLOCK=0
-  KOKORO_THEME=auto             # colours: auto (follow the terminal), dark or light
-  KOKORO_FOCUS=1                # the reader fades text with its distance from the line being read
-)
-for kv in "${KOKORO_DEFAULTS[@]}"; do declare "$kv"; done
-KOKORO_REPO_RAW=https://raw.githubusercontent.com/Anesu/kokomux/main
-# shellcheck source=/dev/null
-[ -f "$CONF" ] && . "$CONF"
-eval "$env_overrides"
-
-DISTRO=kokoro
-PY=/opt/kokoro/venv/bin/python
-ENGINE=/opt/kokoro/engine.py
-SRV_DIR="$PREFIX/tmp/kokoro-server"
-TOKEN_FILE="$SRV_DIR/token"
-PLAYER_PID="$PREFIX/tmp/kokoro-player.pid"
-CONTROL="$PREFIX/tmp/kokoro-control"      # kokoro --pause/--next/--again leave a word here
-PLAYER_STATE="$PREFIX/tmp/kokoro-state"   # "playing" or "paused", for --pause to report
-BOOKS="$HOME/.local/share/kokomux/bookmarks"
-QUEUE_DIR="$HOME/.local/share/kokomux/queue"   # shared links and files, to hear in order
-QUEUE="$QUEUE_DIR/list"                        # one per line: id, kind (url/file), source, title (tab-separated)
-QUIT_RC=0; [ "${KOKORO_QUEUE:-0}" = 1 ] && QUIT_RC=10   # stopped, not finished: the queue waits
-CACHE="$PREFIX/tmp/kokomux-cache"         # made parts, per book (the container sees /tmp/kokomux-cache)
-
-# ------------------------------------------------------------ look & feel
-
-# Count characters, not bytes ("…", "▶" and "␣" are one column each), so text
-# lines up whatever locale the terminal was started with. Byte-exact slicing of
-# the text being read still uses a local LC_ALL=C where it needs it.
-case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
-  *UTF-8*|*utf8*|*UTF8*) ;;
-  *) export LC_CTYPE=C.UTF-8 2>/dev/null ;;
-esac
-# Messages go to stderr. Colours and live status only on a terminal, so
-# scripts and pipes get plain, quiet output.
-
-# The rest of kokomux lives beside this command, in $PREFIX/share/kokomux:
-# theme.sh (the colours), tui.sh (the full-screen screens) and player.sh
-# (playing a text). The installer puts all three there.
-LIB="$PREFIX/share/kokomux"
-for f in theme.sh tui.sh player.sh; do
-  [ -f "$LIB/$f" ] || { echo "kokomux is only partly installed ($f is missing). Run the installer again." >&2; exit 1; }
-done
-# shellcheck source=src/theme.sh
-. "$LIB/theme.sh"
-# shellcheck source=src/tui.sh
-. "$LIB/tui.sh"
-# shellcheck source=src/player.sh
-. "$LIB/player.sh"
-
-# The colours follow the terminal: a dark or light palette, made from its own
-# background where it has told us what that is.
-LIVE=0
-if [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then LIVE=1; fi
-if [ "$LIVE" = 1 ]; then theme_apply; else theme_off; fi
-SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
-frame=0
-
-cols() {         # the terminal's width (60 when it can't be asked)
-  local c
-  c="$(stty size 2>/dev/null </dev/tty | cut -d' ' -f2)" || true
-  [[ "${c:-}" =~ ^[0-9]+$ ]] && [ "$c" -ge 20 ] && echo "$c" || echo 60
-}
-
-# die "what went wrong" ["what to do about it"]
-die() {
-  tui_close
-  status_clear
-  printf '%s✗%s %s\n' "$RED" "$R" "$1" >&2
-  [ -n "${2:-}" ] && printf '  %s%s%s\n' "$D" "$2" "$R" >&2
-  exit 1
-}
-done_msg() { printf '%s✓%s %s%s\n' "$GRN" "$R" "$1" "${2:+ $D$2$R}" >&2; }   # done_msg TEXT [DIM]: a ✓ line
-info() { printf '%s›%s %s\n' "$ACC" "$R" "$1" >&2; }   # info TEXT: a › line
-
-# One live status line, never wider than the screen (a wrapped line can't
-# be redrawn in place): status "text" ["dim extra"] ["symbol"]
-TERM_COLS=60; [ "$LIVE" = 1 ] && TERM_COLS="$(cols)"
-status() {       # status TEXT [DIM] [SYMBOL]: the live status line, redrawn in place
-  [ "$LIVE" = 1 ] || return 0
-  local main=$1 extra=${2:-} sym=${3:-${SPIN[frame % 10]}} vis room
-  vis="$(printf '%s' "$main" | sed 's/\x1b\[[0-9;]*m//g')"
-  room=$(( TERM_COLS - 4 - ${#vis} ))
-  if [ "$room" -lt 4 ]; then extra=""
-  elif [ "${#extra}" -gt "$room" ]; then extra="${extra:0:$((room - 1))}…"; fi
-  printf '\r\033[K%s%s%s %s %s%s%s' "$ACC" "$sym" "$R" "$main" "$D" "$extra" "$R" >&2
-  frame=$((frame + 1))
-}
-status_clear() { [ "$LIVE" = 1 ] && printf '\r\033[K' >&2; return 0; }   # rub out the live status line
-
-snippet() {      # snippet FILE: its first 60 characters, on one line (a title for a text)
-  local t
-  t="$(head -c 600 "$1" | tr '\n\t\r' '   ' | tr -s ' ')" || t=""
-  t=${t# }; t=${t:0:60}; printf '%s' "${t% }"
-}
-# shellcheck disable=SC2088  # a literal ~ is the point
-tilde() { case "$1" in "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac; }
-# Voices: one, or several blended ("af_heart:70+af_bella:30").
-VOICE_RE='^[a-z]{2}_[a-z0-9]+(:[0-9]{1,3})?(\+[a-z]{2}_[a-z0-9]+(:[0-9]{1,3})?){0,3}$'
-voice_mix() {    # voice_mix [VOICE [BLEND]]: the voice to use, with KOKORO_BLEND ("af_bella:30") mixed in
-  local v=${1:-$KOKORO_VOICE} b=${2-$KOKORO_BLEND} n a=30
-  n=${b%%:*}; [[ "$b" == *:* ]] && a=${b#*:}
-  if [ -n "$n" ] && [ "$n" != "$v" ] && [[ "$v" != *[+:]* ]] && [[ "$a" =~ ^[0-9]+$ ]] && [ "$a" -gt 0 ] && [ "$a" -lt 100 ]; then
-    printf '%s:%s+%s:%s' "$v" $(( 100 - a )) "$n" "$a"
-  else printf '%s' "$v"; fi
-}
-voice_label() {  # voice_label SPEC: "af_heart:70+af_bella:30" -> "af_heart + af_bella"
-  local s=$1
-  while [[ "$s" =~ ^(.*):[0-9]+(.*)$ ]]; do s=${BASH_REMATCH[1]}${BASH_REMATCH[2]}; done
-  printf '%s' "${s//+/ + }"
-}
-human_size() {   # human_size BYTES: "1.2 MB" or "340 KB"
-  local b=$1
-  if [ "$b" -ge 1048576 ]; then awk "BEGIN { printf \"%.1f MB\", $b / 1048576 }"
-  else echo "$(( (b + 1023) / 1024 )) KB"; fi
-}
-human_secs() {   # human_secs SECONDS: "2m 05s" or "4.2s"
-  awk -v s="$1" 'BEGIN { if (s >= 60) printf "%dm %02ds", s / 60, s % 60; else printf "%.1fs", s }'
-}
+# ------------------------------------------------------------ help
 
 # Option rows "flags|what it does": two columns on wide screens, stacked on
 # narrow ones (phones in portrait).
-opt_rows() {
+opt_rows() {     # (reads "flags|what it does" lines)
   local w o d
   w="$(cols)"
   while IFS='|' read -r o d; do
@@ -4165,7 +3078,7 @@ usage() {        # kokoro --help
   printf '\n%sSpeak%s\n' "$B" "$R"
   opt_rows <<'ROWS'
 -p, --play|play as it's made
--o FILE|save as .wav .mp3 .ogg or .flac
+-o FILE|save as .wav .mp3 .ogg .flac, or .m4b (an audiobook)
 -v VOICE|voice, e.g. af_heart, or a blend: af_heart:70+af_bella:30
 -s SPEED|0.5 to 2.0
 -l LANG|en-us en-gb es fr-fr it pt-br hi
@@ -4204,728 +3117,1974 @@ ROWS
   printf '\n%sWithout -p, audio is saved to %s.%s\n' "$D" "$KOKORO_OUT" "$R"
 }
 
-# ------------------------------------------------------------ server
-
-server_token() { [ -f "$TOKEN_FILE" ] && cut -d' ' -f2 "$TOKEN_FILE"; }   # the background server's secret (from its token file)
-server_port() { [ -f "$TOKEN_FILE" ] && cut -d' ' -f1 "$TOKEN_FILE"; }   # the port it listens on (from the same file)
-
-server_up() {    # is the background server answering?
-  local tok port
-  tok="$(server_token 2>/dev/null)" || return 1
-  port="$(server_port)"
-  curl -fsS -m 2 -H "X-Kokoro-Token: $tok" "http://127.0.0.1:$port/health" >/dev/null 2>&1
+cmd_status() {   # kokoro --status: the server, the settings and the last bookmark
+  local idle last where
+  printf '%skokomux%s %sv%s%s\n\n' "$B" "$R" "$ACC" "$KOKOMUX_VERSION" "$R"
+  if server_up; then
+    printf '  %s●%s Server    %srunning%s %s(port %s)%s\n' "$GRN" "$R" "$GRN" "$R" "$D" "$(server_port)" "$R"
+  elif [ "$KOKORO_AUTOSERVE" = 1 ]; then
+    printf '  %s○%s Server    sleeping %s(wakes on next use)%s\n' "$D" "$R" "$D" "$R"
+  else
+    printf '  %s○%s Server    off %s(KOKORO_AUTOSERVE=0)%s\n' "$D" "$R" "$D" "$R"
+  fi
+  idle="${KOKORO_IDLE_MINUTES} min"; [ "$KOKORO_IDLE_MINUTES" = 0 ] && idle="never"
+  printf '    Voice     %s%s%s\n' "$ACC2" "$(voice_mix)" "$R"
+  printf '    Speed     %s\n' "$KOKORO_SPEED"
+  printf '    Language  %s\n' "$KOKORO_LANG"
+  printf '    Idle stop %s\n' "$idle"
+  last="$(ls -t "$BOOKS"/*.mark 2>/dev/null | head -n 1)" || true
+  if [ -n "$last" ]; then
+    where="part $(mark_get "$last" part) of $(mark_get "$last" parts)"
+    [ "$(mark_get "$last" kind)" = novel ] && where="$(mark_get "$last" chapter)"
+    printf '    Bookmark  %s %s(%s · kokoro --continue)%s\n' "$(mark_get "$last" title)" "$D" "$where" "$R"
+  fi
+  printf '    Settings  %s%s%s\n' "$D" "$(tilde "$CONF")" "$R"
+  printf '    %sChange them with: kokoro --settings%s\n' "$D" "$R"
+  exit 0
 }
 
-start_server() {   # start the server in the container and wait (a spinner) until it answers
-  server_up && return 0
-  mkdir -p "$SRV_DIR"
-  rm -f "$TOKEN_FILE"
-  # Ignore Ctrl+C and hang-ups so the server outlives the command that started it.
-  ( trap '' INT HUP
-    exec nohup proot-distro login "$DISTRO" --shared-tmp -- \
-      "$PY" "$ENGINE" serve --port "$KOKORO_PORT" --idle "$((KOKORO_IDLE_MINUTES * 60))" \
-        --threads "$KOKORO_THREADS" --block "$KOKORO_BLOCK"
-  ) > "$SRV_DIR/log" 2>&1 < /dev/null &
-  local pid=$! n=0
-  [ "$LIVE" = 1 ] || echo "Starting the Kokoro server..." >&2
-  while [ "$n" -lt 1200 ]; do          # up to 2 minutes
-    if [ $((n % 5)) = 0 ]; then
-      server_up && { status_clear; return 0; }
-      kill -0 "$pid" 2>/dev/null || break
-    fi
-    status "Warming up Kokoro" "(a few seconds)"
-    sleep 0.1; n=$((n + 1))
-  done
+cmd_list_voices() {   # kokoro --list-voices: every voice, by language
+  local flags errf out
+  status "Loading voices"
+  flags=(--width "$(cols)" --default "$KOKORO_VOICE")
+  [ "$LIVE" = 1 ] && [ -t 1 ] && flags+=(--color --accent "$ACC_SGR" --muted "$D_SGR")
+  errf="$(mktemp "$PREFIX/tmp/kokoro-err.XXXXXX")"
+  out="$(proot-distro login "$DISTRO" -- "$PY" "$ENGINE" voices "${flags[@]}" 2>"$errf")" ||
+    die "Couldn't list the voices." "$(tail -n 1 "$errf"; rm -f "$errf")"
+  rm -f "$errf"
   status_clear
-  printf '%s✗%s The Kokoro server didn'"'"'t start.\n' "$RED" "$R" >&2
-  tail -n 5 "$SRV_DIR/log" 2>/dev/null | sed "s/^/  $D/; s/\$/$R/" >&2 || true
-  printf '  %sFull log: %s%s\n' "$D" "${SRV_DIR}/log" "$R" >&2
-  return 1
+  printf '%s\n' "$out"
+  exit 0
 }
 
-stop_server() {  # ask the server to stop, and wait until it has
-  if ! server_up; then info "The server isn't running."; return 0; fi
-  curl -fsS -m 5 -X POST -H "X-Kokoro-Token: $(server_token)" \
-    "http://127.0.0.1:$(server_port)/shutdown" >/dev/null || true
-  local i
-  for i in $(seq 1 20); do server_up || break; sleep 0.25; done
-  done_msg "Server stopped." "It restarts when needed."
-}
+# ------------------------------------------------------------ the queue
+# $QUEUE: one item per line, "id<TAB>kind<TAB>source<TAB>title"; kind is url
+# or file (a copy kept in $QUEUE_DIR, deleted when it leaves the queue).
 
-# ------------------------------------------------------------ playback
-
-player_alive() { local pid; pid="$(cat "$PLAYER_PID" 2>/dev/null)" && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }   # is a kokoro -p running (by its pid file)?
-
-# control WORD MESSAGE: tell the running player to pause, skip or replay
-control() {
-  player_alive || { info "Nothing is playing."; exit 0; }
-  echo "$1" > "$CONTROL"
-  [ -n "${2:-}" ] && done_msg "$2"
+queue_drop() {   # queue_drop ID KIND SOURCE: take an item out of the queue
+  [ "$2" = file ] && rm -f "$3"
+  sed -i "/^$1\t/d" "$QUEUE"
   return 0
 }
 
-# Bookmarks: where a long text was stopped, as key=value lines.
-mark_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1 || true; }   # (empty if there's no such file)
-chapter_url() {  # chapter_url URL N: CHURL = chapter N's address, where a novel's addresses count chapters (…/chapter-5)
-  local u=${1%%[?#]*}
-  u=${u%/}; CHURL=""
-  [[ "$u" =~ ^(.*/[^/]*[Cc][Hh][Aa][Pp][Tt][Ee][Rr][-_]?)([0-9]+)([^/]*)$ ]] || return 1
-  CHURL="${BASH_REMATCH[1]}$2${BASH_REMATCH[3]}"
-}
-
-stop_playback() {   # stop the running player, if any (returns 1 if there was none)
-  local pid
-  pid="$(cat "$PLAYER_PID" 2>/dev/null)" || return 1
-  rm -f "$PLAYER_PID"
-  [ -n "$pid" ] && [ "$pid" != "$$" ] && kill "$pid" 2>/dev/null
-}
-
-# ------------------------------------------------------------ keys and the frame timer
-# tick waits a moment (no process) and, on a terminal, reads one key or click
-# into KEY, by name (key_name): a printable key is itself ("q", " ", "+"), the
-# others are up down left right enter esc backspace pgup pgdn, and click (a
-# left click or tap, at CLICK_X, CLICK_Y). The mouse wheel is up and down.
-# A stop signal during the wait must not exit from inside `read -t`:
-# if cleanup then outlives the timer, bash's alarm jumps back into a read that's
-# gone and bash crashes (seen with bash 5.2). So during the wait the signal only
-# sets a flag, and tick exits once read has returned.
-
-STOP=""; IN_TICK=0; KEY=""; CMD=""; KBD=""; KEYS_TTY=""; TICK_BG=""; CLICK_X=0; CLICK_Y=0
-exec {TICK}<> <(:)                    # read -t on this is a sleep with no process
-now_ms() { local t=${EPOCHREALTIME//[!0-9]/}; NOW=$(( t / 1000 )); }   # no subshell: called every frame
-keys_on() {      # read keys from the terminal, unechoed (restored on exit)
-  [ -n "$KBD" ] && return 0
-  [ "$LIVE" = 1 ] && [ -r /dev/tty ] || return 0
-  { exec {KBD}</dev/tty; } 2>/dev/null || { KBD=""; return 0; }
-  KEYS_TTY="$(stty -g 2>/dev/null </dev/tty)" || KEYS_TTY=""
-  stty -echo -icanon 2>/dev/null </dev/tty || true
-}
-keys_off() { [ -n "$KEYS_TTY" ] && stty "$KEYS_TTY" 2>/dev/null </dev/tty; KEYS_TTY=""; return 0; }   # give the terminal back its echo and line editing
-tick() {         # tick SECONDS: flush the frame, wait, and read a key into KEY (by name)
-  local c rest=""
-  [ -n "${FRAME:-}" ] && flush          # the frame drawn since the last wait, in one write
-  [ -n "${TICK_BG:-}" ] && "$TICK_BG"    # the player keeping mpv fed, while a menu is open
-  IN_TICK=1; KEY=""
-  if [ -n "$KBD" ]; then
-    if IFS= read -rsn1 -d '' -t "$1" -u "$KBD" KEY && [ "$KEY" = $'\033' ]; then
-      # an arrow key or a click: the rest of the sequence follows at once
-      while IFS= read -rsn1 -d '' -t 0.01 -u "$KBD" c; do
-        rest+=$c; [[ "$c" == [A-Za-z~] ]] && [ "${#rest}" -gt 1 ] && break
-      done
-      KEY=$'\033'$rest
-    fi
-    key_name
-  else
-    read -r -t "$1" -u "$TICK" _ || true
+cmd_add() {      # kokoro --add [-u URL | -f FILE | -c | TEXT]: to the queue, to hear later
+  shift
+  local id kind="file" src title ext n
+  mkdir -p "$QUEUE_DIR"
+  id="$(date +%s%N | sha256sum | cut -c1-12)"
+  case "${1:-}" in
+    -u|--url) [[ "${2:-}" =~ ^https?:// ]] || die "That doesn't look like a web address."
+              kind=url src=$2 title=$2 ;;
+    -f|--file) [ -f "${2:-}" ] || die "There's no file called \"${2:-}\"."
+               ext="${2##*.}"; [ "$ext" = "$2" ] && ext=txt
+               src="$QUEUE_DIR/$id.${ext,,}"; cp "$2" "$src"; title="$(basename "$2")" ;;
+    -c|--clipboard) command -v termux-clipboard-get >/dev/null || die "Reading the clipboard needs Termux:API."
+               src="$QUEUE_DIR/$id.txt"; timeout 6 termux-clipboard-get > "$src" || die "Couldn't read the clipboard."
+               title="$(snippet "$src")" ;;
+    "") die "What should go in the queue?" "kokoro --add -u URL, -f FILE, -c, or some text" ;;
+    *) src="$QUEUE_DIR/$id.txt"; printf '%s\n' "$*" > "$src"; title="$(snippet "$src")" ;;
+  esac
+  # A copied link on its own is that page.
+  if [ "$kind" = file ] && [ "${src##*.}" = txt ] && is_link "$src"; then
+    kind=url title="$(tr -d '[:space:]' < "$src")"; rm -f "$src"; src=$title
   fi
-  IN_TICK=0
-  [ -z "$STOP" ] || exit 130
-}
-key_name() {     # KEY, as the terminal sent it, to its name (see above); "" for what no screen uses
-  case "$KEY" in
-    $'\033[A'|$'\033OA'|$'\033[<64;'*M) KEY=up ;;
-    $'\033[B'|$'\033OB'|$'\033[<65;'*M) KEY=down ;;
-    $'\033[C'|$'\033OC') KEY=right ;;
-    $'\033[D'|$'\033OD') KEY=left ;;
-    $'\033[5~') KEY=pgup ;;
-    $'\033[6~') KEY=pgdn ;;
-    $'\r'|$'\n') KEY=enter ;;
-    $'\033') KEY=esc ;;
-    $'\177'|$'\b') KEY=backspace ;;
-    $'\033[<0;'*M)                            # a left click or tap: "ESC [ < 0 ; x ; y M"
-      if [[ "$KEY" =~ \;([0-9]+)\;([0-9]+)M$ ]]; then CLICK_X=${BASH_REMATCH[1]} CLICK_Y=${BASH_REMATCH[2]} KEY=click
-      else KEY=""; fi ;;
-    $'\033'*) KEY="" ;;                        # a release, another button, a key no screen uses
-  esac
-}
-key_cmd() {      # what KEY asks for (or a clicked button): see the player for each
-  CMD=""
-  case "$KEY" in
-    " "|p|P|k) CMD=toggle ;;
-    n|N|l|right) CMD=next ;;
-    b|B|h|left) CMD=again ;;
-    q|Q|esc) CMD=quit ;;
-    +|=) CMD=faster ;;
-    -|_) CMD=slower ;;
-    t|T) CMD="sleep" ;;
-    c|C) CMD=chapters ;;
-    m|M) CMD=menu ;;
-    s|S) CMD=settings ;;
-    v|V) CMD=voice ;;
-    ']') CMD=next_chapter ;;
-    '[') CMD=prev_chapter ;;
-    click) [ "${ui:-}" = tui ] && tui_click ;;
-  esac
-  KEY=""
-}
-
-# kokoro on its own, on a terminal: the home screen.
-if [ $# = 0 ] && [ "$LIVE" = 1 ] && [ -t 0 ] && [ -t 1 ]; then
-  keys_on
-  # However it ends, give back taps and typing (a tap opens Termux's keyboard again).
-  trap 'tui_close; keys_off' EXIT
-  trap 'exit 130' INT TERM HUP
-  tui_home
-  keys_off; trap - EXIT INT TERM HUP
-  [ "${#HOME_CHOICE[@]}" -gt 0 ] && exec "$0" "${HOME_CHOICE[@]}"
+  printf '%s\t%s\t%s\t%s\n' "$id" "$kind" "$src" "${title//$'\t'/ }" >> "$QUEUE"
+  n=$(wc -l < "$QUEUE")
+  done_msg "Added to your queue" "$n waiting · kokoro --queue plays it"
+  command -v termux-toast >/dev/null && { timeout 5 termux-toast "kokoro: added to your queue ($n)" >/dev/null 2>&1 & }
   exit 0
-fi
+}
 
-# ------------------------------------------------------------ admin commands
+cmd_queue() {    # kokoro --queue [list|skip|clear]: play the queue in order
+  local id kind src title n args rc
+  case "${2:-}" in
+    list) [ -s "$QUEUE" ] || { info "Your queue is empty."; exit 0; }
+          n=0; while IFS=$'\t' read -r _ _ _ title; do n=$((n + 1)); printf '  %s%2d%s  %s\n' "$ACC2" "$n" "$R" "$title"; done < "$QUEUE"
+          exit 0 ;;
+    clear) if [ -f "$QUEUE" ]; then
+             while IFS=$'\t' read -r _ kind src _; do [ "$kind" = file ] && rm -f "$src"; done < "$QUEUE"
+           fi
+           rm -f "$QUEUE"; done_msg "Queue cleared."; exit 0 ;;
+    skip) [ -s "$QUEUE" ] || { info "Your queue is empty."; exit 0; }
+          IFS=$'\t' read -r id kind src title < "$QUEUE"
+          queue_drop "$id" "$kind" "$src"; done_msg "Dropped \"$title\"."; exit 0 ;;
+    "") ;;
+    *) die "kokoro --queue plays the queue; --queue list shows it; --queue skip drops the first; --queue clear empties it." ;;
+  esac
+  [ -s "$QUEUE" ] || { info "Your queue is empty." ; printf '  %sShare a link or file to Termux, or: kokoro --add -u URL%s\n' "$D" "$R" >&2; exit 0; }
+  while [ -s "$QUEUE" ]; do
+    IFS=$'\t' read -r id kind src title < "$QUEUE"
+    if [ "$kind" = url ]; then args=(-u "$src"); else args=(-f "$src"); fi
+    rc=0; KOKORO_QUEUE=1 "$0" -p "${args[@]}" || rc=$?
+    case "$rc" in
+      0) ;;                                              # heard to the end
+      10|130) break ;;                                   # stopped: it stays first in the queue
+      *) info "Couldn't read \"$title\", so the queue stopped there."
+         printf '  %skokoro --queue skip drops it.%s\n' "$D" "$R" >&2; break ;;
+    esac
+    queue_drop "$id" "$kind" "$src"
+  done
+  exit 0
+}
+
+# ------------------------------------------------------------ bookmarks
+
+cmd_continue() { # kokoro --continue [MARK]: carry on with a bookmark (the last one), in its voice and speed
+  local last=${2:-} src
+  case "$last" in "$BOOKS"/*.mark) [ -f "$last" ] || last="" ;; *) last="" ;; esac
+  [ -n "$last" ] || last="$(ls -t "$BOOKS"/*.mark 2>/dev/null | head -n 1)" || true
+  [ -n "$last" ] || die "There's nothing to continue." "A bookmark is kept when you stop a long text partway."
+  case "$(mark_get "$last" kind)" in
+    url|novel) src=(-u "$(mark_get "$last" source)") ;;
+    text) src=(-f "${last%.mark}.txt") ;;
+    *)    src=(-f "$(mark_get "$last" source)")
+          [ -f "${src[1]}" ] || die "Can't find \"${src[1]}\" any more." "Has the file moved? Open it again with kokoro -p -f." ;;
+  esac
+  exec "$0" -p -v "$(mark_get "$last" voice)" -s "$(mark_get "$last" speed)" -l "$(mark_get "$last" lang)" "${src[@]}"
+}
+
+# ------------------------------------------------------------ the server
+
+cmd_serve() {    # kokoro --serve: start the background server now
+  local stays
+  if server_up; then info "The server is already running."; exit 0; fi
+  start_server || exit 1
+  stays="stays loaded"; [ "$KOKORO_IDLE_MINUTES" = 0 ] || stays="stops after ${KOKORO_IDLE_MINUTES} min unused"
+  done_msg "Server ready." "port $(server_port) · $stays"
+  exit 0
+}
+
+cmd_benchmark() {   # kokoro --benchmark: time each way of running Kokoro here, and keep the fastest
+  local best="" rows=() tag threads block secs speed label
+  server_up && stop_server >/dev/null 2>&1           # (it would share the cores)
+  info "Timing Kokoro on this phone, a few ways (about a minute)."
+  while read -r tag threads block secs speed; do
+    case "$tag" in
+      @@bench) if [ "$threads" = 0 ]; then label="its own choice"; else label="$threads threads"; fi
+               [ "$block" = 0 ] || label+=", block $block"
+               rows+=("$(printf '  %-26s %s× real time' "$label" "$speed")")
+               status "Timing" "$label: ${speed}× real time" ;;
+      @@best) best="$threads $block $secs" ;;           # (secs is the speed here)
+    esac
+  done < <(proot-distro login "$DISTRO" -- "$PY" "$ENGINE" bench 2>/dev/null)
+  status_clear
+  [ -n "$best" ] || die "The benchmark didn't finish."
+  printf '%s\n' "${rows[@]}" >&2
+  read -r threads block speed <<< "$best"
+  conf_set KOKORO_THREADS "$threads"; conf_set KOKORO_BLOCK "$block"
+  if [ "$threads" = 0 ]; then label="threads chosen by onnxruntime"; else label="$threads threads"; fi
+  [ "$block" = 0 ] || label+=", block $block"
+  done_msg "Kokoro makes speech ${speed}× faster than it's spoken here." "Kept: $label"
+  exit 0
+}
+
+# ------------------------------------------------------------ keeping kokomux up to date
+
+cmd_update() {   # kokoro --update [BRANCH]: the installer from GitHub (main, or that branch)
+  local branch=${2:-main} tmp new rc=0
+  [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die "\"$branch\" isn't a branch name."
+  tmp="$(mktemp "$PREFIX/tmp/kokomux-install.XXXXXX")"
+  curl -fsSL "${KOKORO_REPO_RAW%/main}/$branch/install.sh" -o "$tmp" 2>/dev/null ||
+    { rm -f "$tmp"; die "Couldn't download the installer from the $branch branch."; }
+  new="$(sed -n 's/^KOKOMUX_VERSION="\(.*\)"$/\1/p' "$tmp" | head -n 1)"
+  # Never go backwards by accident: main can be behind the version installed from a branch.
+  if [ -z "${2:-}" ] && [ "$(printf '%s\n%s\n' "$new" "$KOKOMUX_VERSION" | sort -V | head -n 1)" = "$new" ] &&
+     [ "$new" != "$KOKOMUX_VERSION" ]; then
+    rm -f "$tmp"
+    die "main has v$new, older than this v$KOKOMUX_VERSION." "To install from a branch: kokoro --update BRANCH"
+  fi
+  server_up && stop_server >/dev/null 2>&1
+  bash "$tmp" || rc=$?; rm -f "$tmp"; exit "$rc"
+}
+
+cmd_uninstall() {   # kokoro --uninstall: the container, the command, settings, bookmarks and shortcuts
+  local ans f
+  printf '%s\n\n' "This removes the kokoro command, its Debian container, the voices, your settings and shortcuts." |
+    fold -s -w "$(( $(cols) - 1 ))" >&2
+  read -r -p "Uninstall kokomux? [y/N] " ans
+  [[ "$ans" =~ ^[Yy] ]] || { info "Nothing removed."; exit 0; }
+  stop_playback || true
+  server_up && stop_server >/dev/null 2>&1
+  proot-distro remove "$DISTRO" >/dev/null 2>&1 && done_msg "Debian container removed" || true
+  for f in "$HOME/bin/termux-url-opener" "$HOME/bin/termux-file-editor" \
+           "$HOME/.shortcuts/tasks/"Kokoro*; do
+    if [ -f "$f" ] && grep -q '^# kokomux' "$f"; then rm -f "$f"; done_msg "Removed $(tilde "$f")"; fi
+  done
+  rm -rf "$CONF_DIR" "$SRV_DIR" "$HOME/.cache/kokomux" "$HOME/.local/share/kokomux" "$PREFIX/share/kokomux" "$CACHE"
+  done_msg "Settings removed"
+  rm -f "$0"
+  done_msg "kokomux is uninstalled." "Thanks for trying it!"
+  exit 0
+}
+__KOKOMUX_FILE__
+cat > "$WORK/setup-container.sh" <<'__KOKOMUX_FILE__'
+# shellcheck shell=bash
+# kokomux: runs inside the "kokoro" Debian container (as root), one phase
+# per call, from install.sh:  bash setup-container.sh apt|pip|models|tidy
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+export PIP_PROGRESS_BAR=off
+APP=/opt/kokoro
+SRC=/tmp/kokoro-setup
 
 case "${1:-}" in
-  -h|--help) usage; exit 0 ;;
-  --version) echo "kokomux $KOKOMUX_VERSION"; exit 0 ;;
-  --stop)
-    if stop_playback; then done_msg "Stopped."; else info "Nothing is playing."; fi
-    exit 0 ;;
-  --pause)
-    if [ "$(cat "$PLAYER_STATE" 2>/dev/null)" = paused ]; then control toggle "Playing again."
-    else control toggle "Paused." ; fi
-    exit 0 ;;
-  --next) control next "Skipping to the next part."; exit 0 ;;
-  --again) control again "Playing this part again."; exit 0 ;;
-  --add)         # kokoro --add [-u URL | -f FILE | -c | TEXT]: to the queue, to hear later
-    shift
-    mkdir -p "$QUEUE_DIR"
-    id="$(date +%s%N | sha256sum | cut -c1-12)"; kind="file"
-    case "${1:-}" in
-      -u|--url) [[ "${2:-}" =~ ^https?:// ]] || die "That doesn't look like a web address."
-                kind=url src=$2 title=$2 ;;
-      -f|--file) [ -f "${2:-}" ] || die "There's no file called \"${2:-}\"."
-                 ext="${2##*.}"; [ "$ext" = "$2" ] && ext=txt
-                 src="$QUEUE_DIR/$id.${ext,,}"; cp "$2" "$src"; title="$(basename "$2")" ;;
-      -c|--clipboard) command -v termux-clipboard-get >/dev/null || die "Reading the clipboard needs Termux:API."
-                 src="$QUEUE_DIR/$id.txt"; timeout 6 termux-clipboard-get > "$src" || die "Couldn't read the clipboard."
-                 title="$(snippet "$src")" ;;
-      "") die "What should go in the queue?" "kokoro --add -u URL, -f FILE, -c, or some text" ;;
-      *) src="$QUEUE_DIR/$id.txt"; printf '%s\n' "$*" > "$src"; title="$(snippet "$src")" ;;
-    esac
-    # A copied link on its own is that page.
-    if [ "$kind" = file ] && [ "${src##*.}" = txt ] && [ "$(wc -l < "$src")" -le 1 ] &&
-       grep -qE '^[[:space:]]*https?://[^[:space:]]+[[:space:]]*$' "$src"; then
-      kind=url title="$(tr -d '[:space:]' < "$src")"; rm -f "$src"; src=$title
+  apt)
+    # Skip docs, man pages and translations for everything apt installs.
+    mkdir -p /etc/dpkg/dpkg.cfg.d
+    cat > /etc/dpkg/dpkg.cfg.d/01-kokomux-nodoc <<'CFG'
+path-exclude=/usr/share/doc/*
+path-include=/usr/share/doc/*/copyright
+path-exclude=/usr/share/man/*
+path-exclude=/usr/share/info/*
+path-exclude=/usr/share/locale/*
+path-include=/usr/share/locale/locale.alias
+CFG
+    apt-get update
+    apt-get install -y --no-install-recommends python3 python3-venv ca-certificates curl
+    ;;
+  pip)
+    mkdir -p "$APP"
+    [ -x "$APP/venv/bin/python" ] || python3 -m venv "$APP/venv"
+    "$APP/venv/bin/pip" install --upgrade pip
+    # pypdf reads PDFs, trafilatura finds the article on a web page. misaki turns
+    # English into sounds as Kokoro was trained, with spaCy's small English model (no PyTorch).
+    "$APP/venv/bin/pip" install --upgrade kokoro-onnx soundfile pypdf "trafilatura>=2.0,<3" \
+      "misaki>=0.7.4,<0.8" num2words "spacy>=3.8,<3.9" \
+      "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" \
+      | tee /tmp/kokoro-setup/.pip
+    grep -q '^Successfully installed' /tmp/kokoro-setup/.pip || printf 'up to date' > "$SRC/.note"
+    cp "$SRC"/*.py "$APP/"                  # engine.py and its modules
+    ;;
+  models)
+    if [ -s "$APP/models/kokoro-v1.0-timestamped.fp32.onnx" ] && [ -s "$APP/models/voices-v1.0.bin" ]; then
+      printf 'already downloaded' > "$SRC/.note"
     fi
-    printf '%s\t%s\t%s\t%s\n' "$id" "$kind" "$src" "${title//$'\t'/ }" >> "$QUEUE"
-    n=$(wc -l < "$QUEUE")
-    done_msg "Added to your queue" "$n waiting · kokoro --queue plays it"
-    command -v termux-toast >/dev/null && { timeout 5 termux-toast "kokoro: added to your queue ($n)" >/dev/null 2>&1 & }
-    exit 0 ;;
-  --queue)       # kokoro --queue [list|clear]: play the queue in order
-    case "${2:-}" in
-      list) [ -s "$QUEUE" ] || { info "Your queue is empty."; exit 0; }
-            n=0; while IFS=$'\t' read -r _ _ _ title; do n=$((n + 1)); printf '  %s%2d%s  %s\n' "$ACC2" "$n" "$R" "$title"; done < "$QUEUE"
-            exit 0 ;;
-      clear) if [ -f "$QUEUE" ]; then
-               while IFS=$'\t' read -r _ kind src _; do [ "$kind" = file ] && rm -f "$src"; done < "$QUEUE"
-             fi
-             rm -f "$QUEUE"; done_msg "Queue cleared."; exit 0 ;;
-      skip) [ -s "$QUEUE" ] || { info "Your queue is empty."; exit 0; }
-            IFS=$'\t' read -r id kind src title < "$QUEUE"
-            [ "$kind" = file ] && rm -f "$src"
-            sed -i "/^$id\t/d" "$QUEUE"; done_msg "Dropped \"$title\"."; exit 0 ;;
-      "") ;;
-      *) die "kokoro --queue plays the queue; --queue list shows it; --queue skip drops the first; --queue clear empties it." ;;
-    esac
-    [ -s "$QUEUE" ] || { info "Your queue is empty." ; printf '  %sShare a link or file to Termux, or: kokoro --add -u URL%s\n' "$D" "$R" >&2; exit 0; }
-    while [ -s "$QUEUE" ]; do
-      IFS=$'\t' read -r id kind src title < "$QUEUE"
-      if [ "$kind" = url ]; then args=(-u "$src"); else args=(-f "$src"); fi
-      rc=0; KOKORO_QUEUE=1 "$0" -p "${args[@]}" || rc=$?
-      case "$rc" in
-        0) ;;                                              # heard to the end
-        10|130) break ;;                                   # stopped: it stays first in the queue
-        *) info "Couldn't read \"$title\", so the queue stopped there." \
-           ; printf '  %skokoro --queue skip drops it.%s\n' "$D" "$R" >&2; break ;;
-      esac
-      [ "$kind" = file ] && rm -f "$src"
-      sed -i "/^$id\t/d" "$QUEUE"
-    done
-    exit 0 ;;
-  --continue)
-    last="${2:-}"
-    case "$last" in "$BOOKS"/*.mark) [ -f "$last" ] || last="" ;; *) last="" ;; esac
-    [ -n "$last" ] || last="$(ls -t "$BOOKS"/*.mark 2>/dev/null | head -n 1)" || true
-    [ -n "$last" ] || die "There's nothing to continue." "A bookmark is kept when you stop a long text partway."
-    case "$(mark_get "$last" kind)" in
-      url|novel) src=(-u "$(mark_get "$last" source)") ;;
-      text) src=(-f "${last%.mark}.txt") ;;
-      *)    src=(-f "$(mark_get "$last" source)")
-            [ -f "${src[1]}" ] || die "Can't find \"${src[1]}\" any more." "Has the file moved? Open it again with kokoro -p -f." ;;
-    esac
-    exec "$0" -p -v "$(mark_get "$last" voice)" -s "$(mark_get "$last" speed)" -l "$(mark_get "$last" lang)" "${src[@]}" ;;
-  --serve)
-    if server_up; then info "The server is already running."; exit 0; fi
-    start_server || exit 1
-    stays="stays loaded"; [ "$KOKORO_IDLE_MINUTES" = 0 ] || stays="stops after ${KOKORO_IDLE_MINUTES} min unused"
-    done_msg "Server ready." "port $(server_port) · $stays"
-    exit 0 ;;
-  --stop-server) stop_server; exit 0 ;;
-  --benchmark)   # time each way of running Kokoro here, and keep the fastest
-    server_up && stop_server >/dev/null 2>&1           # (it would share the cores)
-    info "Timing Kokoro on this phone, a few ways (about a minute)."
-    best=""; rows=()
-    while read -r tag threads block secs speed; do
-      case "$tag" in
-        @@bench) if [ "$threads" = 0 ]; then label="its own choice"; else label="$threads threads"; fi
-                 [ "$block" = 0 ] || label+=", block $block"
-                 rows+=("$(printf '  %-26s %s× real time' "$label" "$speed")")
-                 status "Timing" "$label: ${speed}× real time" ;;
-        @@best) best="$threads $block $secs" ;;           # (secs is the speed here)
-      esac
-    done < <(proot-distro login "$DISTRO" -- "$PY" "$ENGINE" bench 2>/dev/null)
-    status_clear
-    [ -n "$best" ] || die "The benchmark didn't finish."
-    printf '%s\n' "${rows[@]}" >&2
-    read -r threads block speed <<< "$best"
-    conf_set KOKORO_THREADS "$threads"; conf_set KOKORO_BLOCK "$block"
-    if [ "$threads" = 0 ]; then label="threads chosen by onnxruntime"; else label="$threads threads"; fi
-    [ "$block" = 0 ] || label+=", block $block"
-    done_msg "Kokoro makes speech ${speed}× faster than it's spoken here." "Kept: $label"
-    exit 0 ;;
-  --status)
-    printf '%skokomux%s %sv%s%s\n\n' "$B" "$R" "$ACC" "$KOKOMUX_VERSION" "$R"
-    if server_up; then
-      printf '  %s●%s Server    %srunning%s %s(port %s)%s\n' "$GRN" "$R" "$GRN" "$R" "$D" "$(server_port)" "$R"
-    elif [ "$KOKORO_AUTOSERVE" = 1 ]; then
-      printf '  %s○%s Server    sleeping %s(wakes on next use)%s\n' "$D" "$R" "$D" "$R"
-    else
-      printf '  %s○%s Server    off %s(KOKORO_AUTOSERVE=0)%s\n' "$D" "$R" "$D" "$R"
-    fi
-    idle="${KOKORO_IDLE_MINUTES} min"; [ "$KOKORO_IDLE_MINUTES" = 0 ] && idle="never"
-    printf '    Voice     %s%s%s\n' "$ACC2" "$(voice_mix)" "$R"
-    printf '    Speed     %s\n' "$KOKORO_SPEED"
-    printf '    Language  %s\n' "$KOKORO_LANG"
-    printf '    Idle stop %s\n' "$idle"
-    last="$(ls -t "$BOOKS"/*.mark 2>/dev/null | head -n 1)" || true
-    if [ -n "$last" ]; then
-      where="part $(mark_get "$last" part) of $(mark_get "$last" parts)"
-      [ "$(mark_get "$last" kind)" = novel ] && where="$(mark_get "$last" chapter)"
-      printf '    Bookmark  %s %s(%s · kokoro --continue)%s\n' "$(mark_get "$last" title)" "$D" "$where" "$R"
-    fi
-    printf '    Settings  %s%s%s\n' "$D" "$(tilde "$CONF")" "$R"
-    printf '    %sChange them with: kokoro --settings%s\n' "$D" "$R"
-    exit 0 ;;
-  --settings)
-    if [ "$LIVE" = 1 ] && [ -t 0 ]; then
-      keys_on
-      trap 'tui_close; keys_off' EXIT
-      trap 'exit 130' INT TERM HUP
-      tui_settings
-      keys_off; trap - EXIT INT TERM HUP
-      exit 0
-    fi
-    exec "$0" --status ;;
-  --config)
-    [ -f "$CONF" ] || die "There's no settings file at $(tilde "$CONF")." "Run the installer again to create it."
-    exec "${EDITOR:-nano}" "$CONF" ;;
-  --update)      # kokoro --update [BRANCH]: the installer from GitHub (main, or that branch)
-    branch=${2:-main}
-    [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die "\"$branch\" isn't a branch name."
-    tmp="$(mktemp "$PREFIX/tmp/kokomux-install.XXXXXX")"
-    curl -fsSL "${KOKORO_REPO_RAW%/main}/$branch/install.sh" -o "$tmp" 2>/dev/null ||
-      { rm -f "$tmp"; die "Couldn't download the installer from the $branch branch."; }
-    new="$(sed -n 's/^KOKOMUX_VERSION="\(.*\)"$/\1/p' "$tmp" | head -n 1)"
-    # Never go backwards by accident: main can be behind the version installed from a branch.
-    if [ -z "${2:-}" ] && [ "$(printf '%s\n%s\n' "$new" "$KOKOMUX_VERSION" | sort -V | head -n 1)" = "$new" ] &&
-       [ "$new" != "$KOKOMUX_VERSION" ]; then
-      rm -f "$tmp"
-      die "main has v$new, older than this v$KOKOMUX_VERSION." "To install from a branch: kokoro --update BRANCH"
-    fi
-    server_up && stop_server >/dev/null 2>&1
-    rc=0; bash "$tmp" || rc=$?; rm -f "$tmp"; exit "$rc" ;;
-  --uninstall)
-    printf '%s\n\n' "This removes the kokoro command, its Debian container, the voices, your settings and shortcuts." |
-      fold -s -w "$(( $(cols) - 1 ))" >&2
-    read -r -p "Uninstall kokomux? [y/N] " ans
-    [[ "$ans" =~ ^[Yy] ]] || { info "Nothing removed."; exit 0; }
-    stop_playback || true
-    server_up && stop_server >/dev/null 2>&1
-    proot-distro remove "$DISTRO" >/dev/null 2>&1 && done_msg "Debian container removed" || true
-    for f in "$HOME/bin/termux-url-opener" "$HOME/bin/termux-file-editor" \
-             "$HOME/.shortcuts/tasks/"Kokoro*; do
-      if [ -f "$f" ] && grep -q '^# kokomux' "$f"; then rm -f "$f"; done_msg "Removed $(tilde "$f")"; fi
-    done
-    rm -rf "$CONF_DIR" "$SRV_DIR" "$HOME/.cache/kokomux" "$HOME/.local/share/kokomux" "$PREFIX/share/kokomux" "$CACHE"
-    done_msg "Settings removed"
-    rm -f "$0"
-    done_msg "kokomux is uninstalled." "Thanks for trying it!"
-    exit 0 ;;
-  --list-voices)
-    status "Loading voices"
-    flags=(--width "$(cols)" --default "$KOKORO_VOICE")
-    [ "$LIVE" = 1 ] && [ -t 1 ] && flags+=(--color --accent "$ACC_SGR" --muted "$D_SGR")
-    errf="$(mktemp "$PREFIX/tmp/kokoro-err.XXXXXX")"
-    out="$(proot-distro login "$DISTRO" -- "$PY" "$ENGINE" voices "${flags[@]}" 2>"$errf")" ||
-      die "Couldn't list the voices." "$(tail -n 1 "$errf"; rm -f "$errf")"
-    rm -f "$errf"
-    status_clear
-    printf '%s\n' "$out"
-    exit 0 ;;
+    "$APP/venv/bin/python" -u "$APP/engine.py" download
+    ;;
+  tidy)
+    apt-get clean
+    rm -rf /var/lib/apt/lists/* /root/.cache/pip /usr/share/man/* /usr/share/info/*
+    find /usr/share/doc -mindepth 2 ! -name copyright -delete 2>/dev/null || true
+    ;;
+  *)
+    echo "usage: setup-container.sh apt|pip|models|tidy" >&2; exit 2 ;;
 esac
+__KOKOMUX_FILE__
+cat > "$WORK/engine.py" <<'__KOKOMUX_FILE__'
+#!/usr/bin/env python3
+"""kokomux engine. Runs inside the "kokoro" Debian container.
 
-# ------------------------------------------------------------ options
+The `kokoro` command in Termux writes a job folder under /tmp/kokoro.XXXXXX
+(Termux's $PREFIX/tmp, shared with the container) and runs it either one-off
+or through the background server:
 
-out=""; infile=""; url=""; play=0; clip=0; restart=0; words=()
-voice="$(voice_mix)"; speed="$KOKORO_SPEED"; lang="$KOKORO_LANG"
-need() { [ $# -ge 2 ] || die "$1 needs a value." "See: kokoro --help"; }
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -o|--out)       need "$@"; out="$2"; shift 2 ;;
-    --out=*)        out="${1#*=}"; shift ;;
-    -f|--file)      need "$@"; infile="$2"; shift 2 ;;
-    --file=*)       infile="${1#*=}"; shift ;;
-    -u|--url)       need "$@"; url="$2"; shift 2 ;;
-    --url=*)        url="${1#*=}"; shift ;;
-    -v|--voice)     need "$@"; voice="$2"; shift 2 ;;
-    --voice=*)      voice="${1#*=}"; shift ;;
-    -s|--speed)     need "$@"; speed="$2"; shift 2 ;;
-    --speed=*)      speed="${1#*=}"; shift ;;
-    -l|--lang)      need "$@"; lang="$2"; shift 2 ;;
-    --lang=*)       lang="${1#*=}"; shift ;;
-    -p|--play)      play=1; shift ;;
-    -c|--clipboard) clip=1; shift ;;
-    --restart)      restart=1; shift ;;
-    --)             shift; words+=("$@"); break ;;
-    -?*)            die "Unknown option $1" "See: kokoro --help" ;;
-    *)              words+=("$1"); shift ;;
-  esac
-done
+  engine.py job /tmp/kokoro.XXXXXX/job      run one job
+  engine.py serve [--port N] [--idle SECS]  keep the model loaded, serve jobs
+  engine.py voices                          list voice names
+  engine.py download                        fetch the model and voices (resumable)
+  engine.py bench                           time Kokoro each way it can run here
+  (job and serve also take --threads N --block N: how onnxruntime runs)
 
-[[ "$voice" =~ $VOICE_RE ]] || die "\"$voice\" isn't a voice name." "One voice, like af_heart, or a blend, like af_heart:70+af_bella:30. See: kokoro --list-voices"
-[[ "$speed" =~ ^[0-9]*\.?[0-9]+$ ]] || die "Speed must be a number, like 1.2"
-[[ "$lang" =~ ^[A-Za-z0-9-]+$ ]] || die "\"$lang\" isn't a language code." "Try en-us, en-gb, es, fr-fr, it, pt-br or hi."
+A job folder holds `job` and `in.txt` (the text, unless url is set). `job` is
+key=value lines:
 
-[ "$play" = 1 ] || out="${out:-$KOKORO_OUT}"
-ext=""
-if [ -n "$out" ]; then
-  ext="$(printf '%s' "${out##*.}" | tr '[:upper:]' '[:lower:]')"
-  case "$ext" in wav|mp3|ogg|flac|m4b) ;; *) die "Can't save as \"$out\"." "End the name with .wav, .mp3, .ogg, .flac or .m4b (an audiobook with chapters)" ;; esac
-  [ -d "$(dirname "$out")" ] || die "The folder for \"$out\" doesn't exist."
-fi
-if [ "$ext" = m4b ] && ! command -v ffmpeg >/dev/null; then
-  die "Audiobooks need ffmpeg." "Install it with: pkg install ffmpeg"
-fi
-if [ "$play" = 1 ] && ! { command -v mpv && command -v socat; } >/dev/null; then
-  die "Playback needs mpv and socat." "Install them with: pkg install mpv socat"
-fi
+  voice   a voice, or a blend: af_heart:70+bf_emma:30     speed  0.5 to 2.0
+  lang    en-us, en-gb, es, fr-fr, it, pt-br, hi, ja, cmn  name   what it's called
+  url     read this page instead of in.txt               out    out.<ext>: save a file
+  stream  1: one part at a time, for listening           words  1: word timings too
+  start   the part to begin at                          of     the bookmark's count of parts
+  cache   the book's id: keep parts in /tmp/kokomux-cache/<id>/, reuse them
+  meta    1: write the EPUB's author and cover (for an audiobook)
 
-# ------------------------------------------------------------ job folder
+What it writes into the folder: `title`, `progress` ("part total"), `chapters`
+("first-part<TAB>title" per line), `plan` (every part, one line each:
+"characters-up-to-its-end<TAB>its text"), `rate` (characters spoken a second,
+from the parts made so far), `result` ("seconds-of-audio seconds-taken
+parts"), `out.<ext>` and `chapters_ms` when saving, and with stream=1
+`stream/NNNN.txt` (the part's text), `stream/NNNN.words` (its word timings),
+`stream/NNNN.wav` (its audio, with the pause after it; written last), `stream/first`
+(where it began) and `stream/end` once everything is made. With a cache, the
+stream files are relative links into it.
 
-tmpd="$(mktemp -d "$PREFIX/tmp/kokoro.XXXXXX")"
-gen_pid=""
-cleanup() {      # on exit: the screen, the bookmark message, mpv, the engine and the job folder
-  set +e   # best effort from here: a process that's already gone mustn't change the exit code
-  status_clear
-  [ "${in_line:-0}" = 1 ] && [ "${ui:-}" = inline ] && [ "${show_words:-0}" = 1 ] && block_finish
-  tui_close
-  keys_off
-  if [ "${ui:-none}" != none ] && [ -n "${book_id:-}" ] && [ -f "$BOOKS/$book_id.mark" ]; then
-    [ "${SLEPT:-0}" = 1 ] && info "Sleep timer: good night."
-    if [ "$(mark_get "$BOOKS/$book_id.mark" kind)" = novel ]; then
-      info "Stopped in $(mark_get "$BOOKS/$book_id.mark" chapter). ${D}kokoro --continue picks up there.${R}"
-    else
-      info "Stopped at part $(mark_get "$BOOKS/$book_id.mark" part) of $(mark_get "$BOOKS/$book_id.mark" parts). ${D}kokoro --continue picks up there.${R}"
-    fi
-  fi
-  if [ "${play:-0}" = 1 ]; then notify_clear; rm -f "$PLAYER_STATE"; fi
-  mpv_quit
-  [ "${WAKE:-0}" = 1 ] && termux-wake-unlock >/dev/null 2>&1
-  [ -n "$gen_pid" ] && kill "$gen_pid" 2>/dev/null
-  rm -rf "$tmpd"
-  if [ "$play" = 1 ] && [ "$(cat "$PLAYER_PID" 2>/dev/null)" = "$$" ]; then rm -f "$PLAYER_PID"; fi
-  return 0
-}
-trap cleanup EXIT
-# (see tick: during the frame timer a stop signal only sets a flag)
-on_signal() { if [ "$IN_TICK" = 1 ]; then STOP=1; else exit 130; fi; }
-trap on_signal INT TERM HUP
+While listening (stream=1, no out), the engine makes only AHEAD seconds of
+speech ahead of the part the player is on (the player writes its number into
+`at`), so a long book doesn't keep the phone's CPU busy for hours; parts
+already kept in the cache are linked at once.
 
-text="$tmpd/in.txt"
-book=0
-if [ -n "$url" ]; then
-  :
-elif [ "$clip" = 1 ]; then
-  command -v termux-clipboard-get >/dev/null ||
-    die "Reading the clipboard needs Termux:API." "Install the Termux:API app, then: pkg install termux-api"
-  # termux-clipboard-get waits forever without the Termux:API app, so give it a few
-  # seconds, show that it's waiting, and remember the answer for the home screen.
-  termux-clipboard-get > "$text" 2>/dev/null & cpid=$!
-  for n in $(seq 60); do
-    kill -0 "$cpid" 2>/dev/null || break
-    status "Reading the clipboard" "(this needs the Termux:API app)"; sleep 0.1
-  done
-  mkdir -p "$CONF_DIR"
-  if kill -0 "$cpid" 2>/dev/null || ! wait "$cpid"; then
-    kill "$cpid" 2>/dev/null || true
-    echo no > "$CONF_DIR/termux-api"
-    die "Couldn't read the clipboard: the Termux:API app didn't answer." \
-        "Install the Termux:API app from F-Droid (where you got Termux), open it once, then try again."
-  fi
-  echo yes > "$CONF_DIR/termux-api"
-elif [ -n "$infile" ]; then
-  [ -f "$infile" ] || die "There's no file called \"$infile\"."
-  cp "$infile" "$text"
-  magic=""; read -r -n 4 magic < "$infile" || true
-  case "$magic" in %PDF*|PK*) book=1 ;; esac   # a PDF or EPUB: the engine reads it
-elif [ ${#words[@]} -gt 0 ]; then
-  printf '%s\n' "${words[*]}" > "$text"
-elif [ ! -t 0 ]; then
-  cat > "$text"
-else
-  usage >&2; exit 2
-fi
+A web novel's chapter (url, with stream=1) is read on from chapter to chapter:
+the engine fetches the next one when the player reaches the last one made (the
+player writes the part it's on into `at`). It writes `novel` (title=, url=,
+prev=: the chapter before this listen's first) and `serial` ("first-part<TAB>
+number<TAB>address", in step with `chapters`). Parts are numbered across the
+whole listen; a job that picks up mid-listen says where its chapter starts
+(base=N) and has the earlier `chapters` and `serial` lines in its folder.
+skip=1 starts at the chapter after the one at url.
+"""
+import argparse
+import hmac
+import os
+import re
+import secrets
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+import zipfile
 
-# A copied link on its own means "read that page".
-if [ -z "$url" ] && [ "$book" = 0 ] && [ "$(wc -l < "$text")" -le 1 ] &&
-   grep -qE '^[[:space:]]*https?://[^[:space:]]+[[:space:]]*$' "$text"; then
-  url="$(tr -d '[:space:]' < "$text")"
-fi
-if [ -z "$url" ] && [ "$book" = 0 ] && ! grep -q '[^[:space:]]' "$text"; then
-  [ "$clip" = 1 ] && die "The clipboard is empty."
-  die "There's no text to read."
-fi
-[[ "$url" != *$'\n'* ]] || die "That doesn't look like a web address."
+APP = os.path.dirname(os.path.abspath(__file__))
+if APP not in sys.path:
+    sys.path.insert(0, APP)   # words.py, text.py and sources.py live beside this file
+from sources import (USER_AGENT, JobError, epub_meta, log, novel_next, read_page,  # noqa: E402
+                     read_source)
+from text import PAUSE, normalise, split_text  # noqa: E402
 
-# What it's called (the engine may find a better title inside), and, when
-# listening, a bookmark keyed by what's being read: the same text, file or page
-# picks up where it was stopped.
-if [ -n "$url" ]; then kind=url source=$url name=$url
-elif [ -n "$infile" ]; then kind=file source="$(realpath "$infile")" name="$(basename "$infile")"
-else kind=text source="" name="$(snippet "$text")"; fi
-book_id=""; start=1; was_parts=0
-if { [ "$play" = 1 ] && [ -z "$out" ]; } || [ "$ext" = m4b ]; then   # (an audiobook reuses what listening made)
-  if [ "$kind" = url ]; then book_id="$(printf '%s' "$url" | sha256sum | cut -c1-16)"
-  else book_id="$(sha256sum < "$text" | cut -c1-16)"; fi
-fi
-skip=0
-if [ "$play" = 1 ] && [ -z "$out" ]; then
-  # A web novel's chapter: its bookmark is the novel's, which names the chapter it's at.
-  if [ "$kind" = url ]; then
-    mark="$(grep -lFx "source=$url" "$BOOKS"/*.mark 2>/dev/null | head -n 1)" || true
-    if [ -n "$mark" ] && [ "$(mark_get "$mark" kind)" = novel ]; then book_id="$(basename "$mark" .mark)"; fi
-  fi
-  mark="$BOOKS/$book_id.mark"
-  if [ "$restart" = 1 ]; then [ "$(mark_get "$mark" kind)" = novel ] || rm -f "$mark" "$BOOKS/$book_id.txt"
-  elif [ "$(mark_get "$mark" "done")" = 1 ]; then          # heard to the latest chapter: on to the next
-    skip=1; info "On from $(mark_get "$mark" chapter)."
-  elif [ "$(mark_get "$mark" kind)" = novel ] && [ "$(mark_get "$mark" part)" -gt 1 ] 2>/dev/null; then
-    start="$(mark_get "$mark" part)"; was_parts="$(mark_get "$mark" parts)"
-    [[ "$was_parts" =~ ^[0-9]+$ ]] || was_parts=0
-    info "Picking up in $(mark_get "$mark" chapter), where you stopped."
-  elif [ -f "$mark" ] && [ "$(mark_get "$mark" part)" -gt 1 ] 2>/dev/null; then
-    start="$(mark_get "$mark" part)"; was_parts="$(mark_get "$mark" parts)"
-    [[ "$was_parts" =~ ^[0-9]+$ ]] && [ "$was_parts" -gt 0 ] || was_parts=0
-    if [ "$was_parts" -gt 0 ]; then
-      info "Picking up where you stopped, $(( (start - 1) * 100 / was_parts ))% of the way through."
-    else info "Picking up where you stopped."; fi
-    printf '  %s(--restart starts from the top)%s\n' "$D" "$R" >&2
-  fi
-fi
+MODELS = os.path.join(APP, "models")
+# Kokoro 82M v1.0 at full precision, exported with a "durations" output: it reports
+# when each sound is spoken, which is what lights up each word. Pinned to a commit.
+MODEL = os.path.join(MODELS, "kokoro-v1.0-timestamped.fp32.onnx")
+MODEL_SRC = ("https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX-timestamped/resolve/"
+             "dd4401a9add81ac692d20e240d22ec9dda82cc29/onnx/model.onnx")
+# A voice, or several blended: "af_heart", "af_heart+af_bella", "af_heart:70+af_bella:30"
+VOICE_SPEC = re.compile(r"^[a-z]{2}_[a-z]+(?::\d{1,3})?(?:\+[a-z]{2}_[a-z]+(?::\d{1,3})?){0,3}$")
+VOICES = os.path.join(MODELS, "voices-v1.0.bin")
+VOICES_SRC = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
+SERVER_DIR = "/tmp/kokoro-server"
+JOB_DIR_RE = re.compile(r"^/tmp/kokoro\.[A-Za-z0-9]+$")
+FORMATS = ("wav", "mp3", "ogg", "flac")
+SERVING = False
 
-# With -p on a terminal, show each line as it's read and light the spoken word,
-# in the full-screen reader (ui=tui) or inline below the command (ui=inline).
-show_words=0
-[ "$play" = 1 ] && [ "$LIVE" = 1 ] && [ "$KOKORO_WORDS" = 1 ] && show_words=1
-ui=none
-if [ "$play" = 1 ] && [ "$LIVE" = 1 ]; then
-  ui=inline; keys_on
-  if [ "$KOKORO_TUI" = 1 ] && [ -n "$KBD" ] && tui_fits; then ui=tui; fi
-fi
 
-write_job() {    # the job, for the engine (where it starts and how fast can change mid-listen)
-  local u=$url b=1
-  if [ -n "${NOVEL:-}" ]; then chapters_load; novel_at "$start"; u=$N_URL; b=$N_FIRST; fi   # (the chapter it's in)
-  echo "$start" > "$tmpd/at"
-  {
-    echo "voice=$voice"
-    echo "speed=$speed"
-    echo "lang=$lang"
-    [ -n "$u" ] && echo "url=$u"
-    [ "$b" -gt 1 ] && echo "base=$b"           # where that chapter starts in this listen
-    [ "$skip" = 1 ] && echo "skip=1"          # on from the chapter at url
-    echo "name=$name"
-    [ "$start" -gt 1 ] && echo "start=$start"
-    [ "$was_parts" -gt 0 ] && echo "of=$was_parts"   # the bookmark's count: the engine maps it if its parts differ
-    [ -n "$book_id" ] && echo "cache=$book_id"       # keep what's made, and reuse what was
-    if [ "$ext" = m4b ]; then echo "out=out.wav"; echo "meta=1"     # ffmpeg makes the .m4b from it
-    elif [ -n "$out" ]; then echo "out=out.$ext"; fi
-    [ "$play" = 1 ] && echo "stream=1"
-    [ "$show_words" = 1 ] && echo "words=1"
-  } > "$tmpd/job"
-  job="/tmp/$(basename "$tmpd")/job"   # the same file, as the container sees it
-}
-write_job
+# ------------------------------------------------------------------ model
 
-# The book's made audio is kept; the cache stays under KOKORO_CACHE_GB by letting
-# go of the books heard least recently.
-cache_trim() {
-  [ -d "$CACHE" ] || return 0
-  local cap=$(( ${KOKORO_CACHE_GB:-50} * 1024 )) total d
-  total="$(du -sm "$CACHE" 2>/dev/null | cut -f1)" || true   # (du complains about a part replaced as it counts)
-  while [ "${total:-0}" -gt "$cap" ]; do
-    d="$(find "$CACHE" -mindepth 1 -maxdepth 1 -type d ! -name "${book_id:-none}" -printf '%T@ %p\n' |
-         sort -n | head -n 1 | cut -d' ' -f2-)" || true
-    [ -n "$d" ] || break
-    rm -rf "$d"
-    total="$(du -sm "$CACHE" 2>/dev/null | cut -f1)" || true
-  done
-}
-if [ -n "$book_id" ]; then mkdir -p "$CACHE/$book_id"; touch "$CACHE/$book_id"; cache_trim; fi
+_tts = None
+_tts_lock = threading.Lock()
+# One synthesis at a time, across every job the server is running: espeak isn't
+# thread-safe, and the phone has only so much CPU. Held per part, not per job, so
+# a book playing for hours doesn't block a quick command.
+SYNTH_LOCK = threading.Lock()
 
-# Use the server if it's up (or start it); otherwise run the job directly.
-use_server=0
-if server_up || { [ "$KOKORO_AUTOSERVE" = 1 ] && start_server; }; then use_server=1; fi
 
-run_engine() {   # run the job: through the server, or one-off in the container
-  if [ "$use_server" = 1 ]; then
-    local rc=0
-    curl -s --fail-with-body -X POST -H "X-Kokoro-Token: $(server_token)" \
-      "http://127.0.0.1:$(server_port)/job?path=$job" || rc=$?
-    # 22 = the server answered with an error, which it has already printed.
-    [ "$rc" = 0 ] || [ "$rc" = 22 ] || echo "Error: lost contact with the Kokoro server (curl error $rc)"
-    [ "$rc" = 0 ] || return 1
-  else
-    proot-distro login "$DISTRO" --shared-tmp -- "$PY" "$ENGINE" job "$job" --threads "$KOKORO_THREADS" --block "$KOKORO_BLOCK"
-  fi
-}
+# How onnxruntime runs the model: threads (0: its own choice) and the dynamic block
+# base (0: off), which spreads work across cores of different speeds. kokoro
+# --benchmark finds the fastest on the phone; serve and job take them as set.
+TUNING = {"threads": 0, "block": 0}
 
-# What's happening, for the live status line.
-progress() {
-  local p n i
-  if [ -f "$tmpd/progress" ] && read -r i n < "$tmpd/progress"; then
-    if [ "$n" -gt 1 ]; then p="part $i of $n"; else p=""; fi
-    echo "$p"; return
-  fi
-  echo ""
-}
-waiting_label() {   # what the status line says while the next part is being made
-  if [ "$play" = 1 ] && [ "$i" -gt "$start" ]; then echo "Preparing"
-  elif [ "$start" -gt 1 ]; then echo "Picking up at part $start"
-  elif [ -f "$tmpd/progress" ]; then echo "Making speech"
-  elif [ -n "$url" ]; then echo "Fetching the page"
-  else echo "Getting ready"; fi
-}
 
-# ------------------------------------------------------------ audiobooks
-# -o book.m4b: the engine makes one WAV and says where each chapter starts;
-# ffmpeg turns it into AAC in an .m4b with chapter marks, title, author and cover.
+def load_kokoro(threads=0, block=0):
+    """Kokoro on a CPU session tuned this way."""
+    import onnxruntime as rt
+    from kokoro_onnx import Kokoro
+    so = rt.SessionOptions()
+    so.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_ALL
+    so.inter_op_num_threads = 1
+    if threads:
+        so.intra_op_num_threads = threads
+    if block:
+        so.add_session_config_entry("session.dynamic_block_base", str(block))
+    return Kokoro.from_session(rt.InferenceSession(MODEL, so, providers=["CPUExecutionProvider"]), VOICES)
 
-ffmeta() { sed 's/[=;#\\]/\\&/g' | tr '\n' ' ' | sed 's/ *$//'; }   # a value for ffmpeg's metadata file
-make_audiobook() { # make_audiobook WAV M4B
-  local wav=$1 m4b=$2 meta="$tmpd/ffmeta" total_ms title author line ms prev="" prev_t="" cover="" rc=1
-  title="$(cat "$tmpd/title" 2>/dev/null)"; [ -n "$title" ] || title=$name
-  author="$(cat "$tmpd/author" 2>/dev/null)" || author=""
-  total_ms=$(awk '{ printf "%d", $1 * 1000 }' "$tmpd/result")
-  {
-    echo ";FFMETADATA1"
-    echo "title=$(printf '%s' "$title" | ffmeta)"; echo "album=$(printf '%s' "$title" | ffmeta)"
-    [ -n "$author" ] && echo "artist=$(printf '%s' "$author" | ffmeta)"
-    echo "genre=Audiobook"
-    if [ -s "$tmpd/chapters_ms" ]; then
-      while IFS=$'\t' read -r ms line; do
-        [ -n "$prev" ] && printf '[CHAPTER]\nTIMEBASE=1/1000\nSTART=%s\nEND=%s\ntitle=%s\n' "$prev" "$ms" "$prev_t"
-        prev=$ms prev_t="$(printf '%s' "$line" | ffmeta)"
-      done < "$tmpd/chapters_ms"
-      printf '[CHAPTER]\nTIMEBASE=1/1000\nSTART=%s\nEND=%s\ntitle=%s\n' "$prev" "$total_ms" "$prev_t"
-    fi
-  } > "$meta"
-  for cover in "$tmpd"/cover.jpg "$tmpd"/cover.png ""; do [ -f "$cover" ] && break; done
-  local args=(-hide_banner -loglevel error -nostats -y -i "$wav" -i "$meta")
-  [ -n "$cover" ] && args+=(-i "$cover")
-  args+=(-map 0:a -map_metadata 1 -map_chapters 1)
-  [ -n "$cover" ] && args+=(-map 2:v -c:v copy -disposition:v:0 attached_pic)
-  args+=(-c:a aac -b:a 96k -ac 1 -movflags +faststart -f mp4 -progress pipe:1 "$m4b")
-  while IFS='=' read -r line ms; do         # ffmpeg reports how far it's got (out_time_us)
-    case "$line" in
-      out_time_us) [[ "$ms" =~ ^[0-9]+$ ]] && [ "$total_ms" -gt 0 ] && status "Making the audiobook" "$(( ms / 10 / total_ms ))%" ;;
-      rc) rc=$ms ;;
-    esac
-  done < <(ffmpeg "${args[@]}" 2>"$tmpd/ffmpeg.log"; echo "rc=$?")
-  status_clear
-  [ "$rc" = 0 ] || die "ffmpeg couldn't make the audiobook." "$(tail -n 2 "$tmpd/ffmpeg.log")"
-}
 
-# ------------------------------------------------------------ run
+def tts():
+    """Kokoro, loaded once."""
+    global _tts
+    with _tts_lock:
+        if _tts is None:
+            _tts = load_kokoro(TUNING["threads"], TUNING["block"])
+            # kokoro-onnx looks for an output called "duration"; this export calls it
+            # "durations". It's the second output either way, which is what it reads.
+            _tts.has_timings = len(_tts.sess.get_outputs()) > 1
+        return _tts
 
-if [ "$play" = 1 ]; then
-  stop_playback || true
-  rm -f "$CONTROL"                             # nothing left over from an earlier player
-  echo "$$" > "$PLAYER_PID"
-fi
-WAKE=0                                          # an audiobook can take a while: keep the phone awake
-if [ "$ext" = m4b ] && command -v termux-wake-lock >/dev/null && termux-wake-lock >/dev/null 2>&1; then WAKE=1; fi
-run_engine > "$tmpd/engine.log" 2>&1 & gen_pid=$!
-if [ "$ui" = tui ]; then
-  TUI_TITLE=$name; TUI_INFO="$(voice_label "$voice") · ${speed}×"; TUI_SPEED=$speed; tui_open
-fi
 
-i=$start
-while :; do
-  # The engine starts over at part 1 if a bookmark points past the end (the text changed).
-  [ "$i" = "$start" ] && [ -f "$tmpd/stream/first" ] && { read -r i < "$tmpd/stream/first" || i=$start; start=$i; was_parts=0; }
-  f="$(printf '%s/stream/%04d.wav' "$tmpd" "$i")"
-  if [ "$play" = 1 ] && [ -f "$f" ]; then
-    play_line "$f" "$i"
-    if [ -n "$JUMP" ]; then jump_to "$JUMP"; JUMP=""; continue; fi
-    i=$((i + 1))
-    if sleep_due "$i"; then SLEPT=1; bookmark_save "$i"; exit "$QUIT_RC"; fi   # the sleep timer: stop between parts
-  elif [ "$play" = 1 ] && [ -f "$tmpd/stream/end" ]; then
-    [ -f "$f" ] && continue   # a last chunk may have landed just now
-    break
-  elif ! kill -0 "$gen_pid" 2>/dev/null; then
-    [ "$play" = 1 ] && [ -f "$f" ] && continue
-    break
-  else
-    view_state "$(waiting_label)" "$(progress)"
-    view_refresh
-    tick 0.1
-    if [ -n "$KEY" ]; then
-      key_cmd; [ "$CMD" = quit ] && exit "$QUIT_RC"
-      [ -n "$CMD" ] && listen_cmd "$CMD" "$i" && [ -n "$JUMP" ] && { jump_to "$JUMP"; JUMP=""; }
-      case "$CMD_PENDING" in quit) exit "$QUIT_RC" ;; home) go_home ;; esac   # (chosen in the menu)
-      CMD_PENDING="${CMD_PENDING/toggle/}"
-    fi
-  fi
-done
-rc=0; wait "$gen_pid" || rc=$?
-gen_pid=""
-tui_close
-status_clear
-if [ "$play" = 1 ] && [ "$rc" = 0 ]; then bookmark_done; book_id=""; fi   # read to the end: no bookmark
+def voice_style(engine, spec):
+    """What to hand Kokoro for a voice: its name, or for a blend ("af_heart:70+af_bella:30")
+    the voices' styles mixed in those proportions. Weights left out are shared equally."""
+    if not VOICE_SPEC.match(spec or ""):
+        raise JobError(f"'{spec}' isn't a voice. See: kokoro --list-voices")
+    known = set(engine.get_voices())
+    parts = []
+    for item in spec.split("+"):
+        name, _, weight = item.partition(":")
+        if name not in known:
+            raise JobError(f"Unknown voice '{name}'. See: kokoro --list-voices")
+        parts.append((name, int(weight) if weight else None))
+    if len(parts) == 1:
+        return parts[0][0]
+    given = sum(w for _, w in parts if w is not None)
+    unset = [n for n, w in parts if w is None]
+    share = max(0, 100 - given) / len(unset) if unset else 0
+    weights = [(n, w if w is not None else share) for n, w in parts]
+    total = sum(w for _, w in weights)
+    if total <= 0:
+        raise JobError(f"The voices in '{spec}' need some weight, e.g. af_heart:70+af_bella:30")
+    import numpy as np
+    style = sum((w / total) * np.asarray(engine.get_voice_style(n), dtype=np.float32) for n, w in weights)
+    return style.astype(np.float32)
 
-if [ "$rc" != 0 ]; then
-  msg="$(grep -m1 '^Error: ' "$tmpd/engine.log" | sed 's/^Error: //')" || true
-  [ "$msg" = "Cancelled" ] && exit 130
-  if [ -n "$msg" ]; then die "$msg"; fi
-  printf '%s✗%s Something went wrong:\n' "$RED" "$R" >&2
-  tail -n 5 "$tmpd/engine.log" | sed "s/^/  $D/; s/\$/$R/" >&2
-  exit 1
-fi
 
-secs=""
-if [ -f "$tmpd/result" ] && read -r a _ < "$tmpd/result"; then secs="$(human_secs "$a") of audio"; fi
+# --- pronunciation ------------------------------------------------------------
+# English is turned into sounds by misaki, the dictionary-based tool Kokoro was
+# trained with: it reads "I read it yesterday", "record the record" and "$42.50"
+# the way people say them. Words it doesn't know, and other languages, go to espeak.
+_g2p = {}
+_g2p_lock = threading.Lock()
 
-if [ "$ext" = m4b ]; then
-  [ -f "$tmpd/out.wav" ] || die "No audio was made."
-  make_audiobook "$tmpd/out.wav" "$tmpd/book.m4b"
-  mv "$tmpd/book.m4b" "$out"
-  chapters=$(( $(wc -l < "$tmpd/chapters_ms" 2>/dev/null || echo 0) ))
-  [ "$chapters" -gt 1 ] && secs="${secs:+$secs · }$chapters chapters"
-  ext=saved
-fi
-if [ -n "$out" ]; then
-  [ "$ext" = saved ] || { [ -f "$tmpd/out.$ext" ] || die "No audio was made."; mv "$tmpd/out.$ext" "$out"; }
-  if [ "$LIVE" = 1 ]; then
-    size="$(human_size "$(stat -c %s "$out" 2>/dev/null || wc -c < "$out")")"
-    done_msg "Saved ${B}$out${R}" "${secs:+$secs · }$size"
-  else
-    echo "Saved $out" >&2
-  fi
-elif [ "$LIVE" = 1 ]; then
-  done_msg "Done" "$secs"
-fi
-__KOKOMUX_WRAPPER__
+
+def g2p_for(lang):
+    """misaki's English G2P (loaded once per accent), or None for other languages."""
+    if lang not in ("en-us", "en-gb"):
+        return None
+    british = lang == "en-gb"
+    with _g2p_lock:
+        if british not in _g2p:
+            from misaki import en, espeak
+            # Words it doesn't know go to espeak, the copy kokoro-onnx already set up.
+            _g2p[british] = en.G2P(trf=False, british=british, fallback=espeak.EspeakFallback(british=british))
+        return _g2p[british]
+
+
+def dictionary_phonemes(g2p, text):
+    """A part's sounds from misaki, and each highlighted word's own sounds, taken from the
+    same reading of the sentence (so "read" is "red" in both), for lining up its timing."""
+    import words
+    ps, tokens = g2p(text)
+    spans, pos = [], 0
+    for t in tokens:                    # where misaki's tokens ("Do", "n't") sit in the text
+        at = text.find(t.text, pos)
+        if at < 0:
+            continue
+        spans.append((at, at + len(t.text), t.phonemes or ""))
+        pos = at + len(t.text)
+    per = ["".join(p for s, e, p in spans if s < b and e > a) for a, b in words._tokens(text)]
+    return (ps or "").replace("❓", "").strip(), per
+
+
+def phonemize_many(words, lang, engine=None):
+    """Each word's phonemes on its own, the way Kokoro phonemises (call under SYNTH_LOCK)."""
+    import phonemizer
+    from kokoro_onnx.tokenizer import Tokenizer
+    vocab = (engine or tts()).tokenizer.vocab
+    out = phonemizer.phonemize([Tokenizer.normalize_text(w) for w in words], lang,
+                               preserve_punctuation=True, with_stress=True)
+    return ["".join(ch for ch in p if ch in vocab) for p in out]
+
+
+# ------------------------------------------------------------------ jobs
+
+def read_job(path):
+    real = os.path.realpath(path)
+    jobdir = os.path.dirname(real)
+    if not JOB_DIR_RE.match(jobdir) or os.path.basename(real) != "job":
+        raise JobError(f"Refusing job outside /tmp/kokoro.*: {path}")
+    job = {}
+    with open(real, encoding="utf-8") as fh:
+        for line in fh:
+            key, sep, val = line.rstrip("\n").partition("=")
+            if sep:
+                job[key] = val
+    return jobdir, job
+
+
+CACHE_ROOT = "/tmp/kokomux-cache"   # Termux's $PREFIX/tmp/kokomux-cache: made parts, kept per book
+
+
+def cache_dir(book, voice, speed, lang):
+    """Where a book's parts are kept for these settings (None: not kept)."""
+    if not re.fullmatch(r"[0-9a-f]{8,64}", book or ""):
+        return None
+    import hashlib
+    key = hashlib.sha1(f"{voice}|{speed:.2f}|{lang}|{os.path.basename(MODEL)}".encode()).hexdigest()[:12]
+    d = os.path.join(CACHE_ROOT, book, key)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def cached_part(cache, name, text):
+    """A kept part's audio, if it was made from exactly this text."""
+    wav, txt = os.path.join(cache, f"{name}.wav"), os.path.join(cache, f"{name}.txt")
+    try:
+        with open(txt, encoding="utf-8") as fh:
+            same = fh.read() == text
+    except OSError:
+        return None
+    return wav if same and os.path.exists(wav) else None
+
+
+def _link(src, dest):
+    """A relative link, so it resolves both in the container (/tmp) and in Termux ($PREFIX/tmp)."""
+    tmp = dest + ".lnk"
+    if os.path.lexists(tmp):
+        os.remove(tmp)
+    os.symlink(os.path.relpath(src, os.path.dirname(dest)), tmp)
+    os.replace(tmp, dest)
+
+
+def synthesize(engine, g2p, chunk, voice, speed, lang, timed, i):
+    """One part's audio, and its word timings when timed (else None)."""
+    import words
+    with SYNTH_LOCK:
+        ps, per = None, None
+        if g2p is not None:
+            try:
+                ps, per = dictionary_phonemes(g2p, chunk)
+            except Exception as e:      # a sentence misaki can't parse: espeak reads it
+                log(f"misaki: part {i}: {e.__class__.__name__}: {e}")
+                ps = None
+        if timed:
+            if ps:
+                samples, rate, timings = engine.create_timed(ps, voice=voice, speed=speed, lang=lang, is_phonemes=True)
+                return samples, rate, words.words_from_timings(chunk, timings, lambda ws: per)
+            samples, rate, timings = engine.create_timed(chunk, voice=voice, speed=speed, lang=lang)
+            return samples, rate, words.words_from_timings(chunk, timings, lambda ws: phonemize_many(ws, lang, engine))
+        if ps:
+            samples, rate = engine.create(ps, voice=voice, speed=speed, lang=lang, is_phonemes=True)
+        else:
+            samples, rate = engine.create(chunk, voice=voice, speed=speed, lang=lang)
+        return samples, rate, None
+
+
+def edges(samples, rate):
+    """Soften a part's first and last few milliseconds, so a trimmed edge can't click."""
+    import numpy as np
+    n = min(len(samples) // 4, int(rate * 0.004)), min(len(samples) // 4, int(rate * 0.012))
+    samples = np.array(samples, dtype=np.float32, copy=True)
+    if n[0]:
+        samples[:n[0]] *= np.linspace(0, 1, n[0], dtype=np.float32)
+    if n[1]:
+        samples[-n[1]:] *= np.linspace(1, 0, n[1], dtype=np.float32)
+    return samples
+
+
+def silence(seconds, rate):
+    import numpy as np
+    return np.zeros(max(0, int(seconds * rate)), dtype=np.float32)
+
+
+def _novel_listed(jobdir, base):
+    """The chapters already in this listen, before part BASE: (chapters lines, serial lines).
+    (A jump or a new speed starts a new job folder, with these copied into it.)"""
+    got = []
+    for name in ("chapters", "serial"):
+        try:
+            with open(os.path.join(jobdir, name), encoding="utf-8") as fh:
+                got.append([ln.rstrip("\n") for ln in fh if ln.strip() and int(ln.split("\t", 1)[0]) < base])
+        except (OSError, ValueError):
+            got.append([])
+    if len(got[0]) != len(got[1]):
+        return [], []
+    return got[0], got[1]
+
+
+# While listening, how much speech is made ahead of the player: about ten minutes
+# (a Fibonacci number of seconds), plenty to ride out a busy or throttled phone.
+AHEAD = 610
+
+
+def _listener_at(jobdir):
+    """The part the player is on (it writes it into `at`); 0 before it starts."""
+    try:
+        with open(os.path.join(jobdir, "at")) as fh:
+            return int(fh.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def _keep_ahead(jobdir, made):
+    """Wait until less than AHEAD seconds of speech is ready ahead of the player.
+    MADE: each part made in this job, and its length in seconds."""
+    while True:
+        if not os.path.isdir(jobdir):
+            raise JobError("Cancelled")
+        at = _listener_at(jobdir)
+        if sum(secs for part, secs in made.items() if part >= at) < AHEAD:
+            return
+        time.sleep(0.5)
+
+
+def _write_plan(jobdir, chunks):
+    """`plan`: every part, one line each (line N is part N): the characters read up to the
+    end of it, a tab, and its text. The player searches it and tells the time left from it.
+    (A novel's listen that picks up mid-way keeps the earlier lines, copied in.)"""
+    path = os.path.join(jobdir, "plan")
+    old = []
+    if any(c is None for c in chunks):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                old = [ln.rstrip("\n").partition("\t")[2] for ln in fh]
+        except OSError:
+            pass
+    lines, total = [], 0
+    for k, c in enumerate(chunks):
+        text = c[0] if c else (old[k] if k < len(old) else "")
+        total += len(text) + 1
+        lines.append(f"{total}\t{text}")
+    _write_atomic(path, "\n".join(lines) + "\n")
+
+
+def _settings(engine, job, jobdir):
+    """The job's voice, speed and language, checked; and where its file goes (None: no file)."""
+    voice = voice_style(engine, job.get("voice", "af_heart"))
+    try:
+        speed = float(job.get("speed", "1.0"))
+    except ValueError:
+        raise JobError("Speed must be a number, e.g. 1.2") from None
+    if not 0.5 <= speed <= 2.0:
+        raise JobError("Speed must be between 0.5 and 2.0")
+    out = job.get("out")
+    if out:
+        if "/" in out or out.rsplit(".", 1)[-1] not in FORMATS:
+            raise JobError(f"Output must be one of: {', '.join(FORMATS)}")
+        out = os.path.join(jobdir, out)
+    return voice, speed, job.get("lang", "en-us"), out
+
+
+def _number(job, key, default):
+    """A whole number from the job (DEFAULT if it's missing or isn't one)."""
+    try:
+        return int(job.get(key, default))
+    except ValueError:
+        return default
+
+
+class Listen:
+    """What a job reads, split into parts: chunks ([(text, pause)], part N at N-1),
+    starts (the chapters: "first<TAB>title"), and for a web novel the chapter being
+    read (novel) and serial ("first<TAB>number<TAB>address")."""
+
+    def __init__(self, jobdir, job, lang, stream):
+        self.jobdir, self.lang = jobdir, lang
+        self.chunks, self.starts, self.serial, self.novel = [], [], [], None
+        if job.get("url") and stream:
+            log(f"Fetching {job['url']}")
+            self.title, text, self.novel = read_page(job["url"])
+            if self.novel and job.get("skip") == "1":       # on from a chapter already heard
+                heard, self.novel = self.novel, novel_next(self.novel)
+                if not self.novel:
+                    raise JobError(f"No new chapter after {heard['label']} yet")
+            chapters = [] if self.novel else [(self.title, text)]
+        else:
+            self.title, chapters = read_source(jobdir, job)
+        if self.novel:
+            base = max(1, _number(job, "base", 1))          # this chapter's first part, in the whole listen
+            self.starts, self.serial = _novel_listed(jobdir, base)
+            self.chunks = [None] * (base - 1)
+            self.add_chapter(self.novel, new=base == 1 or not self.serial)
+        # Each chapter is split on its own, so a part never runs across chapters, and
+        # where each chapter starts is written down for the player's chapter list.
+        for heading, text in chapters:
+            parts = split_text(normalise(text, lang))
+            if parts:
+                self.starts.append(f"{len(self.chunks) + 1}\t{heading.replace(chr(9), ' ').replace(chr(10), ' ')[:80]}")
+                parts[-1] = (parts[-1][0], PAUSE["chapter"])         # a longer breath between chapters
+                self.chunks += parts
+        if not self.chunks:
+            raise JobError("No text to read")
+        if not self.novel:
+            if len(self.starts) > 1:
+                _write_atomic(os.path.join(jobdir, "chapters"), "\n".join(self.starts) + "\n")
+            _write_plan(jobdir, self.chunks)
+
+    def add_chapter(self, chapter, new=False):
+        """Add a novel's chapter to the listen: its parts, its line in `chapters` and in `serial`."""
+        parts = split_text(normalise(chapter["text"], self.lang))
+        if not parts:
+            return
+        parts[-1] = (parts[-1][0], PAUSE["chapter"])
+        first = len(self.chunks) + 1
+        self.starts.append(f"{first}\t{chapter['label'].replace(chr(9), ' ')[:80]}")
+        self.serial.append(f"{first}\t{chapter['number']}\t{chapter['url']}")
+        self.chunks += parts
+        _write_atomic(os.path.join(self.jobdir, "chapters"), "\n".join(self.starts) + "\n")
+        _write_atomic(os.path.join(self.jobdir, "serial"), "\n".join(self.serial) + "\n")
+        _write_plan(self.jobdir, self.chunks)
+        if new:                                     # the novel, and the chapter before this listen's first
+            _write_atomic(os.path.join(self.jobdir, "novel"),
+                          f"title={chapter['novel']}\nurl={chapter['novel_url']}\nprev={chapter['prev'] or ''}\n")
+
+    def more(self):
+        """A novel's next chapter, added once the listener has reached the last one made (so one
+        chapter is always ready ahead, and no more). False at the end of what's out."""
+        last = int(self.serial[-1].split("\t", 1)[0]) if self.serial else 0
+        while True:
+            if not os.path.isdir(self.jobdir):
+                raise JobError("Cancelled")
+            if _listener_at(self.jobdir) >= last:
+                break
+            time.sleep(0.5)
+        log(f"Fetching {self.novel['next']}")
+        nxt = novel_next(self.novel)
+        if not nxt:
+            return False
+        self.novel = nxt
+        self.add_chapter(nxt)
+        return True
+
+    def first(self, job):
+        """The part to begin at: the job's start, mapped onto these parts if the bookmark
+        counted them differently; not before a novel's chapter, nor past the end."""
+        first, was = _number(job, "start", 1), _number(job, "of", 0)
+        if was > 1 and was != len(self.chunks):
+            # Made with another version's parts: the same place, as a fraction of the text.
+            first = 1 + round((first - 1) * len(self.chunks) / was)
+        if self.novel:
+            return max(first, int(self.serial[-1].split("\t", 1)[0]))
+        return first if 1 <= first <= len(self.chunks) else 1   # a bookmark past the end: start again
+
+
+def _write_meta(jobdir, job):
+    """For an audiobook: who wrote the EPUB, and its cover (`author`, `cover.<ext>`)."""
+    src = os.path.join(jobdir, job.get("file", "in.txt"))
+    if job.get("url") or not zipfile.is_zipfile(src):
+        return
+    author, cover, ext = epub_meta(src)
+    _write_atomic(os.path.join(jobdir, "author"), author.replace("\n", " ")[:200] + "\n")
+    if cover:
+        with open(os.path.join(jobdir, f"cover.{ext}"), "wb") as fh:
+            fh.write(cover)
+
+
+def _keep(home, name, chunk, samples, rate, marks):
+    """Write a made part into HOME (the cache, or the stream folder): its text and word
+    timings first, so the player has them when the audio lands, then the audio."""
+    import soundfile as sf
+    import words
+    _write_atomic(os.path.join(home, f"{name}.txt"), chunk)
+    if marks is not None:
+        _write_atomic(os.path.join(home, f"{name}.words"), words.player_rows(chunk, marks))
+    tmp = os.path.join(home, f"{name}.tmp.wav")
+    sf.write(tmp, samples, rate)
+    os.replace(tmp, os.path.join(home, f"{name}.wav"))
+
+
+def run_job(path):
+    import numpy as np
+    import soundfile as sf
+
+    t0 = time.time()
+    jobdir, job = read_job(path)
+    engine = tts()
+    voice, speed, lang, out = _settings(engine, job, jobdir)
+    g2p = g2p_for(lang)
+
+    stream = None
+    timed = False
+    if job.get("stream") == "1":
+        stream = os.path.join(jobdir, "stream")
+        os.makedirs(stream, exist_ok=True)
+        # Word timings come from Kokoro itself, with the audio.
+        timed = job.get("words") == "1" and engine.has_timings
+        if job.get("words") == "1" and not timed:
+            _write_atomic(os.path.join(stream, "words-off"), "this model reports no timings\n")
+
+    writer = None
+    total = 0.0
+    try:
+        book = Listen(jobdir, job, lang, stream)
+        _write_atomic(os.path.join(jobdir, "title"), (book.title or "").replace("\n", " ")[:120] + "\n")
+        if job.get("meta") == "1":
+            _write_meta(jobdir, job)
+        first = book.first(job)
+        if stream:
+            _write_atomic(os.path.join(stream, "first"), f"{first}\n")
+
+        # (a novel's parts aren't kept: each listen numbers them from where it began)
+        cache = None if book.novel else cache_dir(job.get("cache", ""), job.get("voice", "af_heart"), speed, lang)
+        if cache and engine.has_timings:
+            timed = True                    # kept parts carry their word timings, whatever this run shows
+        chapter_at = {int(line.split("\t", 1)[0]): line.split("\t", 1)[1] for line in book.starts}
+        chapter_times, written = [], 0
+        made = {}                           # part -> seconds of speech, for keeping just ahead of the listener
+        heard_chars = 0                     # the characters in what's made, for the speech rate
+        i = first - 1
+        while True:
+            i += 1
+            if i > len(book.chunks) and not (book.novel and book.more()):
+                break
+            chunk, pause = book.chunks[i - 1]
+            # The kokoro command deletes its job folder when it exits or is
+            # stopped, so a vanished folder means nobody is waiting any more.
+            if not os.path.isdir(jobdir) or (stream and not os.path.isdir(stream)):
+                raise JobError("Cancelled")
+            _write_atomic(os.path.join(jobdir, "progress"), f"{i} {len(book.chunks)}\n")
+            name = f"{i:04d}"
+            got = cached_part(cache, name, chunk) if cache else None
+            if not got and stream and not out:
+                _keep_ahead(jobdir, made)       # (a kept part costs nothing: it's linked at once)
+            if got:
+                info = sf.info(got)
+                rate, length = info.samplerate, info.frames
+                samples = sf.read(got, dtype="float32")[0] if out else None
+            else:
+                samples, rate, marks = synthesize(engine, g2p, chunk, voice, speed, lang, timed, i)
+                samples = np.concatenate([edges(samples, rate), silence(pause, rate)])   # mpv plays them back to back
+                length = len(samples)
+                if cache or stream:
+                    _keep(cache or stream, name, chunk, samples, rate, marks)
+            if stream and cache:
+                for ext in ("txt", "words", "wav"):                  # (the audio last: the player waits for it)
+                    src = os.path.join(cache, f"{name}.{ext}")
+                    if os.path.exists(src):
+                        _link(src, os.path.join(stream, f"{name}.{ext}"))
+            if chapter_at.get(i) is not None and out:
+                chapter_times.append((round(written / rate * 1000), chapter_at[i]))
+            total += length / rate
+            made[i] = length / rate
+            heard_chars += len(chunk) + 1
+            # How fast this voice reads, in characters a second: the player tells the time left by it.
+            _write_atomic(os.path.join(jobdir, "rate"), f"{heard_chars / total:.3f}\n")
+            if out:
+                # Written as it's made, so a whole book never has to fit in memory.
+                if writer is None:
+                    writer = sf.SoundFile(out, "w", samplerate=rate, channels=1)
+                if i == len(book.chunks):
+                    samples = samples[:max(0, len(samples) - int(pause * rate))]   # no pause after the end
+                writer.write(samples)
+                written += len(samples)
+        if out:
+            total = written / rate if written else total     # (no pause after the last part)
+        if out and chapter_times:
+            _write_atomic(os.path.join(jobdir, "chapters_ms"),
+                          "".join(f"{ms}\t{title}\n" for ms, title in chapter_times))
+    finally:
+        if writer is not None:
+            writer.close()
+        if stream and os.path.isdir(stream):
+            open(os.path.join(stream, "end"), "w").close()
+
+    elapsed = time.time() - t0
+    _write_atomic(os.path.join(jobdir, "result"), f"{total:.1f} {elapsed:.1f} {len(book.chunks)}\n")
+    return f"Made {total:.1f}s of audio in {elapsed:.1f}s"
+
+
+def _write_atomic(path, text):
+    try:
+        with open(path + ".tmp", "w") as fh:
+            fh.write(text)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass  # the job folder vanished (cancelled); the loop will notice
+
+
+# ------------------------------------------------------------------ server
+
+def serve(port, idle):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    global SERVING
+    SERVING = True
+    log("Loading model...")
+    tts()
+    g2p_for("en-us")                    # (a few seconds: done before the first job)
+    token = secrets.token_hex(16)
+    state = {"last": time.time(), "busy": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def _reply(self, code, text):
+            body = (text + "\n").encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _authorized(self):
+            given = self.headers.get("X-Kokoro-Token", "")
+            if hmac.compare_digest(given, token):
+                return True
+            self._reply(403, "bad token")
+            return False
+
+        def do_GET(self):
+            if urlparse(self.path).path == "/health" and self._authorized():
+                self._reply(200, "ok")
+            elif urlparse(self.path).path != "/health":
+                self._reply(404, "not found")
+
+        def do_POST(self):
+            if not self._authorized():
+                return
+            url = urlparse(self.path)
+            if url.path == "/shutdown":
+                self._reply(200, "bye")
+                threading.Thread(target=httpd.shutdown, daemon=True).start()
+                return
+            if url.path != "/job":
+                self._reply(404, "not found")
+                return
+            path = parse_qs(url.query).get("path", [""])[0]
+            state["busy"] += 1
+            try:
+                msg = run_job(path)
+                self._reply(200, msg)
+            except JobError as e:
+                self._reply(400, f"Error: {e}")
+            except Exception as e:  # noqa: BLE001 - send the error to the client
+                self._reply(500, f"Error: {type(e).__name__}: {e}")
+            finally:
+                state["busy"] -= 1
+                state["last"] = time.time()
+
+        def log_message(self, fmt, *args):
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    httpd.daemon_threads = True
+
+    # Publish the token only once we're listening. $PREFIX/tmp is private to
+    # Termux, so other apps on the phone can't use the server.
+    os.makedirs(SERVER_DIR, exist_ok=True)
+    tok = os.path.join(SERVER_DIR, "token")
+    with open(tok + ".tmp", "w") as fh:
+        fh.write(f"{port} {token}\n")
+    os.chmod(tok + ".tmp", 0o600)
+    os.replace(tok + ".tmp", tok)
+
+    def watch_idle():
+        while True:
+            time.sleep(15)
+            if idle and not state["busy"] and time.time() - state["last"] > idle:
+                log(f"Idle for {idle // 60} min, stopping")
+                httpd.shutdown()
+                return
+
+    threading.Thread(target=watch_idle, daemon=True).start()
+    log(f"Ready on 127.0.0.1:{port}")
+    try:
+        httpd.serve_forever()
+    finally:
+        try:
+            with open(tok) as fh:
+                if token in fh.read():
+                    os.remove(tok)
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------------ benchmark and download
+
+BENCH_TEXT = ("The road left the village at first light and climbed into the hills, where the fields "
+              "gave way to heather. For three days she walked without meeting anyone, sleeping in the "
+              "lee of stone walls and waking to the sound of sheep.")
+
+
+def benchmark():
+    """Time Kokoro on this phone with each way of running it, and say which is fastest.
+    Prints "@@bench THREADS BLOCK SECONDS SPEED" per try, then "@@best THREADS BLOCK SPEED"."""
+    cpus = os.cpu_count() or 4
+    tries = [(0, 0)] + [(t, b) for t in sorted({2, 4, 6, 8, cpus}) if t <= cpus for b in (0, 4)]
+    best = None
+    for threads, block in tries:
+        k = load_kokoro(threads, block)
+        k.create(BENCH_TEXT, voice="af_heart")                    # warm up
+        took = []
+        for _ in range(2):
+            t0 = time.time()
+            audio, rate = k.create(BENCH_TEXT, voice="af_heart")
+            took.append(time.time() - t0)
+        secs = min(took)
+        speed = len(audio) / rate / secs
+        print(f"@@bench {threads} {block} {secs:.2f} {speed:.1f}", flush=True)
+        if best is None or speed > best[2]:
+            best = (threads, block, speed)
+        del k
+    print(f"@@best {best[0]} {best[1]} {best[2]:.1f}", flush=True)
+
+
+def download():
+    os.makedirs(MODELS, exist_ok=True)
+    for dest, src, label in ((MODEL, MODEL_SRC, "model"), (VOICES, VOICES_SRC, "voices")):
+        name = os.path.basename(dest)
+        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            print(f"@@progress {label} 100 0 0")
+            print(f"{name}: already downloaded", flush=True)
+            continue
+        part = dest + ".part"
+        for attempt in range(1, 6):
+            have = os.path.getsize(part) if os.path.exists(part) else 0
+            req = urllib.request.Request(src, headers={"User-Agent": USER_AGENT})
+            if have:
+                req.add_header("Range", f"bytes={have}-")
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    if have and r.status != 206:
+                        have = 0  # server ignored the range; start over
+                    size = have + int(r.headers.get("Content-Length", 0))
+                    with open(part, "ab" if have else "wb") as fh:
+                        done, shown = have, -1
+                        while block := r.read(1 << 18):
+                            fh.write(block)
+                            done += len(block)
+                            pct = done * 100 // size if size else 0
+                            if pct != shown:
+                                shown = pct
+                                # "@@progress LABEL PCT DONE_MB TOTAL_MB"
+                                print(f"@@progress {label} {pct} {done / 2**20:.0f} {size / 2**20:.0f}", flush=True)
+                os.replace(part, dest)
+                break
+            except OSError as e:
+                print(f"{name}: download interrupted ({e}), retry {attempt}/5", flush=True)
+                time.sleep(2 * attempt)
+        else:
+            sys.exit(f"Couldn't download {name}. Try again: it picks up where it stopped.")
+
+
+# ------------------------------------------------------------------ voices
+
+LANGS = {"a": ("American English", "en-us"), "b": ("British English", "en-gb"),
+         "e": ("Spanish", "es"), "f": ("French", "fr-fr"), "h": ("Hindi", "hi"),
+         "i": ("Italian", "it"), "j": ("Japanese", "ja"),
+         "p": ("Brazilian Portuguese", "pt-br"), "z": ("Mandarin Chinese", "cmn")}
+
+
+def sgr(params, fallback):
+    """An SGR escape from kokoro's theme ("38;2;182;156;255"), or the fallback."""
+    return f"\033[{params}m" if params and all(c in "0123456789;" for c in params) else fallback
+
+
+def print_voices(names, width, default, accent="", muted=""):
+    """Group voices by language and gender, wrapped to the terminal width.
+    Colour only when stdout is a terminal, in kokoro's theme colours."""
+    tty = (sys.stdout.isatty() or "--color" in sys.argv) and not os.environ.get("NO_COLOR")
+    bold, dim, acc, off = ("\033[1m", sgr(muted, "\033[2m"), sgr(accent, "\033[38;5;141m"), "\033[0m") if tty else ("",) * 4
+    width = max(30, min(width, 100))
+    groups = {}
+    for n in names:
+        groups.setdefault(n[0], {}).setdefault(n[1] if len(n) > 1 else "?", []).append(n)
+    for code in sorted(groups, key=lambda c: list(LANGS).index(c) if c in LANGS else 99):
+        title, lang = LANGS.get(code, (f"Other ({code})", ""))
+        note = " (basic pronunciation)" if code in "jz" else ""
+        print(f"{bold}{title}{off}{dim}{note}" + (f" -l {lang}" if lang else "") + off)
+        for g, label in (("f", "female"), ("m", "male")):
+            vs = groups[code].get(g)
+            if not vs:
+                continue
+            line, cur = [], 9
+            out = []
+            for v in vs:
+                shown = f"{acc}{v}*{off}" if v == default else v
+                w = len(v) + (1 if v == default else 0) + 1
+                if cur + w > width and line:
+                    out.append(" ".join(line))
+                    line, cur = [], 9
+                line.append(shown)
+                cur += w
+            out.append(" ".join(line))
+            print(f"  {dim}{label:<7}{off}" + f"\n  {'':<7}".join(out))
+        print()
+    if default:
+        other = "bm_george" if default != "bm_george" else "af_heart"
+        print(f"{dim}* your default{off}")
+        print(f"{dim}Try another: kokoro -v {other} -p \"Hi\"{off}")
+
+
+# ------------------------------------------------------------------ main
+
+def main():
+    p = argparse.ArgumentParser(prog="engine.py")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    j = sub.add_parser("job")
+    j.add_argument("path")
+    s = sub.add_parser("serve")
+    s.add_argument("--port", type=int, default=8880)
+    s.add_argument("--idle", type=int, default=1800, help="stop after this many idle seconds (0 = never)")
+    for sp in (s, j):
+        sp.add_argument("--threads", type=int, default=0, help="onnxruntime threads (0: its choice)")
+        sp.add_argument("--block", type=int, default=0, help="onnxruntime dynamic block base (0: off)")
+    v = sub.add_parser("voices")
+    v.add_argument("--plain", action="store_true", help="one name per line")
+    v.add_argument("--width", type=int, default=60)
+    v.add_argument("--default", default="")
+    v.add_argument("--color", action="store_true", help="colour even when piped")
+    v.add_argument("--accent", default="", help="SGR parameters for the accent colour")
+    v.add_argument("--muted", default="", help="SGR parameters for secondary text")
+    sub.add_parser("download")
+    sub.add_parser("bench", help="time Kokoro each way it can run here")
+    a = p.parse_args()
+
+    if a.cmd in ("job", "serve"):
+        TUNING.update(threads=max(0, a.threads), block=max(0, a.block))
+    if a.cmd == "job":
+        try:
+            log(run_job(a.path))
+        except JobError as e:
+            sys.exit(f"Error: {e}")
+    elif a.cmd == "serve":
+        serve(a.port, a.idle)
+    elif a.cmd == "voices":
+        names = sorted(tts().get_voices())
+        if a.plain:
+            print("\n".join(names))
+        else:
+            print_voices(names, a.width, a.default, a.accent, a.muted)
+    elif a.cmd == "download":
+        download()
+    elif a.cmd == "bench":
+        benchmark()
+
+
+if __name__ == "__main__":
+    main()
+__KOKOMUX_FILE__
+cat > "$WORK/text.py" <<'__KOKOMUX_FILE__'
+"""kokomux: text made speakable, and split into parts. Runs inside the container.
+
+normalise() tidies what's meant for the eye (ligatures, footnote marks, links,
+dashes, Roman numerals in headings, abbreviations and units), and split_text()
+cuts the result into parts of whole sentences, each with the pause after it.
+Pure Python: the tests import it bare.
+"""
+import re
+
+MAX_CHUNK = 360  # characters per part: whole sentences, under Kokoro's 510 sounds
+
+
+# Pauses between parts, in seconds. Inside a part Kokoro pauses 0.25 s at a
+# full stop; between parts the same, longer after a paragraph and a chapter,
+# in golden-ratio steps (0.25 × φ² and × φ³).
+PAUSE = {"sentence": 0.25, "paragraph": 0.65, "chapter": 1.06}
+
+# --- tidying text before it's spoken -----------------------------------------
+# Kokoro reads what it's given, so things meant for the eye are made speakable
+# first: ligatures, footnote marks, links, markdown, dashes, Roman numerals in
+# headings, ALL-CAPS headings, and (in English) abbreviations and units. The
+# reader shows the tidied text, so what's lit is what's said.
+
+_INVISIBLE = dict.fromkeys(map(ord, "­​‌‍⁠﻿"))
+_LIGATURES = {"ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl",
+              "ﬅ": "st", "ﬆ": "st", "Ĳ": "IJ", "ĳ": "ij"}
+_ROMAN = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+_HEADING_WORDS = (r"Chapter|Part|Book|Volume|Vol\.|Act|Scene|Section|Canto|Letter|Appendix|"
+                  r"Chapitre|Partie|Livre|Capítulo|Capitulo|Parte|Libro|Capitolo|Kapitel|Teil|Buch")
+# "Chapter IV" or "CHAPTER IV", where the numeral ends the phrase ("the part I liked" stays)
+_HEADING_RE = re.compile(r"\b((?:" + "|".join(f"{w}|{w.upper()}" for w in _HEADING_WORDS.split("|")) +
+                         r"))[ \t]+([IVXLCDM]+)(?=[ \t]*(?:\n|$|[.:,;)–—-])|[ \t]+[A-Z\"“'‘])", re.M)
+_TITLES = {"Mr": "Mister", "Mrs": "Missus", "Ms": "Miz", "Dr": "Doctor", "Prof": "Professor",
+           "St": "Saint", "Gen": "General", "Capt": "Captain", "Lt": "Lieutenant",
+           "Sgt": "Sergeant", "Col": "Colonel", "Rev": "Reverend", "Hon": "Honourable"}
+_PHRASES = [(r"\be\.[ \t]?g\.", "for example"), (r"\bi\.[ \t]?e\.", "that is"),
+            (r"\betc\.", "etcetera."), (r"\bvs\.?(?=[ \t])", "versus"), (r"\bapprox\.", "approximately"),
+            (r"\bNo\.(?=[ \t]*\d)", "number"), (r"\bFig\.(?=[ \t]*\d)", "figure"),
+            (r"\bpp\.(?=[ \t]*\d)", "pages"), (r"\bp\.(?=[ \t]*\d)", "page")]
+# unit: (singular, plural), spoken after a number; (American, British) spellings
+_UNITS = [("km/h", ("kilometer per hour", "kilometers per hour"), ("kilometre per hour", "kilometres per hour")),
+          ("mph", ("mile per hour", "miles per hour"), None),
+          ("km", ("kilometer", "kilometers"), ("kilometre", "kilometres")),
+          ("cm", ("centimeter", "centimeters"), ("centimetre", "centimetres")),
+          ("mm", ("millimeter", "millimeters"), ("millimetre", "millimetres")),
+          ("kg", ("kilogram", "kilograms"), None),
+          ("mg", ("milligram", "milligrams"), None),
+          ("ml", ("milliliter", "milliliters"), ("millilitre", "millilitres")),
+          ("lbs?", ("pound", "pounds"), None),
+          ("ft", ("foot", "feet"), None),
+          ("GB", ("gigabyte", "gigabytes"), None), ("MB", ("megabyte", "megabytes"), None),
+          ("KB", ("kilobyte", "kilobytes"), None), ("kB", ("kilobyte", "kilobytes"), None)]
+
+
+_TITLE_RE = re.compile(r"\b(" + "|".join(_TITLES) + r")\.(?=[ \t]+[A-Z])")
+_UNIT_WORDS = {u: (us, gb) for u, us, gb in _UNITS}
+_UNIT_RE = re.compile(r"(?<![\w.])(\d+(?:[.,]\d+)?)[ \t]?(" + "|".join(u for u, _, _ in _UNITS) + r")\b")
+
+
+def roman(s):
+    """A Roman numeral's value, or None if it isn't one ("MMXXIV" -> 2024)."""
+    s = s.upper()
+    if not s or not re.fullmatch(r"M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})", s):
+        return None
+    total = 0
+    for i, ch in enumerate(s):
+        v = _ROMAN[ch]
+        total += -v if i + 1 < len(s) and _ROMAN[s[i + 1]] > v else v
+    return total
+
+
+def _caps_heading(line):
+    """ "CHAPTER ONE: THE ROAD" -> "Chapter One: The Road" (only whole lines in capitals)."""
+    letters = [c for c in line if c.isalpha()]
+    words = re.findall(r"[^\W\d_]{2,}", line)
+    if len(letters) < 4 or len(words) < 2 or not all(c.isupper() for c in letters):
+        return line
+    return re.sub(r"[^\W\d_]+", lambda m: m.group(0)[0] + m.group(0)[1:].lower(), line)
+
+
+def _english(text, lang):
+    text = _TITLE_RE.sub(lambda m: _TITLES[m.group(1)], text)   # titles before a name: "Dr. Smith"
+    for pat, rep in _PHRASES:
+        text = re.sub(pat, rep, text)
+    text = re.sub(r"(?<=\d)[ \t]?([ap])\.[ \t]?m\.", lambda m: f" {m.group(1).upper()}M" +   # 5 p.m. -> 5 PM
+                  ("." if re.match(r"[ \t]+[\"“]?[A-Z]|[ \t]*(?:\n|$)", m.string[m.end():]) else ""),
+                  text, flags=re.I)
+    text = re.sub(r"(?<=\d)[ \t]?°[ \t]?C\b", " degrees Celsius", text)
+    text = re.sub(r"(?<=\d)[ \t]?°[ \t]?F\b", " degrees Fahrenheit", text)
+    text = re.sub(r"(?<=\d)[ \t]?°", " degrees", text)
+    british = lang == "en-gb"
+
+    def unit(m):
+        us, gb = _UNIT_WORDS[m.group(2) if m.group(2) not in ("lb", "lbs") else "lbs?"]
+        one, many = gb if british and gb else us
+        return f"{m.group(1)} {one if m.group(1) == '1' else many}"
+    text = _UNIT_RE.sub(unit, text)
+    text = re.sub(r"(?<=[ \t])&(?=[ \t])", "and", text)
+    return text
+
+
+def normalise(text, lang="en-us"):
+    """Make text speakable (see above). Line breaks, which mark paragraphs, are kept.
+    Each rule runs once over the whole text, so a long book stays quick."""
+    text = text.translate(_INVISIBLE)
+    for k, v in _LIGATURES.items():
+        text = text.replace(k, v)
+    text = re.sub(r"[¹²³⁰-⁹]+", "", text)                 # footnote marks¹²
+    text = re.sub(r"\[(?:\d+(?:\s*[,–-]\s*\d+)*|[a-z]|note \d+|citation needed|clarification needed)\]", "", text)
+    text = re.sub(r"\b(?:https?://|www\.)(?:www\.)?([\w-]+(?:\.[\w-]+)+)[^\s)\]]*?(?=[.,;:!?)\]]?(?:\s|$))",
+                  r"\1", text)                                                         # links: their site
+    text = re.sub(r"(?m)^[ \t]*(?:#{1,6}|>+|[-*+•·▪◦‣])[ \t]+", "", text)            # markdown marks, bullets
+    text = re.sub(r"(?<![\w*])(\*\*\*|___|\*\*|__|\*|_)(?=\S)([^\n]+?)(?<=\S)\1(?![\w*])", r"\2", text)
+    text = re.sub(r"(?<=\d)[ \t]?[–—][ \t]?(?=\d)", " to ", text)                     # 1990–1995
+    text = re.sub(r"[ \t]*(?:—|–|--)[ \t]*", ", ", text)                             # dashes: a pause
+    text = re.sub(r"([!?])\1+", r"\1", text)
+    text = re.sub(r"(?m)^[ \t]+|[ \t]+$", "", text)
+    text = re.sub(r"(?m)^([IVXLCDM]+)([.:]?)$",                                       # a heading: "IV."
+                  lambda m: f"{roman(m.group(1))}{m.group(2) or '.'}" if roman(m.group(1)) else m.group(0), text)
+    text = _HEADING_RE.sub(lambda m: f"{m.group(1)} {roman(m.group(2))}" if roman(m.group(2)) else m.group(0),
+                           text)                                                       # "Chapter IV"
+    text = re.sub(r"(?m)^[^\na-z]*[A-Z][^\na-z]*$", lambda m: _caps_heading(m.group(0)), text)
+    if lang.startswith("en"):
+        text = _english(text, lang)
+    return re.sub(r"[ \t]{2,}", " ", text)
+
+
+# --- splitting into parts ----------------------------------------------------
+_ABBREV = re.compile(r"(?:\b(?:[A-Z]|Mr|Mrs|Ms|Dr|St|Prof|Sr|Sra|Jr|Mt|Gen|Capt|Lt|Sgt|Col|Rev|Hon|"
+                     r"Inc|Ltd|Co|vs|etc|approx|No|Fig|M|Mme|Mlle|Hr|Fr|Dra|Sig|Sto)\.)$")
+_SENTENCE_END = re.compile(r"(?<=[.!?…])[\"”’»)\]]*\s+")
+
+
+def sentences(paragraph):
+    """A paragraph's sentences, not broken after an initial or abbreviation ("J. R. R.", "Mme.")
+    or before a word in lower case ("approx. five")."""
+    out = []
+    for piece in (p for p in re.split(r"((?<=[.!?…])[\"”’»)\]]*)\s+", paragraph)):
+        if piece is None:
+            continue
+        if out and not out[-1].endswith(" ") and re.fullmatch(r"[\"”’»)\]]*", piece):
+            out[-1] += piece + " "                  # closing quotes stay with their sentence
+            continue
+        if out and (_ABBREV.search(out[-1].rstrip()) or (piece[:1].islower())):
+            out[-1] = out[-1].rstrip() + " " + piece
+        else:
+            out.append(piece)
+    return [s.strip() for s in out if re.search(r"\w", s)]
+
+
+def _clauses(sentence, limit):
+    """A sentence longer than the limit, cut at commas, semicolons and colons."""
+    parts, cur = [], ""
+    for bit in re.split(r"(?<=[,;:])\s+", sentence):
+        if cur and len(cur) + len(bit) + 1 > limit:
+            parts.append(cur)
+            cur = bit
+        else:
+            cur = f"{cur} {bit}" if cur else bit
+    return parts + [cur] if cur else parts
+
+
+def split_text(text):
+    """Split into parts: (text, pause after it). The first part is short, so playback
+    starts quickly; then whole sentences up to MAX_CHUNK characters. A part never
+    runs across a paragraph (a line break), and each paragraph ends with a longer
+    pause. The last part's pause is a paragraph's; the caller makes it a chapter's."""
+    chunks = []
+    for para in text.split("\n"):
+        cur = ""
+        for sent in sentences(para.strip()):
+            for bit in (_clauses(sent, MAX_CHUNK) if len(sent) > 2 * MAX_CHUNK else [sent]):
+                limit = 40 if not chunks else MAX_CHUNK
+                if cur and len(cur) + 1 + len(bit) > limit:
+                    chunks.append((cur, PAUSE["sentence"]))
+                    cur = bit
+                else:
+                    cur = f"{cur} {bit}" if cur else bit
+        if cur:
+            chunks.append((cur, PAUSE["paragraph"]))
+    return chunks
+__KOKOMUX_FILE__
+cat > "$WORK/sources.py" <<'__KOKOMUX_FILE__'
+"""kokomux: what a job reads. Runs inside the container.
+
+Web pages (the article, found by trafilatura), web novels' chapters (the
+chapter's text, its number, and the next and previous chapters), EPUBs
+(chapters in reading order, author and cover) and PDFs (lines joined back
+into sentences). Pages are fetched with curl, as the phone's browser would.
+trafilatura and pypdf are imported where they're used, so this imports bare.
+"""
+import os
+import re
+import sys
+import urllib.parse
+import zipfile
+from html.parser import HTMLParser
+
+# A phone browser's: some sites (behind Cloudflare, say) turn other clients away.
+USER_AGENT = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36"
+
+
+class JobError(Exception):
+    """A problem with the request itself (bad voice, empty text...)."""
+
+
+def log(msg):
+    """A line for the server's log (stderr)."""
+    print(msg, file=sys.stderr, flush=True)
+
+
+# ------------------------------------------------------------------ web pages
+
+class _ChapterText(HTMLParser):
+    """An EPUB chapter's readable text: paragraphs, headings, list items. Skips
+    navigation, tables and citations, prefers <article>/<main> content when there's
+    enough of it, and stops at "References" etc. (Web pages go through trafilatura.)"""
+    SKIP_TAGS = {"script", "style", "noscript", "nav", "header", "footer", "aside",
+                 "form", "svg", "button", "select", "template", "iframe", "table",
+                 "figure", "sup", "math"}
+    # Whole words from class/id/role names that mark non-article parts.
+    SKIP_WORDS = {
+        "nav", "navbar", "navbox", "navigation", "menu", "footer", "sidebar",
+        "comment", "comments", "share", "sharing", "social", "related",
+        "reference", "references", "reflist", "infobox", "toc", "hatnote",
+        "metadata", "editsection", "ad", "ads", "advert", "advertisement",
+        "cookie", "cookies", "banner", "breadcrumb", "breadcrumbs", "subscribe",
+        "newsletter", "caption", "thumb", "promo", "popup", "modal", "noprint"}
+    NEVER_SKIP = {"html", "body", "main", "article"}
+    VOID = {"br", "img", "input", "meta", "link", "hr", "source", "wbr", "area", "col"}
+    BLOCK = {"p", "h1", "h2", "h3", "h4", "li", "blockquote", "pre", "dd"}
+    HEADINGS = {"h1", "h2", "h3", "h4"}
+    END_SECTIONS = {"references", "see also", "external links", "further reading",
+                    "notes", "bibliography", "sources", "citations", "footnotes",
+                    "related articles", "comments"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.skip_tag, self.skip_depth = None, 0
+        self.article = 0
+        self.block = None
+        self.buf = []
+        self.blocks = []  # (in_article, text)
+        self.heading = ""  # the first heading: the chapter's title
+        self.done = False
+
+    def handle_starttag(self, tag, attrs):
+        if self.skip_tag:
+            if tag == self.skip_tag:
+                self.skip_depth += 1
+            return
+        if tag in self.VOID:
+            if tag == "br":
+                self.buf.append(" ")
+            return
+        a = dict(attrs)
+        hint = f"{a.get('class') or ''} {a.get('id') or ''} {a.get('role') or ''}"
+        words = set(re.split(r"[^a-z]+", hint.lower()))
+        if tag in self.SKIP_TAGS or (tag not in self.NEVER_SKIP and words & self.SKIP_WORDS):
+            self.skip_tag, self.skip_depth = tag, 1
+        elif tag in ("article", "main"):
+            self.article += 1
+        elif tag in self.BLOCK:
+            self._flush()
+            self.block = tag
+
+    def handle_endtag(self, tag):
+        if self.skip_tag:
+            if tag == self.skip_tag:
+                self.skip_depth -= 1
+                if self.skip_depth == 0:
+                    self.skip_tag = None
+            return
+        if tag in ("article", "main") and self.article:
+            self.article -= 1
+        elif tag in self.BLOCK:
+            self._flush()
+
+    def handle_data(self, data):
+        if not self.skip_tag and self.block and not self.done:
+            self.buf.append(data)
+
+    def _flush(self):
+        t = re.sub(r"\[\s*(?:\d+|[a-z]|edit|citation needed|note \d+)\s*\]", "", "".join(self.buf), flags=re.I)
+        t = re.sub(r"\s+", " ", t.replace("¶", "")).strip()
+        if t and not self.done:
+            if self.block in self.HEADINGS and t.lower().strip(" :") in self.END_SECTIONS:
+                self.done = True
+            else:
+                self.blocks.append((self.article > 0, t))
+                if self.block in self.HEADINGS and not self.heading:
+                    self.heading = t
+        self.buf = []
+        self.block = None
+
+    def text(self):
+        self._flush()
+        art = [t for a, t in self.blocks if a]
+        use = art if sum(map(len, art)) > 500 else [t for _, t in self.blocks]
+        # Headings and list items often lack a full stop; end each block so it
+        # gets its own pause.
+        use = [t if t[-1] in ".!?…:;" else t + "." for t in use]
+        return "\n".join(use)
+
+
+class NotFound(JobError):
+    """The address answered 404: no such page (a chapter that isn't out yet)."""
+
+
+def fetch(url):
+    """Fetch a web page with curl, as a phone browser would: (content type, text)."""
+    import subprocess
+    import tempfile
+    if not re.match(r"^https?://", url):
+        raise JobError(f"Not a web address: {url}")
+    with tempfile.NamedTemporaryFile(prefix="kokomux-page.") as tmp:
+        r = subprocess.run(["curl", "-sS", "-L", "--compressed", "--max-time", "30", "--max-filesize", "5000000",
+                            "-A", USER_AGENT, "-o", tmp.name, "-w", "%{http_code}\t%{content_type}", url],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise JobError(f"Couldn't fetch {url}: {r.stderr.strip() or f'curl error {r.returncode}'}")
+        code, _, ctype = r.stdout.partition("\t")
+        raw = tmp.read()
+    m = re.search(r"charset=([\w-]+)", ctype)
+    try:
+        body = raw.decode(m.group(1) if m else "utf-8", errors="replace")
+    except LookupError:                       # a charset Python doesn't know: read it as UTF-8
+        body = raw.decode("utf-8", errors="replace")
+    if code == "404":
+        raise NotFound(f"There's no page at {url}")
+    if re.search(r"<title>\s*Just a moment", body[:3000]):
+        raise JobError("That site wants a browser check (Cloudflare) before it shows the page")
+    if not code.startswith("2"):
+        raise JobError(f"Couldn't fetch {url}: the site answered {code}")
+    return ctype.split(";")[0].strip().lower(), body
+
+
+def read_page(url):
+    """A web page: (title, text, chapter), where chapter has a novel chapter's details, or is None."""
+    ctype, body = fetch(url)
+    if ctype == "text/plain":
+        return url, body, None
+    if "html" not in ctype and "xml" not in ctype:
+        raise JobError(f"That link is {ctype}, not a web page")
+    chapter = novel_chapter(body, url)
+    if chapter:
+        return chapter["novel"], chapter["text"], chapter
+    title, text = page_text(body, url)
+    return title, text, None
+
+
+# Where an article ends: from a heading like these on it's links, not reading.
+_PAGE_END = set(_ChapterText.END_SECTIONS) | {
+    "more recent articles", "recent articles", "recent posts", "related", "related posts", "related stories",
+    "read more", "more from", "more stories", "you might also like", "you may also like", "popular",
+    "most popular", "most read", "share this", "share", "tags", "about the author", "newsletter", "sign up"}
+
+
+def page_text(html, url):
+    """A web page's (title, text to read), found by trafilatura: the article, not the menus,
+    sidebars, ads or comments, and stopping where the links start ("See also", "Recent posts")."""
+    import trafilatura
+    text = "\n".join(article_lines(html, url))
+    if len(text.split()) < 5:                # a menu or a "Home" link is not an article
+        raise JobError("Couldn't find any readable text on that page")
+    meta = trafilatura.extract_metadata(html, default_url=url)
+    title = (meta.title if meta is not None and meta.title else "") or url
+    short = title.split(" - ")[0].split(" | ")[0].strip()
+    if short and short not in text.split("\n", 1)[0]:
+        text = f"{short}.\n{text}"           # say what it is first
+    return title, text
+
+
+def article_lines(html, url):
+    """The article on a page, as lines (paragraphs), by trafilatura."""
+    import trafilatura
+    # Two line breaks in a row are a paragraph break (older pages lay text out that way).
+    html = re.sub(r"(?i)(?:<br\s*/?>\s*){2,}", "</p><p>", html)
+    md = trafilatura.extract(html, url=url, output_format="markdown", include_comments=False,
+                             include_images=False, include_links=False, include_tables=False) or ""
+    lines = []
+    for line in md.splitlines():
+        line = re.sub(r"<[^>]+>", "", line.replace("\\", "")).strip()       # markdown escapes, stray tags
+        head = re.match(r"^#{1,6}\s+(.*)$", line)
+        if head:
+            name = re.sub(r"[^\w\s]", "", head.group(1)).strip().lower()
+            if name in _PAGE_END:
+                break
+            line = head.group(1)
+            if not re.search(r"[.!?:…]$", line):
+                line += "."                   # a heading gets its own pause
+        line = re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", line)         # list items
+        if line and line != "[edit]":
+            lines.append(line)
+    return lines
+
+
+# ------------------------------------------------------------------ novels
+# A chapter page of a web novel (freewebnovel.com and the like): the novel's
+# title, the chapter's number and title, its text, and the links to the
+# chapters either side. Listening goes on from chapter to chapter.
+
+CHAPTER_RE = re.compile(r"(?i)\b(?:chapter|chap\.?|ch\.)\s*(\d+)")
+CHAPTER_URL_RE = re.compile(r"(?i)chapter[-_]?(\d+)")
+# Where novel sites put the chapter's text.
+_TEXT_IDS = {"article", "chapter-content", "chr-content", "chapter-c", "chaptercontent", "content", "booktxt"}
+_TEXT_CLASSES = {"txt", "chapter-content", "chr-c", "reading-content", "chapter-body", "text-left", "entry-content",
+                 "chapter-inner", "read-content"}
+_NAV_LINE = re.compile(r"(?i)^(?:<<|>>|«|»)?\s*(?:prev(?:ious)?|next)(?: chapter)?\s*(?:<<|>>|«|»)?$|"
+                       r"^(?:index|table of contents|chapter list|report( chapter)?|bookmark|comments?)$")
+
+
+class _ChapterPage(HTMLParser):
+    """Reads what a chapter page says about itself: title, headings, links and the chapter's text."""
+    SKIP = {"script", "style", "noscript", "button", "select"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.title, self.site, self.heads, self.links, self.rel = "", "", [], [], {}
+        self.paras, self._text_depth, self._depth, self._skip = [], 0, 0, 0
+        self._tag, self._buf, self._a, self._para = None, [], None, []
+
+    def handle_starttag(self, tag, attrs):
+        a = {k: (v or "") for k, v in attrs}
+        if tag in self.SKIP:
+            self._skip += 1
+        if tag in ("title", "h1", "h2", "h3"):
+            self._tag, self._buf = tag, []
+        elif tag == "meta" and a.get("property") == "og:site_name":
+            self.site = a.get("content", "")
+        elif tag == "link" and a.get("rel", "").lower() in ("next", "prev", "previous"):
+            self.rel.setdefault(a["rel"].lower()[:4], a.get("href", ""))
+        elif tag == "a":
+            self._a = {"href": a.get("href", ""), "rel": a.get("rel", "").lower(), "text": [],
+                       "meta": " ".join((a.get("id", ""), a.get("class", ""), a.get("title", ""))).lower()}
+        if tag in ("div", "article", "section", "main", "td"):
+            self._depth += 1
+            ident = a.get("id", "").lower()
+            classes = set(a.get("class", "").lower().split())
+            if not self._text_depth and (ident in _TEXT_IDS or classes & _TEXT_CLASSES):
+                self._text_depth = self._depth
+        if self._text_depth and tag in ("p", "br", "div"):
+            self._end_para()
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP and self._skip:
+            self._skip -= 1
+        if tag == self._tag:
+            text = " ".join("".join(self._buf).split())
+            if tag == "title":
+                self.title = self.title or text
+            elif text:
+                self.heads.append(text)
+            self._tag = None
+        elif tag == "a" and self._a is not None:
+            self._a["text"] = " ".join("".join(self._a["text"]).split()).lower()
+            self.links.append(self._a)
+            self._a = None
+        if self._text_depth and tag in ("p", "div", "article", "section", "main", "td"):
+            self._end_para()
+        if tag in ("div", "article", "section", "main", "td"):
+            if self._text_depth == self._depth:
+                self._text_depth = 0
+            self._depth -= 1
+
+    def handle_data(self, data):
+        if self._tag:
+            self._buf.append(data)
+        if self._a is not None:
+            self._a["text"].append(data)
+        if self._text_depth and not self._skip:
+            self._para.append(data)
+
+    def _end_para(self):
+        text = " ".join("".join(self._para).split())
+        if text:
+            self.paras.append(text)
+        self._para = []
+
+
+def novel_url_of(url):
+    """The novel a chapter belongs to: its address up to the "chapter…" part of the path
+    (or without the last part). kokomux keeps one bookmark per novel, by this."""
+    u = urllib.parse.urlsplit(url)
+    parts = [p for p in u.path.split("/") if p]
+    for k, p in enumerate(parts):
+        if p.lower().startswith(("chapter", "chap-", "ch-")):
+            parts = parts[:k]
+            break
+    else:
+        parts = parts[:-1]
+    return urllib.parse.urlunsplit((u.scheme, u.netloc, "/" + "/".join(parts), "", ""))
+
+
+def chapter_address(url, number):
+    """The address of chapter NUMBER of the novel URL is a chapter of, where its address
+    counts chapters (…/chapter-5); None where it doesn't."""
+    u = urllib.parse.urlsplit(url)
+    head, _, last = u.path.rstrip("/").rpartition("/")
+    if not CHAPTER_URL_RE.search(last):
+        return None
+    last = CHAPTER_URL_RE.sub(lambda m: m.group(0)[:-len(m.group(1))] + str(number), last, count=1)
+    return urllib.parse.urlunsplit((u.scheme, u.netloc, f"{head}/{last}", "", ""))
+
+
+def _nav_link(page, url, novel_url, word):
+    """The link to the next (or previous) chapter: rel=next, or a link that says so."""
+    host = urllib.parse.urlsplit(url).netloc
+    best, score = None, 0
+    cands = [{"href": page.rel.get(word, ""), "rel": word, "text": "", "meta": ""}] + page.links
+    for a in cands:
+        href = urllib.parse.urljoin(url, a["href"]).split("#")[0]
+        if not a["href"] or not href.startswith("http") or urllib.parse.urlsplit(href).netloc != host:
+            continue
+        if href.rstrip("/") in (url.split("#")[0].rstrip("/"), novel_url.rstrip("/")):
+            continue
+        said = f"{a['text']} {a['meta']}"
+        if word == "prev":
+            says = re.search(r"\bprev|previous|prev_|prevchap", said)
+        else:
+            says = re.search(r"\bnext|next_|nextchap", said)
+        n = (3 if word in a["rel"] else 0) + (2 if says else 0)
+        if n == 0:
+            continue
+        n += 1 if CHAPTER_URL_RE.search(href) or "chapter" in href.lower() else 0
+        if n > score:
+            best, score = href, n
+    return best
+
+
+def novel_chapter(html, url):
+    """A novel's chapter page, read: a dict with novel (its title), novel_url, label
+    ("Chapter 5: Weapon Haggling"), number, text (to speak: the label, then the chapter),
+    next and prev (addresses or None), and guessed (next was worked out from the address,
+    not linked). None if the page isn't a chapter of something."""
+    page = _ChapterPage()
+    try:
+        page.feed(html)
+        page.close()
+    except Exception:  # noqa: BLE001 - a page this parser can't follow isn't a chapter page to us
+        return None
+    last = urllib.parse.urlsplit(url).path.rstrip("/").rpartition("/")[2]
+    m_url = CHAPTER_URL_RE.search(last)
+    # The page title: "Novel - Chapter 5: Title | Site", or "Chapter 5 - Novel - Site".
+    parts = [p.strip() for p in re.split(r"\s+\|\s+", page.title) if p.strip()]
+    with_ch = [p for p in parts if CHAPTER_RE.search(p)]
+    novel, label = "", ""
+    if with_ch:
+        t = with_ch[0]
+        m = CHAPTER_RE.search(t)
+        novel, label = t[:m.start()].strip(" -–—:|"), t[m.start():].strip()
+        if not novel:
+            bits = re.split(r"\s+[-–—]\s+", label)
+            label, novel = bits[0], (bits[1] if len(bits) > 1 else "")
+    for h in page.heads:                       # a heading names the chapter better than the title
+        if CHAPTER_RE.search(h) and len(h) < 150 and (not label or len(h) >= len(label)):
+            label = h if not novel or not h.startswith(novel) else h[len(novel):].strip(" -–—:|")
+            break
+    number = int(CHAPTER_RE.search(label).group(1)) if CHAPTER_RE.search(label) else (
+        int(m_url.group(1)) if m_url else None)
+    if number is None:
+        return None
+    novel_url = novel_url_of(url)
+    if not novel:
+        novel = next((h for h in page.heads if not CHAPTER_RE.search(h)), "") or \
+            urllib.parse.urlsplit(novel_url).path.rstrip("/").rpartition("/")[2].replace("-", " ").title()
+    label = label or f"Chapter {number}"
+    nxt, prev = _nav_link(page, url, novel_url, "next"), _nav_link(page, url, novel_url, "prev")
+    guessed = False
+    if not nxt:
+        nxt, guessed = chapter_address(url, number + 1), True
+    if not (nxt or prev or m_url):
+        return None
+
+    # The text: from where these sites keep it, else whatever trafilatura finds.
+    lines = page.paras if len(" ".join(page.paras).split()) >= 50 else article_lines(html, url)
+    site = re.sub(r"[^a-z0-9]", "", (page.site or urllib.parse.urlsplit(url).netloc.split(".")[-2]).lower())
+    names = {re.sub(r"\W", "", x.lower()) for x in (label, novel, f"chapter {number}")}
+    keep = []
+    for k, line in enumerate(lines):
+        bare = re.sub(r"\W", "", line.lower())
+        if k < 4 and not keep and (bare in names or (CHAPTER_RE.match(line.strip()) and len(line) < 100)):
+            continue                                   # the heading again (it's said first anyway)
+        if site and len(site) > 4 and site in bare:
+            continue                                   # "Read the latest chapters at freewebnovel.com"
+        if _NAV_LINE.match(line.strip()):
+            continue
+        keep.append(line)
+    if len(" ".join(keep).split()) < 20:
+        return None
+    said = label if re.search(r"[.!?:…]$", label) else label + "."
+    return {"novel": novel, "novel_url": novel_url, "url": url, "label": label, "number": number,
+            "text": said + "\n" + "\n".join(keep), "next": nxt, "prev": prev, "guessed": guessed}
+
+
+def novel_next(chapter):
+    """The chapter after this one, read, or None if there isn't one (yet)."""
+    if not chapter.get("next"):
+        return None
+    try:
+        _, html = fetch(chapter["next"])
+    except NotFound:
+        return None
+    nxt = novel_chapter(html, chapter["next"])
+    if not nxt or nxt["novel_url"] != chapter["novel_url"] or nxt["number"] <= chapter["number"]:
+        return None                                    # the "next" link left the novel, or went back
+    return nxt
+
+
+# ------------------------------------------------------------------ books
+
+def read_epub(path, name):
+    """An EPUB's (title, [(chapter title, text)]): its chapters in reading order."""
+    import posixpath
+    import xml.etree.ElementTree as ET
+
+    def local(tag):
+        return tag.rsplit("}", 1)[-1]
+
+    parts = []
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+            if "META-INF/encryption.xml" in names and b"EncryptedData" in z.read("META-INF/encryption.xml"):
+                raise JobError("That EPUB is DRM-protected, so its text can't be read")
+            container = ET.fromstring(z.read("META-INF/container.xml"))
+            opf_path = next(el.get("full-path") for el in container.iter() if local(el.tag) == "rootfile")
+            opf = ET.fromstring(z.read(opf_path))
+            title = next((el.text for el in opf.iter() if local(el.tag) == "title" and el.text), "")
+            manifest = {el.get("id"): el.get("href") for el in opf.iter() if local(el.tag) == "item"}
+            spine = [el.get("idref") for el in opf.iter()
+                     if local(el.tag) == "itemref" and el.get("linear", "yes") != "no"]
+            base = posixpath.dirname(opf_path)
+            for idref in spine:
+                href = manifest.get(idref)
+                if not href:
+                    continue
+                inner = posixpath.normpath(posixpath.join(base, urllib.parse.unquote(href.split("#")[0])))
+                if inner not in names:
+                    continue
+                ex = _ChapterText()
+                ex.feed(z.read(inner).decode("utf-8", "replace"))
+                chapter = ex.text()
+                if chapter.strip():
+                    parts.append((ex.heading or f"Part {len(parts) + 1}", chapter))
+    except JobError:
+        raise
+    except (KeyError, StopIteration, zipfile.BadZipFile, ET.ParseError) as e:
+        raise JobError(f"Couldn't read that EPUB ({type(e).__name__})") from None
+    if not parts:
+        raise JobError("That EPUB has no readable text")
+    return (title or "").strip() or name, parts
+
+
+def epub_meta(path):
+    """An EPUB's author and cover image, as (author, cover bytes, extension); blanks if it has none."""
+    import posixpath
+    import xml.etree.ElementTree as ET
+
+    def local(tag):
+        return tag.rsplit("}", 1)[-1]
+    try:
+        with zipfile.ZipFile(path) as z:
+            container = ET.fromstring(z.read("META-INF/container.xml"))
+            opf_path = next(el.get("full-path") for el in container.iter() if local(el.tag) == "rootfile")
+            opf = ET.fromstring(z.read(opf_path))
+            author = next((el.text.strip() for el in opf.iter() if local(el.tag) == "creator" and el.text), "")
+            items = [el for el in opf.iter() if local(el.tag) == "item"]
+            cover_id = next((el.get("content") for el in opf.iter()
+                             if local(el.tag) == "meta" and el.get("name") == "cover"), None)
+            item = next((el for el in items if "cover-image" in (el.get("properties") or "").split()), None) or \
+                next((el for el in items if el.get("id") == cover_id), None)
+            if item is None or not (item.get("media-type") or "").startswith("image/"):
+                return author, b"", ""
+            inner = posixpath.normpath(posixpath.join(posixpath.dirname(opf_path),
+                                                      urllib.parse.unquote(item.get("href", ""))))
+            ext = {"image/jpeg": "jpg", "image/png": "png"}.get(item.get("media-type"), "")
+            return author, (z.read(inner) if ext else b""), ext
+    except (KeyError, StopIteration, zipfile.BadZipFile, ET.ParseError):
+        return "", b"", ""
+
+
+def read_pdf(path, name):
+    """A PDF's (title, text), with its lines joined back into sentences."""
+    from pypdf import PdfReader
+    try:
+        reader = PdfReader(path)
+        if reader.is_encrypted and not reader.decrypt(""):
+            raise JobError("That PDF is password-protected")
+        pages = [page.extract_text() or "" for page in reader.pages]
+        title = (reader.metadata.title if reader.metadata else None) or name
+    except JobError:
+        raise
+    except Exception as e:  # noqa: BLE001 - pypdf raises many kinds of error for broken files
+        raise JobError(f"Couldn't read that PDF ({type(e).__name__})") from None
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", "\n".join(pages))        # words split across lines
+    lines = [ln.strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln and not re.fullmatch(r"\d{1,4}", ln)]   # bare page numbers
+    sentences, buf = [], ""
+    for ln in lines:   # a line that doesn't end a sentence carries on into the next
+        buf = f"{buf} {ln}" if buf else ln
+        if re.search(r"[.!?:;\"”’)]$", ln):
+            sentences.append(buf)
+            buf = ""
+    if buf:
+        sentences.append(buf)
+    if not sentences:
+        raise JobError("That PDF has no text to read (is it a scan?)")
+    title = str(title).strip() or name
+    return title, [(title, "\n".join(sentences))]
+
+
+def read_source(jobdir, job):
+    """What a job reads, as (title, [(chapter title, text)]): a web page, or a file
+    that is an EPUB, a PDF or plain text. Only an EPUB has more than one chapter."""
+    name = job.get("name", "")
+    if job.get("url"):
+        log(f"Fetching {job['url']}")
+        title, text, chapter = read_page(job["url"])
+        return title, [(chapter["label"] if chapter else title, text)]
+    file = job.get("file", "in.txt")
+    if "/" in file:
+        raise JobError(f"Bad input file name: {file}")
+    path = os.path.join(jobdir, file)
+    with open(path, "rb") as fh:
+        head = fh.read(64)
+    if head.startswith(b"%PDF"):
+        return read_pdf(path, name)
+    if head.startswith(b"PK") and zipfile.is_zipfile(path):
+        return read_epub(path, name)   # already chapters
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    bad = text.count("\ufffd") + text.count("\x00")
+    if text and bad > max(3, len(text) // 100):
+        raise JobError("That doesn't look like text, an EPUB or a PDF")
+    return name, [(name, text)]
+__KOKOMUX_FILE__
+cat > "$WORK/words.py" <<'__KOKOMUX_FILE__'
+"""Word timings for spoken lines: which word is being said, and when.
+
+Runs inside the "kokoro" Debian container, next to engine.py.
+
+Kokoro reports how long it spends on every sound it makes (the timestamped
+model's "durations" output, read by kokoro-onnx as per-phoneme timings). Each
+word of the line is phonemised on its own, and its sounds are lined up against
+the sounds Kokoro actually spoke, so a word takes exactly the times of the
+phonemes it became. No speech recogniser is needed, and it works in every
+language Kokoro speaks.
+
+A line's result has the shape {v, engine, confidence, words: [{s, e, a, b, p}]}:
+s/e are the start and end in ms, a/b the character range in the line's text,
+and p the confidence (the share of the word's sounds that lined up).
+"""
+import re
+
+LINE_WORDS_VERSION = 2
+# Below this, too few of a line's sounds lined up to trust: it gets no highlight
+# rather than a wrong one.
+WORDS_MIN_CONFIDENCE = 0.35
+
+
+def empty_result(engine):
+    """Timings for a line that has none usable: nothing is lit."""
+    return {"v": LINE_WORDS_VERSION, "engine": engine, "confidence": 0, "words": []}
+
+
+def player_rows(text, data):
+    """A line's timings in the form the bash player reads (stream/NNNN.words): a
+    "confidence" line, then one "start end a b" row per word, with a/b the word's
+    UTF-8 byte range in the line. Below WORDS_MIN_CONFIDENCE there are no rows,
+    so nothing is lit."""
+    rows = [f"confidence\t{data.get('confidence', 0)}"]
+    if data.get("confidence", 0) >= WORDS_MIN_CONFIDENCE:
+        for w, (a, b) in zip(data["words"], byte_ranges(text, data["words"])):
+            rows.append(f"{w['s']}\t{w['e']}\t{a}\t{b}")
+    return "\n".join(rows) + "\n"
+
+
+def byte_ranges(text, words):
+    """The same words as UTF-8 byte ranges, which is what the bash player slices by."""
+    out, pos, byte = [], 0, 0
+    for w in words:
+        byte += len(text[pos:w["a"]].encode("utf-8"))
+        a = byte
+        byte += len(text[w["a"]:w["b"]].encode("utf-8"))
+        pos = w["b"]
+        out.append((a, byte))
+    return out
+
+
+# ---------------------------------------------------------------- Kokoro's own timings
+
+# Not sounds: spaces, stress marks and the punctuation espeak passes through.
+_SILENT = set(" ˈˌ;:,.!?¡¿—…\"«»“”()'-")
+# Stripped from the ends of a token to find the word to highlight (any script).
+_EDGE_PUNCT = "\"'“”‘’«»()[]{}<>.,;:!?¡¿…—–-、。，！？：；（）「」『』।॥"
+# Split points inside a token for scripts written without spaces.
+_CJK_BREAK = re.compile(r"(?<=[、。，！？：；])")
+
+
+def _tokens(text):
+    """The words to highlight: whitespace-separated tokens (also split after CJK
+    punctuation), with punctuation trimmed from their ends, as (start, end)."""
+    out = []
+    for m in re.finditer(r"\S+", text):
+        pos = m.start()
+        for part in _CJK_BREAK.split(m.group()):
+            core = part.strip(_EDGE_PUNCT)
+            if core:
+                a = pos + part.index(core)
+                out.append((a, a + len(core)))
+            pos += len(part)
+    return out
+
+
+def words_from_timings(text, timings, phonemize_many):
+    """Word timings for a line from Kokoro's own per-phoneme timings.
+
+    Each word is phonemised on its own, and its sounds are lined up against the
+    sounds Kokoro actually spoke (stress marks, spaces and punctuation aside), so
+    a word takes the times of exactly the phonemes it became. This survives
+    espeak running words together in a sentence ("in the" -> one spoken word)
+    and expanding numbers ("1999" -> three). Confidence is the share of sounds
+    that lined up. Returns the same shape as the cache: {v, engine, confidence, words}."""
+    import difflib
+
+    tokens = _tokens(text)
+    spoken = [t for t in timings if t.phoneme not in _SILENT]
+    if not tokens or not spoken:
+        return empty_result("kokoro")
+    per = phonemize_many([text[a:b] for a, b in tokens])
+    mine, owner = [], []                       # each token's sounds, end to end
+    for i, p in enumerate(per):
+        for ch in p:
+            if ch not in _SILENT:
+                mine.append(ch)
+                owner.append(i)
+    said = [t.phoneme for t in spoken]
+    match = [None] * len(mine)                 # the spoken sound each of mine lined up with
+    blocks = difflib.SequenceMatcher(None, mine, said, autojunk=False).get_matching_blocks()
+    for blk in blocks:
+        for k in range(blk.size):
+            match[blk.a + k] = blk.b + k
+    matched = sum(m is not None for m in match)
+    confidence = round(matched / max(len(mine), len(said)), 3) if mine else 0.0
+    words, floor = [], 0
+    for i, (a, b) in enumerate(tokens):
+        hits = [match[k] for k in range(len(mine)) if owner[k] == i and match[k] is not None]
+        if not hits:
+            continue                           # nothing of it lined up: leave it unlit
+        start, end = spoken[min(hits)].start, spoken[max(hits)].end
+        s_ms = max(floor, round(start * 1000))
+        e_ms = max(s_ms + 1, round(end * 1000))
+        words.append({"s": s_ms, "e": e_ms, "a": a, "b": b, "p": confidence})
+        floor = e_ms
+    return {"v": LINE_WORDS_VERSION, "engine": "kokoro", "confidence": confidence, "words": words}
+__KOKOMUX_FILE__
 
 # ================================================================ the work
 
@@ -4950,7 +5109,7 @@ debian_container() {
   proot-distro install --override-alias "$DISTRO" debian
 }
 
-in_container() { proot-distro login "$DISTRO" --shared-tmp -- bash /tmp/kokoro-setup/setup.sh "$@"; }
+in_container() { proot-distro login "$DISTRO" --shared-tmp -- bash /tmp/kokoro-setup/setup-container.sh "$@"; }
 
 stop_old_server() {
   local tok="$PREFIX/tmp/kokoro-server/token"
@@ -4979,9 +5138,8 @@ kokoro_command() {
   { printf '#!%s/bin/bash\n' "$PREFIX"; tail -n +2 "$WORK/kokoro"; } > "$PREFIX/bin/kokoro"
   chmod +x "$PREFIX/bin/kokoro"
   mkdir -p "$PREFIX/share/kokomux"
-  cp "$WORK/tui.sh" "$PREFIX/share/kokomux/tui.sh"         # the full-screen screens
-  cp "$WORK/player.sh" "$PREFIX/share/kokomux/player.sh"   # playing a text
-  cp "$WORK/theme.sh" "$PREFIX/share/kokomux/theme.sh"     # the colours
+  # the colours, the screens, playing a text, the admin commands
+  cp "$WORK"/{theme,tui,player,commands}.sh "$PREFIX/share/kokomux/"
 
   local conf="$HOME/.config/kokoro/config"
   if [ ! -f "$conf" ]; then

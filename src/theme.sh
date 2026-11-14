@@ -148,6 +148,7 @@ theme_off() {    # no colours (not a terminal, or NO_COLOR)
   THEME_ON=0
 }
 
+# shellcheck disable=SC2120  # (the installer calls it without "screen")
 theme_apply() {  # theme_apply [screen]
   local want=${KOKORO_THEME:-auto} screen=${1:-} bg fg
   local -a p
