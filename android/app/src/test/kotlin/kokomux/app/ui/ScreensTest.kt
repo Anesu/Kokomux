@@ -93,6 +93,16 @@ class ScreensTest {
 
     @Test fun sheetChapters() = shot("sheet-chapters", ThemeMode.DARK, sheet { ChaptersSheet(Fake.playing()) {} })
     @Test fun sheetSleep() = shot("sheet-sleep", ThemeMode.DARK, sheet { SleepSheet(Fake.playing(sleep = Sleep.EndOfChapter)) {} })
+    // A narrow screen (a larger display size, or the CI emulator's 320 dp) and large text: nothing cut off.
+    @Test @Config(qualifiers = NARROW) fun homeNarrow() = shot("narrow-home", ThemeMode.DARK, home)
+    @Test @Config(qualifiers = NARROW) fun readerNarrow() = shot("narrow-reader", ThemeMode.DARK, reader)
+    @Test @Config(qualifiers = NARROW) fun settingsNarrow() = shot("narrow-settings", ThemeMode.LIGHT) { SettingsScreen(Fake.state, Fake.actions, {}, {}) }
+    @Test @Config(qualifiers = NARROW) fun speedNarrow() = shot("narrow-speed", ThemeMode.DARK, sheet { SpeedSheet(1.2f) {} })
+    @Test @Config(fontScale = 1.3f) fun homeLargeText() = shot("large-text-home", ThemeMode.LIGHT, home)
+    @Test @Config(fontScale = 1.3f) fun readerLargeText() = shot("large-text-reader", ThemeMode.LIGHT, reader)
+    @Test @Config(fontScale = 1.3f) fun voicesLargeText() = shot("large-text-voices", ThemeMode.DARK) { VoicesScreen(Fake.state, Fake.actions) {} }
+    @Test @Config(fontScale = 1.3f) fun speedLargeText() = shot("large-text-speed", ThemeMode.LIGHT, sheet { SpeedSheet(1.2f) {} })
+
     @Test fun sheetSpeed() = shot("sheet-speed", ThemeMode.LIGHT, sheet { SpeedSheet(1.2f) {} })
     @Test fun sheetPage() = shot("sheet-page", ThemeMode.DARK, sheet { PageSheet("https://example.com/the-long-road") {} })
     @Test fun sheetType() = shot("sheet-type", ThemeMode.LIGHT, sheet { TypeSheet {} })
@@ -100,5 +110,7 @@ class ScreensTest {
 
 /** The S26 Ultra held upright (One UI's default resolution), drawn at 2× to keep the files small. */
 const val PHONE = "w384dp-h832dp-xhdpi"
+/** The narrowest the phone gets (the largest display size); the CI emulator's screen too. */
+const val NARROW = "w320dp-h640dp-mdpi"
 /** Samsung DeX on a 1080p screen. */
 const val WIDE = "w1280dp-h720dp-mdpi"

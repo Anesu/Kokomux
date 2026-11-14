@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -30,6 +31,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -56,11 +59,18 @@ fun HomeScreen(
     }
     Box(Modifier.fillMaxSize().background(t.bg)) {
         GoldenColumn(Modifier.fillMaxSize().safeDrawingPadding()) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.s)) {
-                Logo(Space.xl)
-                Text("kokomux", style = Type.title, color = t.accent, modifier = Modifier.weight(1f), maxLines = 1)
-                Pill(Glyphs.hear, Voices.name(state.prefs.voice), "Voice ${Voices.name(state.prefs.voice)}", onClick = onVoices)
-                GlyphButton(Glyphs.settings, "Settings", onClick = onSettings)
+            BoxWithConstraints {
+                // The name steps aside when the voice and settings need its room (a narrow screen, large text).
+                var named by remember(maxWidth) { mutableStateOf(true) }
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.s)) {
+                    Logo(Space.xl)
+                    Box(Modifier.weight(1f)) {
+                        if (named) Text("kokomux", style = Type.title, color = t.accent, maxLines = 1, softWrap = false,
+                            onTextLayout = { if (it.hasVisualOverflow) named = false })
+                    }
+                    Pill(Glyphs.hear, Voices.name(state.prefs.voice), "Voice ${Voices.name(state.prefs.voice)}", onClick = onVoices)
+                    GlyphButton(Glyphs.settings, "Settings", onClick = onSettings)
+                }
             }
             Spacer(Modifier.height(Space.l))
             if (state.error.isNotEmpty()) {
@@ -72,11 +82,20 @@ fun HomeScreen(
             if (state.opening || state.playing != null) Spacer(Modifier.height(Space.l))
 
             val ready = state.setup == Setup.Ready
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(Space.s)) {
-                Tile(Glyphs.file, "File", Modifier.weight(1f), enabled = ready, onClick = onOpenFile)
-                Tile(Glyphs.globe, "Web page", Modifier.weight(1f), enabled = ready, onClick = onPage)
-                Tile(Glyphs.paste, "Clipboard", Modifier.weight(1f), enabled = ready) { actions.readClipboard(); onReader() }
-                Tile(Glyphs.type, "Type", Modifier.weight(1f), enabled = ready, onClick = onType)
+            val tiles: List<Pair<Pair<ImageVector, String>, () -> Unit>> = listOf(
+                (Glyphs.file to "File") to onOpenFile,
+                (Glyphs.globe to "Web page") to onPage,
+                (Glyphs.paste to "Clipboard") to { actions.readClipboard(); onReader() },
+                (Glyphs.type to "Type") to onType,
+            )
+            BoxWithConstraints {
+                // Four across while their names fit (a 13 sp word needs about 68 dp); two by two when they don't.
+                val across = if ((maxWidth - Space.s * 3) / 4 >= 68.dp * LocalDensity.current.fontScale) 4 else 2
+                Column(verticalArrangement = Arrangement.spacedBy(Space.s)) {
+                    for (row in tiles.chunked(across)) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(Space.s)) {
+                        for ((what, go) in row) Tile(what.first, what.second, Modifier.weight(1f), enabled = ready, onClick = go)
+                    }
+                }
             }
 
             val shelf = state.shelf.filter { it.id != state.playing?.id && it.id != removal?.book?.id }

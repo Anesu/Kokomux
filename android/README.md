@@ -66,8 +66,9 @@ The Termux screens' rules (src/theme.sh, src/tui.sh), on a touch screen
   the checks are low in settings, stopping is behind ⋮.
 
 `./gradlew :app:testDebugUnitTest` draws every screen (`app/build/screens/`),
-at the S26 Ultra's width and on DeX, dark and light, and taps through the
-flows; CI uploads the drawings (**screens**).
+at the S26 Ultra's width, at its narrowest (320 dp, the largest display size),
+with large text and on DeX, dark and light, and taps through the flows; CI
+uploads the drawings (**screens**).
 
 ## How it works
 
