@@ -110,6 +110,7 @@ find your way; it's made from the code, so it's always current.
 | a command-line option for a run (`-p`, `-f`…) | the options loop in src/kokoro |
 | bookmarks, the sleep timer, chapters, web novels mid-listen | src/player.sh, section "listening" |
 | the bookshelf and the Finished list (files, removing a book) | src/commands.sh, section "the bookshelf"; the home screen is `tui_home` |
+| finding a passage (/ in the reader) | `book_find` in src/player.sh, over the engine's `plan` |
 | the time left (reader, shelf, sleep timer, `--status`) | `time_left` and `left_label` in src/player.sh, from the engine's `plan` and `rate` |
 | a list to pick from in a panel (chapters, finished books) | `tui_list` in src/tui.sh (fill LIST_LABEL and LIST_NOTE) |
 | how text is tidied or split | src/text.py: `normalise`, `split_text` |

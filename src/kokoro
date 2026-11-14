@@ -313,6 +313,7 @@ key_cmd() {      # what KEY asks for (or a clicked button): see the player for e
     m|M) CMD=menu ;;
     s|S) CMD=settings ;;
     v|V) CMD=voice ;;
+    /|f|F) CMD="find" ;;
     ']') CMD=next_chapter ;;
     '[') CMD=prev_chapter ;;
     click) [ "${ui:-}" = tui ] && tui_click ;;

@@ -465,6 +465,7 @@ tui_menu() {     # the reader's menu (m): MENU_CMD = what to do ("" if closed wi
     sleep_label
     items=("Settings|s||settings" "Voice|v|$(voice_label "$voice")|voice")
     [ "$TUI_HAS_CHAPTERS" = 1 ] && items+=("Chapters|c|$TUI_CHAPTER|chapters")
+    items+=("Find|/||find")
     items+=("Sleep timer|t|${SLEEP_LABEL:-off}|sleep" "Home screen|||home" "Stop|q|keeps your place|quit")
     n=${#items[@]}
     if [ "$dirty" = 1 ] || [ "$TUI_RESIZED" = 1 ]; then
@@ -493,7 +494,7 @@ tui_menu() {     # the reader's menu (m): MENU_CMD = what to do ("" if closed wi
       down|j) [ "$sel" -lt $(( n - 1 )) ] && sel=$(( sel + 1 )) ;;
       enter|" ") cmd=${items[sel]##*|} ;;
       click) i=${rowsel[$CLICK_Y]:-}; [ -z "$i" ] || cmd=${items[i]##*|} ;;
-      s) cmd=settings ;; v) cmd=voice ;; t) cmd="sleep" ;; q) cmd=quit ;;
+      s) cmd=settings ;; v) cmd=voice ;; t) cmd="sleep" ;; q) cmd=quit ;; /|f) cmd="find" ;;
       c) [ "$TUI_HAS_CHAPTERS" = 1 ] && cmd=chapters ;;
       esc|m) break ;;
     esac

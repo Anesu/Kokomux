@@ -435,6 +435,21 @@ def make_epub(path, chapters):
 
 
 @needs_rig
+def test_reader_finds_a_passage_and_jumps_there():
+    p = Phone(rig=True)
+    try:
+        story = p.write("home/story.txt", STORY)
+        # / (find), "bridge", Enter: the one result is chosen; Enter goes there; then stop.
+        status, out = p.run(["-p", "-f", story], keys=["/", 0.5, "bridge\r", 1, ENTER, 3, "q"], start=8, wait=0.3)
+        ended_cleanly(status, out)
+        assert "1 found" in plain(out) and "crossed the bridge" in plain(out)
+        mark = list(p.bookmarks().values())[0]
+        assert mark["part"] == mark["parts"], mark                   # the last part: where the bridge is
+    finally:
+        p.close()
+
+
+@needs_rig
 def test_reader_chapters_jump_and_continue():
     p = Phone(rig=True)
     try:

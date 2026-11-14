@@ -11,7 +11,7 @@
 # GENERATED FILE: edit the files in src/ and run ./build.sh.
 set -euo pipefail
 
-KOKOMUX_VERSION="1.3.0"
+KOKOMUX_VERSION="1.4.0"
 DISTRO=kokoro
 
 VERBOSE=0
@@ -506,7 +506,7 @@ cat > "$WORK/kokoro" <<'__KOKOMUX_FILE__'
 # in theme.sh (all four loaded below).
 set -euo pipefail
 
-KOKOMUX_VERSION="1.3.0"
+KOKOMUX_VERSION="1.4.0"
 CONF_DIR="$HOME/.config/kokoro"
 CONF="$CONF_DIR/config"
 
@@ -805,6 +805,7 @@ key_cmd() {      # what KEY asks for (or a clicked button): see the player for e
     m|M) CMD=menu ;;
     s|S) CMD=settings ;;
     v|V) CMD=voice ;;
+    /|f|F) CMD="find" ;;
     ']') CMD=next_chapter ;;
     '[') CMD=prev_chapter ;;
     click) [ "${ui:-}" = tui ] && tui_click ;;
@@ -1873,6 +1874,7 @@ tui_menu() {     # the reader's menu (m): MENU_CMD = what to do ("" if closed wi
     sleep_label
     items=("Settings|s||settings" "Voice|v|$(voice_label "$voice")|voice")
     [ "$TUI_HAS_CHAPTERS" = 1 ] && items+=("Chapters|c|$TUI_CHAPTER|chapters")
+    items+=("Find|/||find")
     items+=("Sleep timer|t|${SLEEP_LABEL:-off}|sleep" "Home screen|||home" "Stop|q|keeps your place|quit")
     n=${#items[@]}
     if [ "$dirty" = 1 ] || [ "$TUI_RESIZED" = 1 ]; then
@@ -1901,7 +1903,7 @@ tui_menu() {     # the reader's menu (m): MENU_CMD = what to do ("" if closed wi
       down|j) [ "$sel" -lt $(( n - 1 )) ] && sel=$(( sel + 1 )) ;;
       enter|" ") cmd=${items[sel]##*|} ;;
       click) i=${rowsel[$CLICK_Y]:-}; [ -z "$i" ] || cmd=${items[i]##*|} ;;
-      s) cmd=settings ;; v) cmd=voice ;; t) cmd="sleep" ;; q) cmd=quit ;;
+      s) cmd=settings ;; v) cmd=voice ;; t) cmd="sleep" ;; q) cmd=quit ;; /|f) cmd="find" ;;
       c) [ "$TUI_HAS_CHAPTERS" = 1 ] && cmd=chapters ;;
       esc|m) break ;;
     esac
@@ -2892,6 +2894,42 @@ speed_now() {    # speed_now PART: (while PART plays) $speed from this moment on
   if [ "$ui" = tui ]; then TUI_INFO="$(voice_label "$voice") · ${speed}×"; TUI_SPEED=$speed; tui_draw; fi
 }
 
+# Finding a passage: every part's text is in the engine's plan, so the whole
+# book can be searched, not just what's been made (a web novel: the chapters
+# fetched so far). The results are a list; choosing one jumps there.
+book_find() {    # book_find PART: ask what to find, list where it is, and set JUMP to the part chosen
+  local q lq hits=() n text lt at k start note
+  tui_prompt "Find:" "${FIND_LAST:-}"
+  q=$ANSWER
+  tui_draw                                        # (the prompt's Enter scrolled the screen)
+  if [ -z "$q" ] || [ ! -s "$tmpd/plan" ]; then return 0; fi
+  FIND_LAST=$q; lq=${q,,}
+  mapfile -t hits < <(cut -f2- "$tmpd/plan" | grep -n -i -F -- "$q" | head -n 500) || true
+  LIST_LABEL=(); LIST_NOTE=(); FIND_PART=()
+  for k in "${!hits[@]}"; do
+    n=${hits[k]%%:*} text=${hits[k]#*:}
+    lt=${text,,}; at=${lt%%"$lq"*}; at=${#at}                 # where it is in the part
+    start=$(( at > 24 ? at - 24 : 0 ))
+    text=${text:start:72}; [ "$start" -gt 0 ] && text="…${text#* }"
+    chapter_of "$n"; note="part $n"
+    [ "$CH" -ge 0 ] && [ "${#CH_START[@]}" -gt 1 ] && { note=${CH_TITLE[CH]}; [ "${#note}" -gt 18 ] && note="${note:0:17}…"; }
+    LIST_LABEL+=("$text"); LIST_NOTE+=("$note"); FIND_PART+=("$n")
+  done
+  if [ "${#hits[@]}" = 0 ]; then
+    LIST_LABEL=("Nothing found."); LIST_NOTE=(""); FIND_PART=("")
+    tui_list "Find \"$q\"" 0 "Esc close"
+  else
+    # the first result at or after where you are
+    local from=0 more=""
+    for k in "${!FIND_PART[@]}"; do [ "${FIND_PART[k]}" -ge "$1" ] && { from=$k; break; }; done
+    [ "${#hits[@]}" -ge 500 ] && more="+"
+    tui_list "Find \"$q\" · ${#hits[@]}$more found" "$from" "↑↓ Enter go there · Esc close"
+  fi
+  [ -n "$CHOSEN" ] && [ -n "${FIND_PART[CHOSEN]}" ] && JUMP=${FIND_PART[CHOSEN]}
+  tui_draw
+}
+FIND_LAST=""; FIND_PART=()
+
 # Commands that change where or how it reads (from a key, a click or the menu).
 # Sets JUMP to restart at a part; returns 1 if CMD isn't one of these.
 listen_cmd() {   # listen_cmd CMD PART
@@ -2918,11 +2956,13 @@ listen_cmd() {   # listen_cmd CMD PART
                     t="$(mark_get "$tmpd/novel" prev)"; [ -n "$t" ] && novel_go "$t"
                   fi ;;
     seek:*) JUMP=${cmd#seek:} ;;
+    find) [ "$ui" = tui ] || return 0
+          book_find "$at" ;;
     menu)                                       # the menu: some choices are the player's to carry out
       [ "$ui" = tui ] || return 0
       tui_menu
       case "$MENU_CMD" in
-        settings|voice|chapters) listen_cmd "$MENU_CMD" "$at" ;;
+        settings|voice|chapters|find) listen_cmd "$MENU_CMD" "$at" ;;
         "") ;;
         *) CMD_PENDING=$MENU_CMD ;;
       esac ;;
