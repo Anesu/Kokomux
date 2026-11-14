@@ -140,6 +140,7 @@ jobs:
           # storage, the screen once loaded and the log so far, and the tests.
           script: |
             ./gradlew --console=plain :app:installDebug
+            adb shell pm grant kokomux.app android.permission.POST_NOTIFICATIONS
             adb shell am start -W -n kokomux.app/.MainActivity
             sleep 20
             adb exec-out screencap -p > "$RUNNER_TEMP/first-screen.png"

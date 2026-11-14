@@ -54,6 +54,6 @@ class TextSideTest {
         val timings = s.sounds.mapIndexed { i, ch -> Timing(ch, i * 0.1, (i + 1) * 0.1) }
         val rows = text.wordRows(line, "en-us", s, timings).lines().filter { it.isNotEmpty() }
         assertTrue(rows.first(), rows.first().startsWith("confidence\t"))
-        assertEquals(14, rows.size)                               // a row for each of the 13 words
+        assertEquals(line.split(" ").size + 1, rows.size)        // the confidence, then a row for each word
     }
 }
