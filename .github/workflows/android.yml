@@ -69,21 +69,24 @@ jobs:
 
       # The app's packages (Chaquopy's spaCy 3.8.7, thinc 8.3.4, numpy 1.26.2 on
       # Python 3.10) against the sounds the container's engine.py made.
-      - name: Pronunciation with the app's Python packages
+      - name: Pronunciation and reading with the app's Python packages
         run: |
           python -m pip install --quiet uv
+          python android/tools/wheels.py "$RUNNER_TEMP/wheels"
           echo "setuptools<70" > "$RUNNER_TEMP/build-constraints.txt"   # murmurhash 1.0.2 builds only with an older setuptools
           uv venv --quiet -p "$pythonLocation/bin/python" "$RUNNER_TEMP/mirror"
           VIRTUAL_ENV="$RUNNER_TEMP/mirror" uv pip install --quiet --build-constraints "$RUNNER_TEMP/build-constraints.txt" \
-            -r android/app/requirements.txt espeakng-loader==0.2.4 pypdf
+            --find-links "$RUNNER_TEMP/wheels" -r android/app/requirements.txt espeakng-loader==0.2.4
           "$RUNNER_TEMP/mirror/bin/python" android/tools/pronunciation.py | tee -a "$GITHUB_STEP_SUMMARY"
+          "$RUNNER_TEMP/mirror/bin/python" -I android/tools/test_text_side.py | tee -a "$GITHUB_STEP_SUMMARY"
 
   emulator:
     # The arm64 app on an x86_64 emulator, through Android's arm64 translation:
-    # the pronunciation check with Chaquopy, spaCy and the app's espeak-ng.
-    name: Pronunciation on an emulator
+    # the pronunciation check, reading books, and a short text listened to
+    # through the service, with Chaquopy, spaCy, the app's espeak-ng and Kokoro.
+    name: The app on an emulator
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
@@ -102,6 +105,20 @@ jobs:
       - name: Android SDK, NDK and CMake
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0" "ndk;30.0.16248370" "cmake;3.31.6" > /dev/null
 
+      - name: Kokoro's model and voices, for listening on the emulator
+        uses: actions/cache@v6
+        with:
+          path: models
+          key: kokoro-v1.0-fp32-dd4401a9-voices-v1.0
+
+      - name: Download them if they aren't cached
+        run: |
+          mkdir -p models
+          [ -s models/kokoro-v1.0-timestamped.fp32.onnx ] || curl -fsSL -o models/kokoro-v1.0-timestamped.fp32.onnx \
+            https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX-timestamped/resolve/dd4401a9add81ac692d20e240d22ec9dda82cc29/onnx/model.onnx
+          [ -s models/voices-v1.0.bin ] || curl -fsSL -o models/voices-v1.0.bin \
+            https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+
       - name: Let the emulator use KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -116,13 +133,25 @@ jobs:
           arch: x86_64
           target: google_apis
           disable-animations: true
+          ram-size: 4096M
+          disk-size: 6000M
           working-directory: android
-          # The app's first screen as it opens (no model yet) and its log, then the test.
+          # The app's first screen (no model yet); then with the model put in its
+          # storage, the screen once loaded and the log so far, and the tests.
           script: |
             ./gradlew --console=plain :app:installDebug
             adb shell am start -W -n kokomux.app/.MainActivity
             sleep 20
             adb exec-out screencap -p > "$RUNNER_TEMP/first-screen.png"
+            adb shell am force-stop kokomux.app
+            adb push "$GITHUB_WORKSPACE/models/kokoro-v1.0-timestamped.fp32.onnx" /data/local/tmp/model.onnx
+            adb push "$GITHUB_WORKSPACE/models/voices-v1.0.bin" /data/local/tmp/voices.bin
+            adb shell run-as kokomux.app mkdir -p files/models
+            adb shell run-as kokomux.app cp /data/local/tmp/model.onnx files/models/kokoro-v1.0-timestamped.fp32.onnx
+            adb shell run-as kokomux.app cp /data/local/tmp/voices.bin files/models/voices-v1.0.bin
+            adb shell am start -W -n kokomux.app/.MainActivity
+            sleep 90
+            adb exec-out screencap -p > "$RUNNER_TEMP/ready-screen.png"
             adb logcat -d > "$RUNNER_TEMP/logcat.txt"
             ./gradlew --console=plain :app:connectedDebugAndroidTest
 
@@ -132,6 +161,7 @@ jobs:
           name: emulator-screen
           path: |
             ${{ runner.temp }}/first-screen.png
+            ${{ runner.temp }}/ready-screen.png
             ${{ runner.temp }}/logcat.txt
             android/app/build/outputs/androidTest-results/connected/
           if-no-files-found: ignore

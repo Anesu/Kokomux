@@ -1,29 +1,27 @@
 package kokomux.app
 
 import android.app.Application
+import android.content.ComponentName
 import android.net.Uri
+import android.os.Bundle
+import android.provider.OpenableColumns
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
-import androidx.media3.exoplayer.ExoPlayer
-import kokomux.engine.Audio
-import kokomux.engine.Kokoro
-import kokomux.engine.withPause
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.isActive
+import androidx.media3.session.MediaController
+import androidx.media3.session.SessionCommand
+import androidx.media3.session.SessionToken
+import kokomux.engine.Bookmarks
+import kokomux.engine.Books
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.Dispatchers
 import org.json.JSONObject
 import java.io.File
-import java.util.concurrent.Executors
 
 /** Where the app is: models to fetch, fetching, loading, ready, or stuck. */
 sealed interface Stage {
@@ -34,30 +32,26 @@ sealed interface Stage {
     data class Failed(val message: String) : Stage
 }
 
-/** One part made: how long misaki and Kokoro took, and how much speech it is. */
-data class Made(val index: Int, val chars: Int, val sounds: Double, val kokoro: Double, val audio: Double) {
-    val took get() = sounds + kokoro
-}
-
 /** A pronunciation check: how many parts, how many sound different, and which. */
 data class Checked(val cases: Int, val seconds: Double, val differ: List<Triple<String, String, String>>)
 
 /**
- * The spike's one screen: type, pick a voice, Play. Each part is tidied and
- * split by engine.py, turned into sounds by misaki, spoken by Kokoro and
- * appended to one ExoPlayer playlist, with the time each step took.
+ * The one screen's state: open something to hear (a typed text, a file, a web
+ * page, or a book on the shelf), the controls, and the checks. Listening
+ * itself is [ListenService]'s; this talks to it through a MediaController.
  */
 class Spike(app: Application) : AndroidViewModel(app) {
+    private val engine = app.engine
     var stage by mutableStateOf<Stage>(Stage.Missing)
         private set
     var text by mutableStateOf(SAMPLE)
+    var address by mutableStateOf("")
     var voice by mutableStateOf("af_heart")
     var voices by mutableStateOf(listOf("af_heart"))
         private set
-    /** How onnxruntime runs Kokoro, as kokoro --benchmark tries it: threads (0: its own choice) and block. */
-    var threads by mutableStateOf(0)
+    var threads by mutableStateOf(engine.threads)
         private set
-    var block by mutableStateOf(0)
+    var block by mutableStateOf(engine.block)
         private set
     var playing by mutableStateOf(false)
         private set
@@ -69,31 +63,29 @@ class Spike(app: Application) : AndroidViewModel(app) {
         private set
     var error by mutableStateOf("")
         private set
-    val made = mutableStateListOf<Made>()
-    /** How Kokoro ran for the parts in [made]. */
-    var madeWith by mutableStateOf("")
+    var shelf by mutableStateOf(emptyList<Bookmarks.Mark>())
         private set
 
-    private val models = Models(File(app.filesDir, "models"))
-    private val words = Text(app)
-    private var kokoro: Kokoro? = null
-    // Python and onnxruntime are driven from one thread, one part at a time.
-    private val worker = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
-    private var job: Job? = null
-    // Which Play this is, so a stopped one's ending doesn't touch the next one.
-    @Volatile private var runs = 0
-    @Volatile private var making = false
-    private val parts = File(app.cacheDir, "parts")
-    private val player = ExoPlayer.Builder(app).build().apply {
-        addListener(object : Player.Listener {
-            override fun onPlaybackStateChanged(state: Int) {
-                if (state == Player.STATE_ENDED && !making) playing = false
-            }
-        })
-    }
+    private var controller: MediaController? = null
+    private var pending: Request? = null          // asked for before the controller was connected
 
     init {
-        if (models.ready()) load()
+        if (engine.models.ready()) load()
+        val token = SessionToken(app, ComponentName(app, ListenService::class.java))
+        val future = MediaController.Builder(app, token).buildAsync()
+        future.addListener({
+            controller = future.get().apply {
+                addListener(object : Player.Listener {
+                    override fun onIsPlayingChanged(isPlaying: Boolean) {
+                        playing = isPlaying
+                        refreshShelf()
+                    }
+                })
+                playing = isPlaying
+            }
+            pending?.let { pending = null; send(it) }
+        }, ContextCompat.getMainExecutor(app))
+        refreshShelf()
     }
 
     /** Fetch the model and voices (about 354 MB), then load them. */
@@ -102,7 +94,7 @@ class Spike(app: Application) : AndroidViewModel(app) {
             try {
                 withContext(Dispatchers.IO) {
                     var shown = -1L
-                    models.download { label, done, total ->
+                    engine.models.download { label, done, total ->
                         if (done - shown >= 1 shl 20 || done == total) {
                             shown = done
                             stage = Stage.Downloading(label, done, total)
@@ -117,41 +109,31 @@ class Spike(app: Application) : AndroidViewModel(app) {
     }
 
     private fun load() {
-        viewModelScope.launch(worker) {
+        viewModelScope.launch(Dispatchers.IO) {
             try {
-                val kokoroSecs = loadKokoro()
+                stage = Stage.Loading("Kokoro")
+                voices = engine.kokoro().voices.names          // (already loaded if a book is playing)
                 stage = Stage.Loading("misaki")
-                val misakiSecs = words.warm("en-us") + words.warm("en-gb")
-                loaded = "Kokoro loaded in ${fmt(kokoroSecs)} s, misaki and spaCy in ${fmt(misakiSecs)} s"
+                val misakiSecs = engine.exclusive { engine.text.warm("en-us") + engine.text.warm("en-gb") }
+                loaded = "Kokoro loaded in ${fmt(engine.loadSeconds)} s, misaki and spaCy in ${fmt(misakiSecs)} s"
                 stage = Stage.Ready
             } catch (e: Throwable) {
                 stage = Stage.Failed(e.message ?: e.toString())
             }
         }
-    }
-
-    /** (Re)load Kokoro with the chosen threads and block; the seconds it took. */
-    private fun loadKokoro(): Double {
-        stage = Stage.Loading("Kokoro")
-        kokoro?.close()
-        kokoro = null
-        val t0 = System.nanoTime()
-        val k = Kokoro(models.model, models.voices, threads, block)
-        kokoro = k
-        voices = k.voices.names.filter { it.take(3) in setOf("af_", "am_", "bf_", "bm_") }
-        return seconds(t0)
     }
 
     /** Run Kokoro another way: [threads] (0: onnxruntime's own choice) and [block] (0: off). */
     fun tune(threads: Int, block: Int) {
         if (stage != Stage.Ready || (threads == this.threads && block == this.block)) return
-        stop()
+        stopListening()
         this.threads = threads
         this.block = block
-        viewModelScope.launch(worker) {
+        viewModelScope.launch(Dispatchers.IO) {
             try {
-                val secs = loadKokoro()
-                loaded = "Kokoro loaded in ${fmt(secs)} s (${tuning()})"
+                stage = Stage.Loading("Kokoro")
+                val secs = engine.load(threads, block)
+                loaded = "Kokoro loaded in ${fmt(secs)} s (${engine.tuning()})"
                 stage = Stage.Ready
             } catch (e: Throwable) {
                 stage = Stage.Failed(e.message ?: e.toString())
@@ -159,75 +141,100 @@ class Spike(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** "its own choice", "6 threads, block 4": kokoro --benchmark's words. */
-    fun tuning() = (if (threads == 0) "its own choice" else "$threads threads") + (if (block > 0) ", block $block" else "")
+    /** Hear the typed text: it's kept as a book of its own, as Termux keeps a long text. */
+    fun playText() {
+        val t = text.trim()
+        if (t.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            engine.books.mkdirs()
+            val tmp = File(engine.books, "typed.tmp").apply { writeText(t) }
+            val id = Books.id(tmp.path)
+            val file = File(engine.books, "$id.txt")
+            tmp.renameTo(file)
+            val words = t.split(Regex("\\s+"))
+            val name = words.take(6).joinToString(" ") + if (words.size > 6) "…" else ""
+            send(Request(id, "text", file.path, name, voice))
+        }
+    }
 
-    /** Play the text, or stop. */
-    fun playOrStop() {
-        if (playing) return stop()
-        val k = kokoro ?: return
-        stop()
-        made.clear()
-        madeWith = tuning()
-        error = ""
-        playing = true
-        making = true
-        val run = ++runs
-        val text = text
-        val voice = voice
-        val lang = if (voice.startsWith("b")) "en-gb" else "en-us"
-        job = viewModelScope.launch(worker) {
+    /** Hear a file the system's picker gave (an EPUB, a PDF or text): a copy is kept as the book. */
+    fun openFile(uri: Uri) {
+        val resolver = getApplication<Application>().contentResolver
+        viewModelScope.launch(Dispatchers.IO) {
             try {
-                parts.deleteRecursively()
-                parts.mkdirs()
-                for ((i, part) in words.parts(text, lang).withIndex()) {
-                    ensureActive()
-                    val t0 = System.nanoTime()
-                    val sounds = words.sounds(part.text, lang)
-                    val t1 = System.nanoTime()
-                    val speech = k.speak(sounds, voice)
-                    val t2 = System.nanoTime()
-                    val file = File(parts, "%04d.wav".format(i + 1))
-                    Audio.writeWav(file, speech.withPause(part.pause))
-                    val m = Made(i + 1, part.text.length, (t1 - t0) / 1e9, (t2 - t1) / 1e9, speech.seconds)
-                    withContext(Dispatchers.Main) { queue(file, m) }
-                }
-            } catch (e: Throwable) {
-                if (e !is kotlinx.coroutines.CancellationException) error = e.message ?: e.toString()
-            } finally {
-                if (run == runs) {
-                    making = false
-                    // Already played to the end of what was made (or nothing was): Play again.
-                    if (isActive) withContext(Dispatchers.Main) { if (player.playbackState != Player.STATE_READY) playing = false }
-                }
+                val name = resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+                    if (it.moveToFirst()) it.getString(0) else null
+                } ?: "book"
+                engine.books.mkdirs()
+                val tmp = File(engine.books, "opened.tmp")
+                resolver.openInputStream(uri)!!.use { input -> tmp.outputStream().use { input.copyTo(it) } }
+                val id = Books.id(tmp.path)
+                val ext = name.substringAfterLast('.', "txt").lowercase().takeIf { it in setOf("epub", "pdf", "txt") } ?: "txt"
+                val file = File(engine.books, "$id.$ext")
+                tmp.renameTo(file)
+                send(Request(id, "file", file.path, name.substringBeforeLast('.'), voice))
+            } catch (e: Exception) {
+                error = "Couldn't open that file (${e.message})"
             }
         }
     }
 
-    private fun queue(file: File, m: Made) {
-        made += m
-        player.addMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
-        when {
-            m.index == 1 -> { player.prepare(); player.play() }
-            player.playbackState == Player.STATE_ENDED -> { player.seekTo(m.index - 1, 0); player.play() }
+    /** Hear the web page at [address]. */
+    fun openAddress() {
+        val url = address.trim()
+        if (!url.matches(Regex("^https?://\\S+$"))) {
+            error = "That isn't a web address (https://…)"
+            return
+        }
+        send(Request(Books.id(url), "url", url, url, voice))
+    }
+
+    /** Carry on with a book on the shelf, in the voice it was in. */
+    fun resume(mark: Bookmarks.Mark) =
+        send(Request(mark.id, mark.kind, mark.source, mark.title, mark.voice, mark.speed))
+
+    private fun send(request: Request) {
+        viewModelScope.launch(Dispatchers.Main) {
+            error = ""
+            val c = controller ?: run { pending = request; return@launch }
+            c.sendCustomCommand(SessionCommand(ListenService.OPEN, Bundle.EMPTY), request.toBundle())
         }
     }
 
-    private fun stop() {
-        job?.cancel()
-        job = null
-        player.stop()
-        player.clearMediaItems()
-        playing = false
+    /** Pause, or carry on. */
+    fun pauseOrPlay() {
+        val c = controller ?: return
+        if (c.isPlaying) c.pause() else c.play()
+    }
+
+    /** Skip to the next part. */
+    fun next() {
+        controller?.seekToNextMediaItem()
+    }
+
+    /** Hear this part again. */
+    fun again() {
+        controller?.seekTo(0)
+    }
+
+    /** Stop, keeping the bookmark. */
+    fun stopListening() {
+        controller?.sendCustomCommand(SessionCommand(ListenService.STOP, Bundle.EMPTY), Bundle.EMPTY)
+        refreshShelf()
+    }
+
+    /** The books in progress, from their bookmarks. */
+    fun refreshShelf() {
+        viewModelScope.launch(Dispatchers.IO) { shelf = engine.bookmarks.all() }
     }
 
     /** Run pronunciation.json's sentences through misaki here and compare with engine.py's sounds. */
     fun check() {
         if (checking) return
         checking = true
-        viewModelScope.launch(worker) {
+        viewModelScope.launch(Dispatchers.IO) {
             try {
-                val r = JSONObject(words.check())
+                val r = JSONObject(engine.exclusive { engine.text.check() })
                 val differ = r.getJSONArray("differ")
                 checked = Checked(r.getInt("cases"), r.getDouble("seconds"), (0 until differ.length()).map {
                     val d = differ.getJSONObject(it)
@@ -242,10 +249,7 @@ class Spike(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
-        stop()
-        player.release()
-        kokoro?.close()
-        worker.close()
+        controller?.release()
     }
 
     companion object {
@@ -254,7 +258,6 @@ class Spike(app: Application) : AndroidViewModel(app) {
             "gave way to heather. For three days she walked without meeting anyone, sleeping in the " +
             "lee of stone walls and waking to the sound of sheep."
 
-        private fun seconds(since: Long) = (System.nanoTime() - since) / 1e9
         fun fmt(s: Double) = "%.2f".format(s)
     }
 }

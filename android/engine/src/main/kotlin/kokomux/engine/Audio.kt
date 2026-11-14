@@ -95,6 +95,14 @@ object Audio {
 
     private fun Float.roundEven(): Float = Math.rint(this.toDouble()).toFloat()
 
+    /** Seconds of audio in a WAV file this app wrote (16-bit mono, the data's size at byte 40). */
+    fun wavSeconds(file: File): Double = RandomAccessFile(file, "r").use { f ->
+        val head = ByteArray(44)
+        f.readFully(head)
+        val buf = ByteBuffer.wrap(head).order(ByteOrder.LITTLE_ENDIAN)
+        buf.getInt(40).toDouble() / 2 / buf.getInt(24)
+    }
+
     /** Seconds of audio in [samples]. */
     fun seconds(samples: Int, rate: Int = RATE) = samples.toDouble() / rate
 }

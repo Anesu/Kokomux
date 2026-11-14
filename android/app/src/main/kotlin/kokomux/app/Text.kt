@@ -4,34 +4,65 @@ import android.content.Context
 import com.chaquo.python.PyObject
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
+import kokomux.engine.Book
+import kokomux.engine.Chapter
+import kokomux.engine.Part
+import kokomux.engine.ReadError
+import kokomux.engine.Speakable
+import kokomux.engine.TextSide
+import kokomux.engine.Timing
+import kokomux.engine.Vocab
 import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 
-/** A part of the text, and the pause after it in seconds. */
-data class Part(val text: String, val pause: Double)
-
 /**
- * The text side, in Python: engine.py's normalise and split_text, and misaki
- * (with espeak-ng for the words it doesn't know) for the sounds. Calls block;
- * make them off the main thread.
+ * The text side, in Python (app/src/main/python/kokomux_android.py, over
+ * engine.py and words.py): reading books and pages, tidying and splitting
+ * them, misaki's sounds (espeak-ng's for other languages) and word timings.
+ * Calls block; make them on the engine's worker thread.
  */
-class Text(private val context: Context) {
+class Text(private val context: Context) : TextSide {
     private val module: PyObject by lazy {
         if (!Python.isStarted()) Python.start(AndroidPlatform(context))
         val data = espeakData()
         val lib = File(context.applicationInfo.nativeLibraryDir, "libespeak-ng.so")
         Python.getInstance().getModule("kokomux_android").also {
-            it.callAttr("setup", lib.path, data.path, context.cacheDir.path)
+            it.callAttr("setup", lib.path, data.path, context.cacheDir.path, Vocab.symbols)
         }
     }
 
-    /** The parts [text] is read in. */
+    override fun read(source: String, name: String, lang: String): Book {
+        val got = JSONObject(module.callAttr("read", source, name, lang).toString())
+        if (got.has("error")) throw ReadError(got.getString("error"))
+        val parts = got.getJSONArray("parts")
+        val chapters = got.getJSONArray("chapters")
+        return Book(
+            got.getString("title"),
+            (0 until parts.length()).map { parts.getJSONArray(it).let { p -> Part(p.getString(0), p.getDouble(1)) } },
+            (0 until chapters.length()).map { chapters.getJSONArray(it).let { c -> Chapter(c.getInt(0), c.getString(1)) } },
+        )
+    }
+
+    override fun speakable(text: String, lang: String): Speakable {
+        val got = JSONObject(module.callAttr("speakable", text, lang).toString())
+        return Speakable(got.getString("ps"), if (got.isNull("per")) "null" else got.getJSONArray("per").toString())
+    }
+
+    override fun wordRows(text: String, lang: String, speakable: Speakable, timings: List<Timing>): String =
+        module.callAttr(
+            "word_rows", text, lang, speakable.perWord,
+            String(timings.map { it.phoneme }.toCharArray()),
+            timings.map { it.start }.toDoubleArray(), timings.map { it.end }.toDoubleArray(),
+        ).toString()
+
+    /** The parts [text] is read in (engine.py's normalise and split_text). */
     fun parts(text: String, lang: String): List<Part> {
         val list = JSONArray(module.callAttr("parts", text, lang).toString())
         return (0 until list.length()).map { list.getJSONArray(it).let { p -> Part(p.getString(0), p.getDouble(1)) } }
     }
 
-    /** A part's sounds, as misaki makes them. */
+    /** A part's sounds, as engine.py makes them. */
     fun sounds(part: String, lang: String): String = module.callAttr("sounds", part, lang).toString()
 
     /** Load misaki and spaCy for [lang]; the seconds it took. */

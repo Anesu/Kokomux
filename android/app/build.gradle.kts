@@ -19,8 +19,8 @@ android {
         applicationId = "kokomux.app"
         minSdk = 36                       // Android 16, what the S26 Ultra shipped with
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
         ndk { abiFilters += "arm64-v8a" }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -41,25 +41,23 @@ android {
 
     // phonemizer loads espeak-ng by its path, so the library is kept as a file.
     packaging { jniLibs { useLegacyPackaging = true } }
+
+    // The instrumented tests read the repo's test fixtures (a PDF, recorded timings).
+    sourceSets.getByName("androidTest").assets.directories.add("../../tests/fixtures")
 }
 
 // The build machine's Python 3.10, which Chaquopy needs to install packages.
 val hostPython = System.getenv("KOKOMUX_BUILD_PYTHON") ?: "python3.10"
 val wheels = layout.buildDirectory.dir("wheels")
 
-// Chaquopy installs wheels only, and docopt (num2words' command line, which
-// misaki never runs, but pip wants installed) is only a source package: build
-// its wheel here, from the release on PyPI, checked against its hash.
-val docoptWheel = tasks.register<Exec>("docoptWheel") {
-    val req = temporaryDir.resolve("docopt.txt")
+// Wheels PyPI doesn't have in a form Chaquopy installs (docopt's, and the
+// container's web-page readers taking Chaquopy's lxml and regex): see tools/wheels.py.
+val wheelsTask = tasks.register<Exec>("wheels") {
+    inputs.file(rootDir.resolve("tools/wheels.py"))
     outputs.dir(wheels)
-    doFirst {
-        req.writeText("docopt==0.6.2 --hash=sha256:49b3a825280bd66b3aa83585ef59c4a8c82f2c8a522dbe754a8bc8d08c85c491\n")
-    }
-    commandLine(hostPython, "-m", "pip", "wheel", "--quiet", "--no-deps", "--require-hashes",
-        "-r", req.path, "-w", wheels.get().asFile.path)
+    commandLine(hostPython, rootDir.resolve("tools/wheels.py").path, wheels.get().asFile.path)
 }
-tasks.matching { it.name.matches(Regex("install.*PythonRequirements")) }.configureEach { dependsOn(docoptWheel) }
+tasks.matching { it.name.matches(Regex("install.*PythonRequirements")) }.configureEach { dependsOn(wheelsTask) }
 
 chaquopy {
     defaultConfig {
@@ -70,7 +68,9 @@ chaquopy {
             install("-r", "requirements.txt")
         }
         // These find their data files through __file__, so they're unpacked on first use.
-        extractPackages("spacy", "thinc", "en_core_web_sm", "misaki", "num2words", "phonemizer")
+        extractPackages("spacy", "thinc", "en_core_web_sm", "misaki", "num2words", "phonemizer",
+            "trafilatura", "justext", "courlan", "tld", "babel", "htmldate", "dateparser", "dateparser_data",
+            "pytz", "certifi")
     }
     sourceSets {
         getByName("main") {
@@ -81,8 +81,8 @@ chaquopy {
 }
 
 /**
- * espeak-ng's data for English (its sound tables, the English dictionary and
- * the language list), taken from the espeakng-loader wheel the container
+ * espeak-ng's data for Kokoro's languages (its sound tables, the dictionaries
+ * and the language list), taken from the espeakng-loader wheel the container
  * installs, so the phone's espeak reads words exactly as the container's does.
  */
 abstract class EspeakData : DefaultTask() {
@@ -94,7 +94,8 @@ abstract class EspeakData : DefaultTask() {
         .digest(file.readBytes()).joinToString("") { "%02x".format(it) }
 
     private fun keep(path: String) = path in setOf("phontab", "phonindex", "phondata", "phondata-manifest",
-        "intonations", "en_dict") || path.startsWith("lang/")
+        "intonations") || path.startsWith("lang/") ||
+        path.removeSuffix("_dict") in setOf("en", "es", "fr", "hi", "it", "ja", "pt", "cmn")
 
     @TaskAction
     fun extract() {
@@ -138,6 +139,7 @@ dependencies {
     implementation(libs.compose.ui)
     implementation(libs.activity.compose)
     implementation(libs.media3.exoplayer)
+    implementation(libs.media3.session)
     implementation(libs.coroutines.android)
 
     androidTestImplementation(libs.androidx.test.runner)
