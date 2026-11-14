@@ -25,13 +25,13 @@ class Maker(
                val prepSecs: Double, val voiceSecs: Double, val speechSecs: Double, val kept: Boolean)
 
     /**
-     * Make the parts from [first] to the end, handing each to [ready] as it's done.
+     * Make the parts from [first] to [last] (the end), handing each to [ready] as it's done.
      * [at] is the part the player is on (0 before it starts); [stop] ends it early.
      */
-    fun run(first: Int, at: () -> Int, stop: () -> Boolean, ready: (Made) -> Unit) {
+    fun run(first: Int, at: () -> Int, stop: () -> Boolean, last: Int = book.parts.size, ready: (Made) -> Unit) {
         cache.mkdirs()
         val made = HashMap<Int, Double>()               // part -> seconds of speech, for keeping just ahead
-        for (i in first..book.parts.size) {
+        for (i in first..minOf(last, book.parts.size)) {
             if (stop()) return
             val (chunk, pause) = book.parts[i - 1]
             val name = "%04d".format(i)

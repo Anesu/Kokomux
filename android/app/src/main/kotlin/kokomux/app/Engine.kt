@@ -56,6 +56,8 @@ class Engine(private val context: Context) {
     val bookmarks = Bookmarks(books)
     /** Made parts, kept per book and settings, as Termux's $PREFIX/tmp/kokomux-cache. */
     val cache = File(context.filesDir, "kokomux-cache")
+    /** Passages saved while listening. */
+    val passages = Passages(File(context.filesDir, "passages.tsv"))
     /** The listens, for the stats. */
     val stats = File(context.filesDir, "stats/listens.tsv")
     /** Web novels' chapters, kept as they're fetched. */

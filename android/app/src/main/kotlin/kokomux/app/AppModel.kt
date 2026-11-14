@@ -26,6 +26,7 @@ import kokomux.app.ui.Checked
 import kokomux.app.ui.Clip
 import kokomux.app.ui.EngineFiles
 import kokomux.app.ui.Found
+import kokomux.app.ui.Saved
 import kokomux.app.ui.TocEntry
 import kokomux.app.ui.Making
 import kokomux.app.ui.Playing
@@ -77,6 +78,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
     private var found by mutableStateOf(emptyList<Found>())
     private var searching by mutableStateOf(false)
     private var stats by mutableStateOf<kokomux.engine.Stats?>(null)
+    private var passages by mutableStateOf(emptyList<Saved>())
     /** The part playing's word timings: (part, words). */
     private var words by mutableStateOf(0 to emptyList<WordSpan>())
     private val version = app.packageManager.getPackageInfo(app.packageName, 0).versionName.orEmpty()
@@ -106,6 +108,7 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
         }, ContextCompat.getMainExecutor(app))
         refreshShelf()
         loadStats()
+        viewModelScope.launch(Dispatchers.IO) { refreshPassages() }
         // The part playing's word timings, read when it changes or is made.
         viewModelScope.launch { snapshotFlow { Listening.at to Listening.made.size }.collect { readWords() } }
     }
@@ -136,7 +139,8 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
             engines = Voices.engines.mapNotNull { engineFiles[it.first] }, preparing = Listening.preparing,
             recording = recording, clip = clip, cloning = cloning,
             toc = toc.map { e -> e.copy(now = now?.book?.chapterOf(Listening.at.coerceAtLeast(1))?.url == e.url) },
-            tocLoading = tocLoading, found = found, searching = searching, stats = stats,
+            tocLoading = tocLoading, found = found, searching = searching, stats = stats, passages = passages,
+            saving = Export.progress,
         )
     }
 
@@ -480,6 +484,48 @@ class AppModel(app: Application) : AndroidViewModel(app), Actions {
             val kokoro = engine.kokoro?.voices?.names ?: voices.filter { VoiceId.engine(it) == VoiceId.KOKORO }
             voices = kokoro + Voices.ming + engine.cloned().map { it.voice }
         }
+    }
+
+    // ------------------------------------------------------------ audiobooks
+
+    override fun saveAudiobook(uri: Uri, from: Int, to: Int) {
+        val now = Listening.now ?: return
+        Export.start(getApplication(), Export.Job(now.book, now.request, now.lang, from, to, uri))
+    }
+
+    // ------------------------------------------------------------ saved passages
+
+    override fun savePassage() {
+        val now = Listening.now ?: return
+        val at = Listening.at.takeIf { it > 0 } ?: return
+        val pos = position()
+        // Just into a part, the sentence just heard is the last of the part before.
+        val (part, offset) = if (pos < 1500 && at > 1) (at - 1) to Int.MAX_VALUE
+        else at to (words.second.lastOrNull { it.start <= pos }?.from ?: 0)
+        val text = now.book.parts.getOrNull(part - 1)?.text ?: return
+        val sentence = Passages.sentence(text, offset.coerceAtMost(text.length - 1))
+        val p = Passages.Passage(System.currentTimeMillis(), now.request.id, now.book.novel?.title ?: now.book.title,
+            now.book.chapterOf(part)?.title.orEmpty(), part, sentence)
+        viewModelScope.launch(Dispatchers.IO) {
+            engine.passages.save(p)
+            refreshPassages()
+        }
+        Listening.note = "Saved: “${sentence.take(55)}${if (sentence.length > 55) "…" else ""}”"
+    }
+
+    override fun removePassage(saved: Long) {
+        viewModelScope.launch(Dispatchers.IO) {
+            engine.passages.remove(saved)
+            refreshPassages()
+        }
+    }
+
+    override fun goToPassage(p: Saved) {
+        if (Listening.now?.request?.id == p.book) jump(p.part) else resume(p.book)
+    }
+
+    private fun refreshPassages() {
+        passages = engine.passages.all().map { Saved(it.saved, it.book, it.title, it.chapter, it.part, it.text) }
     }
 
     // ------------------------------------------------------------ stats

@@ -65,11 +65,22 @@ object Fake {
         Stats(sessions, zone, today)
     }
 
+    /** Passages saved from two books. */
+    val passages = listOf(
+        Saved(3, "0123456789abcdef", "The Long Road", "Chapter One: Departure",
+            5, "She sat on a rock and ate the last of her bread, and watched the boats come in on the evening tide."),
+        Saved(2, "2", "Starting with an SSS-Rank Goddess Summon", "Chapter 8: The Summoning", 12,
+            "“An SSS-rank summon,” the examiner whispered, “has not been seen in three hundred years.”"),
+        Saved(1, "0123456789abcdef", "The Long Road", "Chapter Two: The Harbour", 9,
+            "Nobody asked her where she had come from, which was just as well, because she was no longer sure."),
+    )
+
     val state = UiState(
         setup = Setup.Ready, prefs = Prefs(voice = "bf_emma", speed = 1.1f), shelf = shelf, playing = playing(),
         voices = voices + Voices.ming + listOf("qwen:en-us:Anesu", "qwen:en-gb:Narrator"),
         making = Making(37, 412.0, 98.0, 91.0, "Kokoro", "6 threads, block 4"),
         loaded = "Kokoro loaded in 2.14 s, misaki and spaCy in 3.60 s", kept = 1_234_000_000, stats = stats,
+        passages = passages,
         engines = listOf(
             EngineFiles("kokoro", "Kokoro", 353_746_569, 353_746_569),
             EngineFiles("ming", "Ming 3.0", 2_839_549_649, done = 1_123_000_000),
@@ -116,6 +127,10 @@ object Fake {
         override fun forgetVoice(voice: String) {}
         override fun loadToc() {}
         override fun loadStats() {}
+        override fun saveAudiobook(uri: Uri, from: Int, to: Int) {}
+        override fun savePassage() {}
+        override fun removePassage(saved: Long) {}
+        override fun goToPassage(p: Saved) {}
         override fun chapter(url: String) {}
         override fun search(query: String) {}
         override fun novelToc(found: Found) {}

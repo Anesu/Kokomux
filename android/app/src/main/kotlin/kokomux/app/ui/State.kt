@@ -31,6 +31,9 @@ data class ShelfBook(val id: String, val title: String, val part: Int, val parts
 /** A chapter in a novel's list: its number, label and address, whether it's been heard, and whether it's the one playing. */
 data class TocEntry(val number: Int, val label: String, val url: String, val heard: Boolean, val now: Boolean)
 
+/** A passage saved while listening: when, which book, where in it, and the words. */
+data class Saved(val saved: Long, val book: String, val title: String, val chapter: String, val part: Int, val text: String)
+
 /** A novel found by name: its title, its own address, and the latest chapter the site mentions. */
 data class Found(val title: String, val url: String, val latest: String)
 
@@ -139,6 +142,10 @@ data class UiState(
     /** The novel playing's list of chapters (empty until asked for), and whether it's being fetched. */
     val toc: List<TocEntry> = emptyList(),
     val tocLoading: Boolean = false,
+    /** Passages saved while listening, the newest first. */
+    val passages: List<Saved> = emptyList(),
+    /** An audiobook being saved: (parts made, of); null when none is. */
+    val saving: Pair<Int, Int>? = null,
     /** The listens, added up (null until asked for). */
     val stats: kokomux.engine.Stats? = null,
     /** Novels found by name, and whether a search is going. */
@@ -179,6 +186,12 @@ interface Actions {
     /** A voice made from the clip, its [words] (blank if not known), [name] and language; it becomes the voice. */
     fun makeVoice(words: String, name: String, lang: String)
     fun forgetVoice(voice: String)
+    /** Save parts [from] to [to] of the book playing as an audiobook, to [uri]. */
+    fun saveAudiobook(uri: android.net.Uri, from: Int, to: Int)
+    /** Save the sentence just heard; let a saved passage go; go back to one. */
+    fun savePassage()
+    fun removePassage(saved: Long)
+    fun goToPassage(p: Saved)
     /** The listens added up, again (for the stats). */
     fun loadStats()
     /** The novel playing's list of chapters, fetched for the chapters sheet. */

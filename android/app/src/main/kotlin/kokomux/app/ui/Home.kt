@@ -48,7 +48,7 @@ import kotlinx.coroutines.delay
 fun HomeScreen(
     state: UiState, actions: Actions,
     onReader: () -> Unit, onOpenFile: () -> Unit, onPage: () -> Unit, onType: () -> Unit,
-    onVoices: () -> Unit, onSettings: () -> Unit, onStats: (String?) -> Unit = {},
+    onVoices: () -> Unit, onSettings: () -> Unit, onStats: (String?) -> Unit = {}, onSaved: () -> Unit = {},
 ) {
     val t = LocalTokens.current
     // A book taken off the shelf goes for good when its undo bar does (after 5 s, or on leaving home).
@@ -105,6 +105,9 @@ fun HomeScreen(
                         .joinToString(" · "),
                     trailing = { Icon(Glyphs.forward, null, Modifier.size(Space.l - 3.dp), tint = t.dim) }) { onStats(null) }
             }
+            if (state.passages.isNotEmpty()) ListRow(Glyphs.bookmark, "Saved",
+                if (state.passages.size == 1) "1 passage" else "${state.passages.size} passages",
+                trailing = { Icon(Glyphs.forward, null, Modifier.size(Space.l - 3.dp), tint = t.dim) }, onClick = onSaved)
 
             val shelf = state.shelf.filter { it.id != state.playing?.id && it.id != removal?.book?.id }
             if (shelf.isNotEmpty()) {
@@ -119,10 +122,7 @@ fun HomeScreen(
                 r.undone = true; removal = null
             }
         }
-        if (removal == null && state.note.isNotEmpty()) {
-            LaunchedEffect(state.note) { delay(5000); actions.dismissError() }
-            Bar(state.note, "OK", Modifier.align(Alignment.BottomCenter).safeDrawingPadding(), actions::dismissError)
-        }
+
     }
 }
 
@@ -131,7 +131,7 @@ private class Removal(val book: ShelfBook) { var undone = false }
 
 /** A word for a moment ("Removed: the title"), and what to do about it (Undo), floating at the bottom of the screen. */
 @Composable
-private fun Bar(text: String, action: String, modifier: Modifier, onAction: () -> Unit) {
+fun Bar(text: String, action: String, modifier: Modifier, onAction: () -> Unit) {
     val t = LocalTokens.current
     Row(
         modifier.widthIn(max = Space.column).fillMaxWidth().padding(Space.l).clip(Corner.l).background(t.fg)

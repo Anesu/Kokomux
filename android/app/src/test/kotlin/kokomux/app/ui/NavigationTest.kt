@@ -53,6 +53,8 @@ class NavigationTest {
         override fun chapter(url: String) { log += "chapter $url" }
         override fun loadToc() { log += "toc" }
         override fun novelToc(found: Found) { log += "novel ${found.title}" }
+        override fun savePassage() { log += "save" }
+        override fun goToPassage(p: Saved) { log += "passage ${p.part}" }
     }
 
     private fun show(state: UiState, asked: Asked) =
@@ -115,6 +117,17 @@ class NavigationTest {
         compose.onNodeWithText("Chapter 8: The Summoning").performClick()
         assertEquals(listOf("search goddess summon", "novel Starting with an SSS-Rank Goddess Summon",
             "page https://freewebnovel.com/novel/starting-with-an-sss-rank-goddess-summon/chapter-8"), asked.log)
+    }
+
+    @Test
+    fun theSentenceJustHeardIsSavedAndFoundAgain() {
+        val asked = Asked()
+        show(Fake.state.copy(playing = Fake.playing(playing = false)), asked)
+        compose.onNodeWithContentDescription("Save the sentence just heard").performClick()
+        compose.onNodeWithContentDescription("More").performClick()
+        compose.onNodeWithText("Saved").performClick()
+        compose.onNodeWithText("Nobody asked her", substring = true).performClick()
+        assertEquals(listOf("save", "passage 9"), asked.log)
     }
 
     @Test

@@ -126,6 +126,12 @@ class ScreensTest {
     @Test fun statsLight() = shot("stats-light", ThemeMode.LIGHT) { StatsScreen(Fake.stats, {}) }
     @Test fun statsBook() = shot("stats-book", ThemeMode.LIGHT) { StatsScreen(Fake.stats, {}, book = "2") }
     @Test fun statsNone() = shot("stats-none", ThemeMode.DARK) { StatsScreen(null, {}) }
+    @Test fun sheetSaved() = shot("sheet-saved", ThemeMode.DARK, sheet {
+        SavedSheet(Fake.passages.filter { it.book == "0123456789abcdef" }, Fake.actions) {}
+    })
+    @Test fun saved() = shot("saved", ThemeMode.LIGHT) { SavedScreen(Fake.passages, Fake.actions, {}) {} }
+    @Test fun sheetAudiobook() = shot("sheet-audiobook", ThemeMode.LIGHT, sheet { AudiobookSheet(Fake.playing(), null) { _, _, _ -> } })
+    @Test fun sheetAudiobookSaving() = shot("sheet-audiobook-saving", ThemeMode.DARK, sheet { AudiobookSheet(Fake.playing(), 13 to 21) { _, _, _ -> } })
     @Test fun sheetSpeed() = shot("sheet-speed", ThemeMode.LIGHT, sheet { SpeedSheet(1.2f) {} })
     @Test fun sheetPage() = shot("sheet-page", ThemeMode.DARK, sheet { WebSheet("https://example.com/the-long-road", Fake.state, Fake.actions) {} })
     @Test fun sheetType() = shot("sheet-type", ThemeMode.LIGHT, sheet { TypeSheet {} })

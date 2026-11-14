@@ -88,6 +88,8 @@ class ListenService : MediaSessionService() {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 backALittle(isPlaying)
                 track(isPlaying)
+                ListeningWidget.playingNow = isPlaying
+                ListeningWidget.refresh(this@ListenService)
             }
         })
         session = MediaSession.Builder(this, player)
@@ -313,6 +315,7 @@ class ListenService : MediaSessionService() {
         at = part
         Listening.at = part
         mark(now.book, r, part, now.lang)
+        ListeningWidget.refresh(this)
         if (Listening.sleep == Sleep.EndOfChapter) chapterEnd()
     }
 
@@ -568,6 +571,8 @@ class ListenService : MediaSessionService() {
 
     /** Stop listening, keeping the bookmark (a book still opening is let go too). */
     private fun close() {
+        ListeningWidget.playingNow = false
+        ListeningWidget.refresh(this)
         keepListen()
         listen = null
         playingSince = 0

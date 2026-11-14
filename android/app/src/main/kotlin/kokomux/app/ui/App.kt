@@ -9,6 +9,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -26,12 +27,13 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import kotlinx.coroutines.delay
 
-/** The screens: home, the reader, settings, the voice picker, making a voice, listening stats. */
-enum class Screen { HOME, READER, SETTINGS, VOICES, NEW_VOICE, STATS }
+/** The screens: home, the reader, settings, the voice picker, making a voice, listening stats, saved passages. */
+enum class Screen { HOME, READER, SETTINGS, VOICES, NEW_VOICE, STATS, SAVED }
 
 /** What slides up over a screen. */
-enum class Sheet { CHAPTERS, SLEEP, SPEED, PAGE, TYPE }
+enum class Sheet { CHAPTERS, SLEEP, SPEED, PAGE, TYPE, SAVED, AUDIOBOOK }
 
 /**
  * The whole app: first run until Kokoro is ready, then home, the reader,
@@ -66,9 +68,18 @@ fun KokomuxApp(state: UiState, position: () -> Long, link: () -> String, actions
             stack = stack.dropLast(1).filter { it != Screen.READER || state.playing != null || state.opening }
                 .ifEmpty { listOf(Screen.HOME) }
         }
+        // Which parts to save as an audiobook, while the phone asks where.
+        var saveParts by rememberSaveable { mutableStateOf<Pair<Int, Int>?>(null) }
+        val saveTo = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("audio/mp4")) { uri ->
+            val parts = saveParts
+            if (uri != null && parts != null) actions.saveAudiobook(uri, parts.first, parts.second)
+            saveParts = null
+        }
         val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
             if (uri != null) { actions.openFile(uri); go(Screen.READER) }
         }
+        // Something being opened (shared to the app, or the widget's play) is shown in the reader.
+        LaunchedEffect(state.opening) { if (state.opening && screen != Screen.READER) go(Screen.READER) }
         // A book heard to the end, or stopped: the reader has nothing left to show.
         LaunchedEffect(state.playing == null, state.opening) {
             if (screen == Screen.READER && state.playing == null && !state.opening && state.error.isEmpty()) go(Screen.HOME)
@@ -83,20 +94,28 @@ fun KokomuxApp(state: UiState, position: () -> Long, link: () -> String, actions
                     onOpenFile = { pick.launch(arrayOf("*/*")) },
                     onPage = { sheet = Sheet.PAGE }, onType = { sheet = Sheet.TYPE },
                     onVoices = { go(Screen.VOICES) }, onSettings = { go(Screen.SETTINGS) },
-                    onStats = { statsOf = it; actions.loadStats(); go(Screen.STATS) })
+                    onStats = { statsOf = it; actions.loadStats(); go(Screen.STATS) }, onSaved = { go(Screen.SAVED) })
                 Screen.READER -> {
                     val p = state.playing
                     if (p == null) Opening(state, actions) { go(Screen.HOME) }
                     else ReaderScreen(p, state.prefs, position, actions, ReaderTo(
                         home = { go(Screen.HOME) }, speed = { sheet = Sheet.SPEED }, sleep = { sheet = Sheet.SLEEP },
                         chapters = { sheet = Sheet.CHAPTERS }, voices = { go(Screen.VOICES) }, settings = { go(Screen.SETTINGS) },
-                        stats = { statsOf = p.id; actions.loadStats(); go(Screen.STATS) }))
+                        stats = { statsOf = p.id; actions.loadStats(); go(Screen.STATS) }, saved = { sheet = Sheet.SAVED },
+                        audiobook = { sheet = Sheet.AUDIOBOOK }))
                 }
                 Screen.SETTINGS -> SettingsScreen(state, actions, onBack = ::back, onVoices = { go(Screen.VOICES) })
                 Screen.VOICES -> VoicesScreen(state, actions, onBack = ::back, onNewVoice = { go(Screen.NEW_VOICE) })
                 Screen.NEW_VOICE -> NewVoiceScreen(state, actions, onBack = ::back)
                 Screen.STATS -> StatsScreen(state.stats, onBack = ::back, book = statsOf)
+                Screen.SAVED -> SavedScreen(state.passages, actions, onBack = ::back) { go(Screen.READER) }
             }
+        }
+
+        // A word for a moment ("Saved: …", "Up to date: …"), over whichever screen.
+        if (state.note.isNotEmpty() && sheet == null) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+            LaunchedEffect(state.note) { delay(5000); actions.dismissError() }
+            Bar(state.note, "OK", Modifier.safeDrawingPadding(), actions::dismissError)
         }
 
         val open = sheet ?: return@KokomuxTheme
@@ -114,6 +133,12 @@ fun KokomuxApp(state: UiState, position: () -> Long, link: () -> String, actions
                 Sheet.SPEED -> SpeedSheet(p?.speed ?: state.prefs.speed, actions::speed)
                 Sheet.PAGE -> WebSheet(link(), state, actions) { actions.openPage(it); go(Screen.READER) }
                 Sheet.TYPE -> TypeSheet { actions.readTyped(it); go(Screen.READER) }
+                Sheet.SAVED -> SavedSheet(state.passages.filter { it.book == p?.id }, actions) { sheet = null }
+                Sheet.AUDIOBOOK -> if (p != null) AudiobookSheet(p, state.saving) { what, from, to ->
+                    saveParts = from to to
+                    sheet = null
+                    saveTo.launch(kokomux.app.Export.fileName(p.title, what))
+                }
             }
         }
     }

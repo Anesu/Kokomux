@@ -1,0 +1,5 @@
+<!-- The widget's pause: Glyphs.pause. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <path android:fillColor="#FFFFFFFF" android:pathData="M7,5L10.5,5L10.5,19L7,19Z M13.5,5L17,5L17,19L13.5,19Z" />
+</vector>

@@ -126,10 +126,11 @@ private fun readerKey(e: KeyEvent, p: Playing, actions: Actions, to: ReaderTo): 
 /** Where the reader's controls lead: home, and the sheets and screens they open. */
 class ReaderTo(
     val home: () -> Unit = {}, val speed: () -> Unit = {}, val sleep: () -> Unit = {}, val chapters: () -> Unit = {},
-    val voices: () -> Unit = {}, val settings: () -> Unit = {}, val stats: () -> Unit = {},
+    val voices: () -> Unit = {}, val settings: () -> Unit = {}, val stats: () -> Unit = {}, val saved: () -> Unit = {},
+    val audiobook: () -> Unit = {},
 )
 
-/** ⌄ folds the reader away (it keeps playing); the title and chapter; ⋮ for this book's listening, settings and stopping. */
+/** ⌄ folds the reader away (it keeps playing); the title and chapter; ⋮ for this book's saved passages and listening, settings and stopping. */
 @Composable
 private fun Header(p: Playing, actions: Actions, to: ReaderTo) {
     Row(Modifier.widthIn(max = Space.column + Space.touch).fillMaxWidth().height(Space.touch).padding(horizontal = Space.xs),
@@ -137,14 +138,18 @@ private fun Header(p: Playing, actions: Actions, to: ReaderTo) {
         GlyphButton(Glyphs.down, "Home", onClick = to.home)
         Column(Modifier.weight(1f).padding(horizontal = Space.xs)) {
             Text(p.title, style = Type.label, color = LocalTokens.current.fg, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            p.chapter?.title?.takeIf { p.chapters.size > 1 }?.let { Dim(it, maxLines = 1) }
+            p.chapter?.title?.takeIf { p.chapters.size > 1 || p.novel }?.let { Dim(it, maxLines = 1) }
         }
         var more by remember { mutableStateOf(false) }
         Box {
             GlyphButton(Glyphs.more, "More") { more = true }
             DropdownMenu(expanded = more, onDismissRequest = { more = false }) {
+                DropdownMenuItem(text = { Text("Saved", style = Type.body) }, onClick = { more = false; to.saved() },
+                    leadingIcon = { Icon(Glyphs.bookmark, null, Modifier.size(Space.l)) })
                 DropdownMenuItem(text = { Text("Listening", style = Type.body) }, onClick = { more = false; to.stats() },
                     leadingIcon = { Icon(Glyphs.chart, null, Modifier.size(Space.l)) })
+                DropdownMenuItem(text = { Text("Save as audiobook", style = Type.body) }, onClick = { more = false; to.audiobook() },
+                    leadingIcon = { Icon(Glyphs.download, null, Modifier.size(Space.l)) })
                 DropdownMenuItem(text = { Text("Settings", style = Type.body) }, onClick = { more = false; to.settings() },
                     leadingIcon = { Icon(Glyphs.settings, null, Modifier.size(Space.l)) })
                 DropdownMenuItem(text = { Text("Stop", style = Type.body) }, onClick = { more = false; actions.stop(); to.home() },
@@ -271,7 +276,9 @@ private fun Footer(p: Playing, actions: Actions, to: ReaderTo) {
                     onClick = to.speed)
                 QuietButton(Glyphs.moon, p.sleep?.let { sleepLabel(it) } ?: "Sleep", on = p.sleep != null,
                     description = "Sleep timer", onClick = to.sleep)
-                if (p.chapters.size > 1) QuietButton(Glyphs.chapters, "Chapters", onClick = to.chapters)
+                if (p.chapters.size > 1 || p.novel) QuietButton(Glyphs.chapters, "Chapters", onClick = to.chapters)
+                QuietButton(Glyphs.bookmark, "Save", enabled = p.at > 0, description = "Save the sentence just heard",
+                    onClick = actions::savePassage)
                 QuietButton(Glyphs.hear, Voices.name(p.voice), description = "Voice ${Voices.name(p.voice)}", onClick = to.voices)
             }
         }

@@ -107,6 +107,15 @@ object Glyphs {
     val chart = glyph("listening") {
         moveTo(6f, 19f); lineTo(6f, 13f); moveTo(12f, 19f); lineTo(12f, 9f); moveTo(18f, 19f); lineTo(18f, 5f)
     }
+    val bookmark = glyph("save") { moveTo(7f, 4f); lineTo(17f, 4f); lineTo(17f, 20f); lineTo(12f, 16f); lineTo(7f, 20f); close() }
+    val share = glyph("share") {
+        moveTo(12f, 15f); lineTo(12f, 4f); moveTo(8f, 8f); lineTo(12f, 4f); lineTo(16f, 8f)
+        moveTo(6f, 12f); lineTo(6f, 20f); lineTo(18f, 20f); lineTo(18f, 12f)
+    }
+    val copy = glyph("copy") {
+        moveTo(9f, 9f); lineTo(19f, 9f); lineTo(19f, 20f); lineTo(9f, 20f); close()
+        moveTo(6f, 16f); lineTo(5f, 16f); lineTo(5f, 4f); lineTo(15f, 4f); lineTo(15f, 5f)
+    }
     val check = glyph("check") { moveTo(5f, 12.5f); lineTo(10f, 17.5f); lineTo(19f, 7f) }
     val plus = glyph("plus") { moveTo(6f, 12f); lineTo(18f, 12f); moveTo(12f, 6f); lineTo(12f, 18f) }
     val minus = glyph("minus") { moveTo(6f, 12f); lineTo(18f, 12f) }

@@ -236,3 +236,26 @@ fun MainButton(label: String, enabled: Boolean = true, onClick: () -> Unit) {
             disabledContentColor = t.line),
     ) { Text(label, style = Type.label) }
 }
+
+/**
+ * Saving as an audiobook: this chapter, from here to the end, or the whole book (one .m4a, where
+ * you choose); while one is being saved, how far it's got.
+ */
+@Composable
+fun AudiobookSheet(p: Playing, saving: Pair<Int, Int>?, onPick: (name: String, from: Int, to: Int) -> Unit) {
+    SheetFrame("Save as audiobook") {
+        if (saving != null) {
+            ProgressFill(saving.first.toLong(), saving.second.toLong(), "${saving.first} of ${saving.second} parts")
+            return@SheetFrame
+        }
+        val n = p.parts.size
+        val at = p.at.coerceAtLeast(1)
+        val c = p.chapter
+        if (c != null && p.chapters.size > 1) {
+            val end = p.chapters.firstOrNull { it.first > c.first }?.first?.minus(1) ?: n
+            Choice("This chapter", c.title) { onPick(c.title, c.first, end) }
+        }
+        if (at > 1) Choice("From here to the end", "${n - at + 1} of $n parts") { onPick("from ${p.chapter?.title ?: "part $at"}", at, n) }
+        Choice(if (p.novel) "The chapters loaded" else "The whole book", "$n parts") { onPick("", 1, n) }
+    }
+}
