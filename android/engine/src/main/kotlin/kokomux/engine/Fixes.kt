@@ -23,7 +23,7 @@ class Fixes(pairs: List<Pair<String, String>>) {
     internal class Swap(val from: Int, val to: Int, val wasFrom: Int, val wasTo: Int)
 
     /** A part as it's spoken ([text]), and where its respellings are, to find the book's words again. */
-    class Spoken(val text: String, internal val swaps: List<Swap>)
+    class Spoken internal constructor(val text: String, internal val swaps: List<Swap>)
 
     /** [text] as the voice is given it. */
     fun spoken(text: String): Spoken {
